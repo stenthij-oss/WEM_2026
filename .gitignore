@@ -1,0 +1,27 @@
+# Unreal Engine — generated, regenerated on build. Never commit.
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Generated project/solution files (UE rebuilds these from the .uproject)
+*.sln
+*.slnx
+*.suo
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# IDE / editor
+.vs/
+.idea/
+*.xcodeproj
+*.xcworkspace
+
+# OS cruft
+Desktop.ini
+.DS_Store
+Thumbs.db
