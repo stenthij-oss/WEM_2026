@@ -19,93 +19,102 @@ class UStaticMesh;
 struct FBatchedLine;
 
 /**
- * What a single grid cell has been unlocked to carry.
- *
- * A cell is never "a floor" or "a wall" itself - it is a surface that permits a class of
- * things to stand on it. Placement systems read this; nothing here spawns geometry.
+ * The two kinds of platform. Every platform is the same size and built the same way - the
+ * kind only says which way it faces, which is what makes a floor, a wall and a ceiling one
+ * object.
  */
 UENUM(BlueprintType)
-enum class EGridSurface : uint8
+enum class EPlatformKind : uint8
 {
-	/** Nothing has claimed this cell. Carries nothing. */
+	/** Lies in the XY plane and faces up and down: a floor from above, a ceiling from below. */
+	SurfaceHorizontal UMETA(DisplayName = "surface_horizontal"),
+
+	/** Stands in the XZ or YZ plane and faces sideways: a wall, from either side. */
+	SurfaceVertical UMETA(DisplayName = "surface_vertical")
+};
+
+/** One of the grid's three axes, in the order FIntVector indexes them. */
+UENUM(BlueprintType)
+enum class EGridAxis : uint8
+{
+	X UMETA(DisplayName = "X"),
+	Y UMETA(DisplayName = "Y"),
+	Z UMETA(DisplayName = "Z")
+};
+
+/** One of a cell's six faces, named by the direction it looks out in. */
+UENUM(BlueprintType)
+enum class EGridFace : uint8
+{
+	PosX UMETA(DisplayName = "+X"),
+	NegX UMETA(DisplayName = "-X"),
+	PosY UMETA(DisplayName = "+Y"),
+	NegY UMETA(DisplayName = "-Y"),
+	PosZ UMETA(DisplayName = "+Z"),
+	NegZ UMETA(DisplayName = "-Z")
+};
+
+/**
+ * What a surface has been unlocked to carry.
+ *
+ * A surface is never "a floor" or "a wall" itself - it permits a class of things to stand on
+ * it. Placement systems read this; nothing here spawns anything onto a surface.
+ */
+UENUM(BlueprintType)
+enum class ESurfaceCapacity : uint8
+{
+	/** Not a surface: nothing built here faces this way. Carries nothing. */
 	Empty UMETA(DisplayName = "Empty"),
 
-	/** Beam surface: carries walls only. The purple rim in the reference drawings. */
+	/** Rim surface: carries walls only. The purple in the reference drawings. */
 	Wall UMETA(DisplayName = "Wall Surface"),
 
 	/** Carries anything. The green field in the reference drawings. */
 	AllObject UMETA(DisplayName = "All-Object Surface")
 };
 
-/** Which of a floor tile's four sides something stands on. */
-UENUM(BlueprintType)
-enum class EGridSide : uint8
-{
-	PosX UMETA(DisplayName = "+X"),
-	NegX UMETA(DisplayName = "-X"),
-	PosY UMETA(DisplayName = "+Y"),
-	NegY UMETA(DisplayName = "-Y")
-};
-
 /**
- * One wall: the whole rim run along one side of one floor tile, corner posts included.
+ * One placed platform: a single face of the lattice, named by its min node and the axis it
+ * faces along.
  *
- * Named by the tile it was raised from rather than by the cells it covers, so it travels
- * with that tile. The cells are derived from the pair on every rebuild.
+ * Only the axis is stored. The kind follows from it - facing Z is horizontal, facing X or Y
+ * is vertical - so storing the kind as well would only leave room for the two to disagree.
  */
 USTRUCT(BlueprintType)
-struct FWallSegment
+struct FGridPlatform
 {
 	GENERATED_BODY()
 
-	/** Interior min corner of the tile this wall was raised from. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Wall")
-	FIntPoint TileMin = FIntPoint::ZeroValue;
+	/** The lattice node at the platform's min corner: the first cell of its rim. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	FIntVector MinNode = FIntVector::ZeroValue;
 
-	/** Which of that tile's sides it stands on. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Wall")
-	EGridSide Side = EGridSide::PosX;
+	/** The axis the platform faces along. Its two broad faces look out either way along it. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	EGridAxis Normal = EGridAxis::Z;
+
+	EPlatformKind GetKind() const
+	{
+		return Normal == EGridAxis::Z ? EPlatformKind::SurfaceHorizontal : EPlatformKind::SurfaceVertical;
+	}
 };
 
-/**
- * One storey's worth of the grid: what has been placed on it, and what that works out to.
- *
- * Every level shares the one cell lattice and differs only in height, so a cell coordinate
- * means the same thing on all of them and the levels stack in register.
- */
+/** Addresses one surface: a cell, and which of its six faces. */
 USTRUCT(BlueprintType)
-struct FGridLevel
+struct FGridSurfaceRef
 {
 	GENERATED_BODY()
 
-	/** Interior min corner of every tile laid down on this level. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Level")
-	TArray<FIntPoint> Tiles;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface")
+	FIntVector Cell = FIntVector::ZeroValue;
 
-	/** Every wall raised on this level. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Level")
-	TArray<FWallSegment> Walls;
-
-	/** What each cell carries. Derived, never edited in place. Indexed by CellToIndex. */
-	UPROPERTY(Transient)
-	TArray<EGridSurface> CellSurfaces;
-
-	/** Whether each cell has been built on. Derived alongside the surfaces. */
-	UPROPERTY(Transient)
-	TArray<uint8> CellOccupied;
-
-	/** The beams as built: this level's tile rims, and whatever the level below leaves under it. */
-	UPROPERTY(Transient)
-	TArray<FIntPoint> BeamCells;
-
-	/** This level's corner posts, deduplicated - two walls meeting at a corner share one. */
-	UPROPERTY(Transient)
-	TArray<FIntPoint> WallPostCells;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Surface")
+	EGridFace Face = EGridFace::PosZ;
 };
 
 /**
- * One kind of built piece - floor tile, beam, slab, wall, post - spread over a run of small
- * instanced components, "chunks", filled one at a time.
+ * One kind of built piece - horizontal interior, vertical interior, edge, node - spread over a
+ * run of small instanced components, "chunks", filled one at a time.
  *
  * Lumen throws away its surface cache for every instance of a component whose instance count
  * changes, then recaptures all of it over the frames that follow. With a kind of piece in one
@@ -120,7 +129,7 @@ struct FRoomPieceLayer
 
 	/**
 	 * Oldest first, and only the last is ever still being filled. The first is the actor's own
-	 * component for this kind of piece; the rest are made as the grid fills and never saved.
+	 * component for this kind of piece; the rest are made as the structure grows and never saved.
 	 * Not copied with the actor either: each layer property on ARoomManager is DuplicateTransient.
 	 */
 	UPROPERTY(Transient)
@@ -134,80 +143,87 @@ struct FRoomPieceLayer
 };
 
 /**
- * Directs the simulation's grid: a debug-visible lattice laid out across the landscape.
+ * Directs the simulation's grid: a cube of cells, and the structure that grows through it one
+ * platform at a time.
  *
- * The grid's corner origin is this actor's own world-space location and extends into
- * +X/+Y from there, so placing the actor at world origin gives a grid from world origin.
- * Actor rotation and scale are ignored - the grid stays axis-aligned to world X/Y.
+ * The cube's corner is this actor's own world-space location, at the resolved ground height,
+ * and it extends into +X/+Y/+Z from there. Actor rotation and scale are ignored - the cube
+ * stays axis-aligned to the world.
  *
- * The lattice is drawn from OnConstruction, not from Tick, so it is visible in the editor
- * without entering Play.
+ * The ground lattice and the cube's outline are drawn from OnConstruction, not from Tick, so
+ * they are visible in the editor without entering Play.
  *
- * Cell addressing: every cell has a unique FIntPoint coordinate, X in [0, GridSizeX) and
- * Y in [0, GridSizeY), and a unique row-major index in [0, GetCellCount()). The two map
- * onto each other one-to-one via CellToIndex / IndexToCell. Coordinates are derived from
- * the grid's dimensions rather than stored per cell, so resizing the grid cannot leave
- * stale cell data behind. Anything that needs per-cell state (occupancy, for instance)
- * can keep a parallel array of GetCellCount() entries addressed by CellToIndex.
+ * Cell addressing: every cell has a unique FIntVector coordinate, each component in
+ * [0, GridSize). Nothing is stored per cell - a cube at the cap holds 134 million of them - so
+ * the state below is kept sparse, and whatever is not held there is worked out from the
+ * coordinate itself.
  *
- * Floorspace growth
- * -----------------
- * A floor tile is a FloorTileSize x FloorTileSize block of all-object cells, laid down
- * with its one-cell beam rim already around it - tile and beams arrive in the same beat.
- * The first tile lands anywhere on the grid; every later one lands flush against a tile
- * already down, with exactly one beam line between them. That puts the tile pitch at
- * FloorTileSize + 1, so neighbouring tiles share that beam line rather than doubling it up.
+ * The lattice
+ * -----------
+ * Everything placed is a platform: a PlatformSize x PlatformSize interior ringed by a one-cell
+ * rim of beams, one cell thick. Neighbouring platforms share their rims rather than doubling
+ * them up, so they sit at a pitch of PlatformSize + 1 and the whole structure lies on one
+ * lattice. Its nodes, one every pitch along each axis, are the posts where beams meet; its
+ * edges are the PlatformSize cells of beam between two neighbouring nodes; and each of its
+ * faces is one slot a platform can fill - interior, four edges and four nodes. A platform is
+ * named by its min node and the axis it faces along, and two platforms can share edges and
+ * nodes but never interior cells.
  *
- * A beam line caught between two tiles stops being a rim and joins the interior: any wall
- * cell flanked by all-object cells on opposite sides is promoted to all-object. The
- * promotion cannot reach the outer rim, since a rim cell always has emptiness on one side,
- * so the field grows while staying enclosed. It does cascade - the centre of a 2x2
- * arrangement of tiles opens up completely - so it is resolved to a fixpoint.
+ * The lattice is pinned to the cube rather than to whatever happens to be placed first. Nodes
+ * sit at every multiple of the pitch from the cube's corner, and the cube is sized in whole
+ * platforms - GridPlatformsPerSide of them - so a node lands on its far face as well. A
+ * structure that grows out to the edge therefore finishes flush with the cube, its outer beams
+ * lying on the cube's faces on every side.
  *
- * CellSurfaces is derived state, rebuilt wholesale from FloorTiles and Walls. The promotion
- * rule is order-independent, so the same set of tiles always yields the same surfaces
- * regardless of the sequence they were placed in.
+ * Growth
+ * ------
+ * The first platform is horizontal and in the sky: on the node layer at the cube's centre, at a
+ * random lattice position across it. Every one after grows off an edge of a platform already
+ * placed. An edge is shared by up to four slots, two in each of the two planes that contain it,
+ * so each edge offers three more: the coplanar slot that carries its platform on past it, and
+ * the two that fold off it - up and down from a floor, sideways from a wall.
  *
- * Walls
- * -----
- * A wall stands on one whole side of a tile's rim - the run of cells facing the interior,
- * corners excluded - and two 1x1 posts are raised with it to fill those corners, so the
- * barrier is continuous from end to end. A wall may only go where the wall surface is still
- * free, which is what keeps walls on the outside of the floorspace: the moment two tiles
- * conjoin, the beam line between them has been promoted to all-object and no longer offers
- * itself.
+ * A slot is free when it is empty, lies wholly inside the cube, and none of its interior has
+ * been built. A fold asks more: the edge it folds off must still be offering itself on the side
+ * the fold goes toward, which means every cell of the edge's run has to present a face there
+ * that is wall surface and not yet built against. The posts at the run's ends are not asked,
+ * since a post is shared by whatever meets at it. That is what keeps walls on the outside of the
+ * floorspace: the moment two floors conjoin, the edge between them opens into all-object surface
+ * and no longer offers itself.
  *
- * The cells a wall and its posts stand on are marked occupied, and occupancy is what the
- * promotion rule steps over. So a tile conjoining across a walled line still arrives and
- * still lays its own floorspace, but the line between them never opens: the two fields stay
- * separate, each still ringed by wall surface. Since purple is the potential for a wall and
- * a wall keeps the cell purple, a field is enclosed once every side around it has been
- * walled, and open on the sides that have not - rooms accumulate rather than arrive.
+ * A slot is judged against every platform it touches, not only the one it was found from - it
+ * has to fold legally off each perpendicular platform it shares an edge with. So a wall that
+ * would carry on from one already standing still cannot be raised over a seam that has opened,
+ * and a surface that has opened is never closed again afterwards.
  *
- * Posts are the one thing two walls may share. A tile's +X and +Y walls both want a post in
- * the corner between them, and the second wall finds it already standing; only the run has
- * to be free. Runs and corners never collide, since every tile sits on the same pitch
- * lattice, so a corner cell is a corner for every tile that touches it.
+ * Surfaces
+ * --------
+ * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
+ * each of its cells along its normal - and the thin outer edge of a rim does not. A cell that
+ * platforms facing two ways both run through carries surfaces along both.
  *
- * Storeys
- * -------
- * What a wall leaves behind when it tops out is a beam over its run and one over each of
- * its posts, resting on the level above. A run is a tile's width plus its two corners, which
- * is exactly one whole rim side of a tile - so a wall hands the level above a finished edge
- * to build against, and a tile may conjoin to it from either side, the same move as
- * conjoining to a tile already down. That is the only rule an upper level does not share
- * with the ground: its tiles have to start from a beam left by a wall, where the ground's
- * first tile started anywhere.
+ * What a surface carries follows from the cell: interior surfaces carry anything, rim surfaces
+ * walls only. A surface is occupied once the cell it looks into has been built, and occupancy
+ * outranks what it carries.
  *
- * Everything after that repeats. An upper level's tiles carry their own rims, its beam lines
- * open up where two tiles meet, walls stand on what stays closed, and those walls leave beams
- * for the level above them. A beam resting on a wall is an ordinary beam and opens like any
- * other, so a wall divides its own storey and not the one over it - each floor is free to be
- * laid out differently from the one it sits on.
+ * A rim surface caught between two fields stops being rim and joins them: a wall surface
+ * flanked, within its own plane and on its own side, by all-object surfaces on opposite sides is
+ * promoted to all-object. Occupied surfaces never promote and never count as all-object for the
+ * ones beside them. The outer rim can never satisfy the rule, since it always has emptiness on
+ * one side, so a field grows while staying enclosed. Promotions feed each other - the node at
+ * the centre of a 2x2 only opens once the seams around it have - so the rule is resolved to a
+ * fixpoint.
  *
- * Levels are not drawn alike. The ground is notation - flat, weightless, a reading of where
- * things may go - while everything above it is built: slabs and beams of SlabThickness, walls
- * of WallHeight standing on them, so one storey is WallHeight + SlabThickness tall.
+ * Because promotion goes side by side, a wall divides only the side it stands on. A wall raised
+ * on a free edge builds against that edge's top faces, which stay closed; a floor conjoining
+ * across the edge afterwards still opens the seam's underside, since the ceiling below runs on
+ * unbroken, while the floor above stays divided. The posts close the corners, so two fields
+ * never find each other around the end of a wall. And a wall, being a platform like any other,
+ * carries all-object surface on both of its faces.
+ *
+ * Platforms is the whole of the saved state. Everything else is rebuilt wholesale from it, and
+ * the promotion rule is order-independent, so the same set of platforms always yields the same
+ * surfaces whatever order they were placed in.
  */
 UCLASS()
 class WEM_2026_API ARoomManager : public AActor
@@ -217,16 +233,23 @@ class WEM_2026_API ARoomManager : public AActor
 public:
 	ARoomManager();
 
-	/** Hard cap on cells per axis. Mirrored by the ClampMax below, and re-applied in code. */
+	/** Hard cap on cells along each side of the cube. Re-applied in code, since the cube is sized in platforms. */
 	static constexpr int32 MaxGridDimension = 512;
 
-	/** Number of cells along world +X. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1", ClampMax = "512"))
-	int32 GridSizeX = 52;
+	/**
+	 * Size of the cube, counted in platforms along each side.
+	 *
+	 * Counted in platforms rather than cells so the lattice always fits it exactly: a cube of
+	 * whole platforms has a node on both of its faces along every axis, which is what lets a
+	 * structure's outer beams lie flush with it. Clamped in code so the cube stays within
+	 * MaxGridDimension cells.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1"))
+	int32 GridPlatformsPerSide = 6;
 
-	/** Number of cells along world +Y. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1", ClampMax = "512"))
-	int32 GridSizeY = 52;
+	/** Cells along each side of the cube: a pitch per platform, plus the node that closes the far side. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid")
+	int32 GridSize = 0;
 
 	/** Edge length of one cell, in centimetres. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1.0"))
@@ -236,7 +259,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Placement")
 	float GridHeightOffset = 0.0f;
 
-	/** If true, a single downward trace at the grid's origin corner sets the base Z. */
+	/** If true, a single downward trace at the cube's origin corner sets the base Z. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Placement")
 	bool bSnapToLandscapeHeight = true;
 
@@ -244,209 +267,165 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Placement")
 	TEnumAsByte<ECollisionChannel> LandscapeTraceChannel = ECC_WorldStatic;
 
-	/** Cells per side of one floor tile's all-object interior, before its beam rim. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Floorspace", meta = (ClampMin = "1"))
-	int32 FloorTileSize = 8;
+	/** Cells per side of one platform's interior, before its beam rim. The lattice pitch is one more. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "1"))
+	int32 PlatformSize = 8;
 
-	/** Seconds between automatic placements. One tile with its rim, or one wall with its posts, per beat. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Floorspace", meta = (ClampMin = "0.0"))
-	float FloorTilePlacementInterval = 3.0f;
+	/** Seconds between automatic placements. One platform, rim and all, per beat. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "0.0"))
+	float PlatformPlacementInterval = 3.0f;
 
 	/** Whether the placement beat runs on its own once play begins. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Floorspace")
-	bool bAutoPlaceFloorTiles = true;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
+	bool bAutoPlacePlatforms = true;
 
-	/** Discards tiles and walls authored in the editor at BeginPlay, so a run starts from bare grid. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Floorspace")
-	bool bClearFloorTilesOnBeginPlay = true;
+	/** Discards platforms placed in the editor at BeginPlay, so a run starts from an empty cube. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
+	bool bClearPlatformsOnBeginPlay = true;
 
 	/** Seed for the placement stream. Zero draws a fresh seed each run. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Floorspace")
-	int32 FloorTileRandomSeed = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
+	int32 PlatformRandomSeed = 0;
 
 	/**
-	 * The storeys, from the ground up. Index zero always exists, and a level is added above
-	 * any level carrying a wall, since that wall leaves a beam resting up there.
+	 * Chance that a beat places a vertical platform rather than a horizontal one.
 	 *
-	 * The tiles and walls in here are the whole of what has been placed; everything else is
-	 * derived from them, so this list alone is the simulation's state.
+	 * The roll only decides which kind is tried first: when the chosen kind has nowhere to go
+	 * the other one takes the beat, so a beat is lost only when the structure has room for
+	 * neither. That also covers the opening beat, which only a horizontal can take.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float VerticalPlacementChance = 0.5f;
+
+	/**
+	 * Every platform placed, in the order it was placed. This list alone is the simulation's
+	 * state; everything else is derived from it.
 	 *
 	 * Deliberately kept out of the Details panel. Every placement changes it, and the panel
 	 * answers a changed array by rebuilding its whole property tree - with this actor selected
 	 * during a run that cost over a second a frame. The counts below stand in for it there.
 	 */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid|Floorspace")
-	TArray<FGridLevel> Levels;
+	UPROPERTY(BlueprintReadOnly, Category = "Grid|Platforms")
+	TArray<FGridPlatform> Platforms;
 
-	/** Tiles laid down across every level. Readout only. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
-	int32 TotalTileCount = 0;
+	/** Platforms standing in the cube. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Platforms")
+	int32 PlatformCount = 0;
 
-	/** Walls raised across every level. Readout only. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
-	int32 TotalWallCount = 0;
+	/** Of those, the surface_horizontal ones. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Platforms")
+	int32 HorizontalPlatformCount = 0;
 
-	/** How many storeys the stack is currently deep. Readout only. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
-	int32 TotalLevelCount = 0;
+	/** Of those, the surface_vertical ones. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Platforms")
+	int32 VerticalPlatformCount = 0;
+
+	/** Master toggle for the built geometry: every interior, edge and node. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	bool bShowPieces = true;
 
 	/**
-	 * Chance that a beat raises a wall rather than laying a floor tile.
+	 * Unit box every piece is built from: the engine's 100cm cube, centred on its own origin.
+	 * Anything with those conventions can be swapped in.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	TObjectPtr<UStaticMesh> PieceMesh;
+
+	/**
+	 * Material the pieces are built from. Lit, unlike the surface overlay laid over them: the
+	 * overlay is notation and reads best flat, while a platform is a thing standing in the world
+	 * and needs light falling across it to read as one. Tinted per layer, so one material covers
+	 * every colour. It is expected to expose PieceColorParameterName.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	TObjectPtr<UMaterialInterface> PieceMaterial;
+
+	/** Vector parameter on PieceMaterial that the colours below drive. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	FName PieceColorParameterName = FName(TEXT("Color"));
+
+	/**
+	 * The interiors of horizontal platforms - floor and ceiling at once.
 	 *
-	 * The roll only decides which of the two is tried first: when the chosen kind has
-	 * nowhere to go the other one takes the beat, so a beat is lost only when the grid has
-	 * room for neither. That also covers the opening beat, where there is no tile to wall.
+	 * These are straight linear albedos and not pitched to suit an exposure: the pieces are
+	 * lit, so what lands on screen is whatever the level's exposure makes of them. A level left
+	 * on auto-exposure renormalises the whole frame and will wash these out however they are
+	 * set here - that is fixed in the level, with a post-process volume on manual exposure, not
+	 * by dimming the colour.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float WallPlacementChance = 0.5f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	FLinearColor HorizontalInteriorColor = FLinearColor(0.35f, 0.34f, 0.32f);
 
-	/**
-	 * Height of a wall, and of the corner posts raised with it, in centimetres.
-	 *
-	 * 280 is the WBS70 storey height of 2.80m in Unreal's units, where one unit is one
-	 * centimetre. Set it to 2.8 if a wall the height of a kerb is what was meant.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls", meta = (ClampMin = "0.0"))
-	float WallHeight = 280.0f;
+	/** The interiors of vertical platforms. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	FLinearColor VerticalInteriorColor = FLinearColor(0.25f, 0.10f, 0.03f);
 
-	/**
-	 * Every wall raised so far, each named by a tile and one of its sides.
-	 * As with FloorTiles, this list alone is the walls' state.
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid|Walls")
-	TArray<FWallSegment> Walls;
+	/** The beams: one run per lattice edge, however many platforms share it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	FLinearColor EdgeColor = FLinearColor(0.21f, 0.21f, 0.21f);
 
-	/**
-	 * Unit box every wall piece is built from: the engine's 100cm cube, centred on its own
-	 * origin. Anything with those conventions can be swapped in.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls")
-	TObjectPtr<UStaticMesh> WallMesh;
+	/** The posts: one per lattice node, however many beams meet there. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
+	FLinearColor NodeColor = FLinearColor(0.21f, 0.21f, 0.21f);
 
-	/**
-	 * Material the walls and posts are built from. Lit, unlike the surfaces below them:
-	 * the surfaces are notation and read best flat, while a wall is a thing standing in
-	 * the world and needs light falling across it to read as one. Tinted per layer, so one
-	 * material covers both colours. It is expected to expose WallColorParameterName.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls")
-	TObjectPtr<UMaterialInterface> WallMaterial;
-
-	/** Vector parameter on WallMaterial that the two colours below drive. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls")
-	FName WallColorParameterName = FName(TEXT("Color"));
-
-	/**
-	 * The walls themselves.
-	 *
-	 * Unlike the plane colours above, this is a straight linear albedo and not pitched to
-	 * suit an exposure: the walls are lit, so what lands on screen is whatever the level's
-	 * exposure makes of them. A level left on auto-exposure renormalises the whole frame and
-	 * will wash these out however they are set here - that is fixed in the level, with a
-	 * post-process volume on manual exposure, not by dimming the colour.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls")
-	FLinearColor WallColor = FLinearColor(0.25f, 0.10f, 0.03f);
-
-	/** The corner posts. Held apart from the walls they fill in between. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Walls")
-	FLinearColor WallPostColor = FLinearColor(0.21f, 0.21f, 0.21f);
-
-	/**
-	 * Thickness of the slabs and beams an upper storey is built from, in centimetres.
-	 * One storey is this plus WallHeight, so the levels stack at a fixed pitch.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Storeys", meta = (ClampMin = "0.0"))
-	float SlabThickness = 20.0f;
-
-	/** The tile slabs of an upper storey. Built, unlike the flat notation on the ground. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Storeys")
-	FLinearColor SlabColor = FLinearColor(0.35f, 0.34f, 0.32f);
-
-	/** The beams around those slabs, and the ones left resting on a wall. Grey, as the posts are. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Storeys")
-	FLinearColor BeamColor = FLinearColor(0.21f, 0.21f, 0.21f);
-
-	/** Master toggle for the built geometry: the red floor tiles, grey wall beams and the walls. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	bool bShowPlanes = true;
-
-	/**
-	 * Unit plane every surface is built from: the engine's 100x100cm plane, centred on its
-	 * own origin and facing +Z. Anything with those conventions can be swapped in.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	TObjectPtr<UStaticMesh> PlaneMesh;
-
-	/**
-	 * Base material for both layers. It is not used directly - a dynamic instance per layer
-	 * is made from it and tinted, so one material covers both colours.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	TObjectPtr<UMaterialInterface> PlaneMaterial;
-
-	/** Vector parameter on PlaneMaterial that the colours below drive. M_WEMDebug calls it "Color". */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	FName PlaneColorParameterName = FName(TEXT("Color"));
-
-	/**
-	 * One plane per floor tile, covering its whole interior.
-	 *
-	 * These are linear values through an unlit material, so what lands on screen also
-	 * depends on the level's exposure - the defaults are pitched low because the default
-	 * auto-exposure lifts them considerably. Tune here rather than in the material.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	FLinearColor FloorTilePlaneColor = FLinearColor(0.45f, 0.015f, 0.015f);
-
-	/** One plane per beam cell, so beams can never overlap each other or a tile. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	FLinearColor WallBeamPlaneColor = FLinearColor(0.16f, 0.16f, 0.16f);
-
-	/** Lifts the planes off the grid base so they do not z-fight the ground under them. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Planes")
-	float PlaneZOffset = 1.0f;
-
-	/** Master toggle for the debug lattice. */
+	/** Master toggle for the debug lattice and the cube's outline. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	bool bShowDebugGrid = true;
 
 	/**
-	 * Overlays what each cell is unlocked to carry, one inset square per claimed cell, in
-	 * green and purple. This is the only view that shows which beams have been promoted -
-	 * the planes cannot, since a promoted beam is still a beam - so it reads on top of them
-	 * rather than instead of them, and both are on by default.
+	 * Overlays what each surface is unlocked to carry, one inset square per surface, in green,
+	 * purple and white. This is the only view that shows which rim has been promoted - the
+	 * pieces cannot, since a promoted beam is still a beam - so it reads on top of them rather
+	 * than instead of them, and both are on by default.
 	 *
-	 * The squares are instanced and only the cells a placement changed are touched, so the
-	 * overlay costs little however far the grid has filled.
+	 * The squares are instanced and only the surfaces a placement changed are touched, so the
+	 * overlay costs little however far the structure has grown.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	bool bShowSurfaces = true;
 
-	/** Colour of the interior lattice lines. */
+	/**
+	 * Unit plane every overlay square is built from: the engine's 100x100cm plane, centred on
+	 * its own origin and facing +Z. Anything with those conventions can be swapped in.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
+	TObjectPtr<UStaticMesh> PlaneMesh;
+
+	/**
+	 * Base material for the overlay. It is not used directly - a dynamic instance per colour is
+	 * made from it and tinted, so one material covers all three.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
+	TObjectPtr<UMaterialInterface> PlaneMaterial;
+
+	/** Vector parameter on PlaneMaterial that the overlay colours drive. M_WEMDebug calls it "Color". */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
+	FName PlaneColorParameterName = FName(TEXT("Color"));
+
+	/** Colour of the ground lattice's interior lines. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	FColor GridLineColor = FColor(200, 200, 200);
 
-	/** Colour of the four outer edges. */
+	/** Colour of the cube's twelve edges. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	FColor BoundaryLineColor = FColor::Blue;
 
-	/** Cells that carry anything. */
+	/** Surfaces that carry anything. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	FColor AllObjectSurfaceColor = FColor(0, 230, 0);
 
-	/** Cells that carry walls only, and are still free to. */
+	/** Surfaces that carry walls only, and are still free to. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	FColor WallSurfaceColor = FColor(170, 0, 230);
 
-	/** Cells already built on. Drawn over whatever the cell carries, since occupancy outranks it. */
+	/** Surfaces already built against. Drawn over whatever the surface carries, since occupancy outranks it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	FColor OccupiedSurfaceColor = FColor::White;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug", meta = (ClampMin = "0.1"))
 	float GridLineThickness = 1.5f;
 
-	/** Drawn thicker than the interior so the grid reads as surrounded by a boundary line. */
+	/** Drawn thicker than the ground lattice so the cube reads as surrounded by a boundary line. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug", meta = (ClampMin = "0.1"))
 	float BoundaryLineThickness = 5.0f;
 
@@ -454,22 +433,18 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Coordinates")
 	bool bHighlightDebugCell = false;
 
-	/** Cell to mark. Nothing is drawn when it falls outside the grid. */
+	/** Cell to mark. Nothing is drawn when it falls outside the cube. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Coordinates")
-	FIntPoint DebugCell = FIntPoint::ZeroValue;
+	FIntVector DebugCell = FIntVector::ZeroValue;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Coordinates")
 	FColor DebugCellColor = FColor::Green;
 
-	/** Base Z resolved at the last rebuild. Every cell shares it. Readout only. */
+	/** Base Z resolved at the last rebuild: where cell layer zero starts. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	double GridBaseZ = 0.0;
 
-	/** Row-major index of DebugCell, or INDEX_NONE when it is outside the grid. Readout only. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
-	int32 DebugCellIndex = INDEX_NONE;
-
-	/** World-space centre of DebugCell, or zero when it is outside the grid. Readout only. */
+	/** World-space centre of DebugCell, or zero when it is outside the cube. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	FVector DebugCellCenter = FVector::ZeroVector;
 
@@ -477,122 +452,107 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Coordinates")
 	FVector DebugProbeLocation = FVector::ZeroVector;
 
-	/** Cell containing DebugProbeLocation, or (INDEX_NONE, INDEX_NONE) when off the grid. Readout only. */
+	/** Cell containing DebugProbeLocation, or (INDEX_NONE, INDEX_NONE, INDEX_NONE) when outside the cube. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
-	FIntPoint DebugProbeCell = FIntPoint(INDEX_NONE, INDEX_NONE);
-
-	/** Total number of cells: GridSizeX * GridSizeY. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	int32 GetCellCount() const;
-
-	/** True when the coordinate addresses a cell that exists in this grid. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	bool IsValidCell(const FIntPoint& Cell) const;
-
-	/** Row-major index for a cell, or INDEX_NONE when the cell is outside the grid. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	int32 CellToIndex(const FIntPoint& Cell) const;
-
-	/** Inverse of CellToIndex. Returns (INDEX_NONE, INDEX_NONE) for an out-of-range index. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	FIntPoint IndexToCell(int32 Index) const;
-
-	/** World-space corner of a cell nearest the grid origin, at the grid's base Z. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	FVector GetCellMinCorner(const FIntPoint& Cell) const;
-
-	/** World-space centre of a cell, at the grid's base Z. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	FVector GetCellCenter(const FIntPoint& Cell) const;
-
-	/** World-space footprint of a cell. Flat: min and max share the grid's base Z. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	FBox GetCellBounds(const FIntPoint& Cell) const;
+	FIntVector DebugProbeCell = FIntVector(INDEX_NONE, INDEX_NONE, INDEX_NONE);
 
 	/**
-	 * Cell containing a world location, ignoring Z.
-	 * Returns false and sets OutCell to (INDEX_NONE, INDEX_NONE) when the location is
-	 * outside the grid.
+	 * The surface nearest DebugProbeLocation, among the probe's own cell and the 26 around it.
+	 * Its cell is (INDEX_NONE, INDEX_NONE, INDEX_NONE) when there is none that close. Readout only.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	FGridSurfaceRef DebugProbeSurface;
+
+	/** What that surface carries. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	ESurfaceCapacity DebugProbeSurfaceCapacity = ESurfaceCapacity::Empty;
+
+	/** Whether that surface has been built against. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	bool bDebugProbeSurfaceOccupied = false;
+
+	/** True when the coordinate addresses a cell inside the cube. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
+	bool IsValidCell(const FIntVector& Cell) const;
+
+	/** World-space corner of a cell nearest the cube's origin corner. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
+	FVector GetCellMinCorner(const FIntVector& Cell) const;
+
+	/** World-space centre of a cell. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
+	FVector GetCellCenter(const FIntVector& Cell) const;
+
+	/** World-space box a cell fills. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
+	FBox GetCellBounds(const FIntVector& Cell) const;
+
+	/**
+	 * Cell containing a world location.
+	 * Returns false and sets OutCell to (INDEX_NONE, INDEX_NONE, INDEX_NONE) when the location
+	 * is outside the cube.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
-	bool WorldToCell(const FVector& WorldLocation, FIntPoint& OutCell) const;
+	bool WorldToCell(const FVector& WorldLocation, FIntVector& OutCell) const;
 
-	/** How many storeys the stack is currently deep. Never less than one. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	int32 GetLevelCount() const;
-
-	/** World-space Z of a level's surface: the ground for level zero, a slab's top above that. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	double GetLevelBaseZ(int32 Level) const;
-
-	/** What a cell has been unlocked to carry on one level. Cells outside the grid carry nothing. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	EGridSurface GetCellSurface(int32 Level, const FIntPoint& Cell) const;
+	/** What one face of a cell has been unlocked to carry. Anything that is not a surface carries nothing. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
+	ESurfaceCapacity GetSurfaceCapacity(const FIntVector& Cell, EGridFace Face) const;
 
 	/**
-	 * Whether a cell's surface has been built on.
+	 * Whether a surface has been built against: the cell it looks into is part of a platform.
 	 *
-	 * Occupancy is not the same as what a cell carries: a walled cell is still a wall
-	 * surface, it has only stopped being a free one. Nothing new may be placed there, and
-	 * the promotion that opens beam lines into floorspace steps over it.
+	 * Occupancy is not the same as what a surface carries. An occupied rim surface is still a
+	 * wall surface, it has only stopped being a free one - nothing more may fold off there, and
+	 * the promotion that opens seams into floorspace steps over it. Always false for a face that
+	 * is not a surface.
 	 */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	bool IsCellOccupied(int32 Level, const FIntPoint& Cell) const;
-
-	/** Number of tiles laid down on one level. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	int32 GetTileCount(int32 Level) const;
-
-	/** Number of walls raised on one level. */
-	UFUNCTION(BlueprintPure, Category = "Grid|Walls")
-	int32 GetWallCount(int32 Level) const;
+	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
+	bool IsSurfaceOccupied(const FIntVector& Cell, EGridFace Face) const;
 
 	/**
-	 * Whether a wall could be raised along one side of a tile.
-	 *
-	 * Every cell of that side's rim run has to be a wall surface and still free. A side a
-	 * neighbouring tile has conjoined across reads as all-object and fails; a side already
-	 * walled - from either of the two tiles that meet along it - reads as occupied and fails
-	 * too, so one line can never carry two walls. The corner posts are not tested, since the
-	 * only thing they can meet there is another post, which they share.
+	 * World transform of one face of a cell: at the face's centre, turned so its up vector is
+	 * the face's outward normal. Pure geometry, so it answers for any face, surface or not.
 	 */
-	UFUNCTION(BlueprintPure, Category = "Grid|Walls")
-	bool CanPlaceWallAt(int32 Level, const FIntPoint& TileMin, EGridSide Side) const;
+	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
+	FTransform GetSurfaceWorldTransform(const FIntVector& Cell, EGridFace Face) const;
 
 	/**
-	 * Whether a tile whose interior starts at this cell could be laid down on one level.
-	 *
-	 * Its full footprint - interior plus beam rim - must fit inside the grid, and it must
-	 * neither cover an existing tile's beams nor let an existing tile's beams cover it.
-	 * Two tiles sharing a single beam line pass this; anything closer does not.
+	 * Every surface that carries Filter, occupied ones included only when asked for.
+	 * Occupied surfaces always carry walls only, and asking for Empty finds nothing.
 	 */
-	UFUNCTION(BlueprintPure, Category = "Grid|Floorspace")
-	bool CanPlaceFloorTileAt(int32 Level, const FIntPoint& InteriorMin) const;
+	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
+	void GatherSurfaces(ESurfaceCapacity Filter, bool bIncludeOccupied, TArray<FGridSurfaceRef>& OutSurfaces) const;
+
+	/** Number of platforms standing in the cube. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
+	int32 GetPlatformCount() const;
 
 	/**
-	 * Lays down one tile with its beam rim, then rebuilds the surfaces.
+	 * Whether a platform could be placed at this min node, facing along this axis.
 	 *
-	 * The ground's first tile goes anywhere it fits. After that a tile goes flush against a
-	 * tile already down on its own level, one beam line apart, or - above the ground - to
-	 * either side of a beam a wall has left resting there. The choice is drawn from the
-	 * placement stream across every level at once, so the stack grows where there is room
-	 * rather than storey by storey. Returns false when nowhere is left.
+	 * It has to sit on the lattice with its whole footprint inside the cube, in a slot that is
+	 * empty and whose interior is unbuilt, sharing at least one edge with a platform already
+	 * placed. For every platform it would fold off - one it shares an edge with but faces
+	 * across - every cell of that edge's run must still offer a free wall surface on the side it
+	 * would fold toward. Before anything is placed, only a horizontal platform on the cube's
+	 * centre layer passes.
 	 */
-	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Floorspace")
-	bool PlaceNextFloorTile();
+	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
+	bool CanPlacePlatform(const FIntVector& MinNode, EGridAxis Normal) const;
 
 	/**
-	 * Raises one wall with its two corner posts, then rebuilds the surfaces.
-	 *
-	 * The side is drawn from the placement stream out of every tile side on every level that
-	 * is still free to take one. Returns false when no side is.
+	 * One beat of growth: rolls which kind to try first, places one platform - the other kind
+	 * if the first has nowhere to go - and rebuilds everything derived. The platform is drawn
+	 * from the placement stream out of every free slot across the whole structure at once.
+	 * Returns false when neither kind fits anywhere.
 	 */
-	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Walls")
-	bool PlaceNextWall();
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
+	bool PlaceNextPlatform();
 
-	/** Drops every storey and re-seeds the placement stream. Back to bare grid. */
-	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Floorspace")
-	void ClearFloorTiles();
+	/** Drops every platform and re-seeds the placement stream. Back to an empty cube. */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
+	void ClearPlatforms();
 
 	//~ Begin AActor Interface
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -608,7 +568,7 @@ private:
 	/** How many colours the surface overlay has: all-object, wall, and occupied. One component each. */
 	static constexpr int32 SurfaceMarkLayerCount = 3;
 
-	/** Where one cell's overlay square stands: which colour's component, and which instance of it. */
+	/** Where one surface's overlay square stands: which colour's component, and which instance of it. */
 	struct FSurfaceMarkSlot
 	{
 		int32 Layer = INDEX_NONE;
@@ -616,16 +576,16 @@ private:
 		/** INDEX_NONE while the square is still waiting to be added. */
 		int32 Instance = INDEX_NONE;
 
-		/** The sync that last found this cell claimed. Anything older is no longer claimed at all. */
+		/** The sync that last found this surface. Anything older is no longer a surface at all. */
 		uint32 SeenStamp = 0;
 	};
 
-	/** Every visual from scratch: the planes, the overlay and the debug lattice. */
+	/** Every visual from scratch: the pieces, the overlay and the debug lattice. */
 	void RebuildVisuals();
 
 	/**
-	 * What has to follow one placement. A placement only ever adds to the grid, so the lattice
-	 * stays as it is and the overlay takes just the cells that changed.
+	 * What has to follow one placement. A placement only ever adds to the structure, so the
+	 * lattice stays as it is and the pieces and overlay take just what changed.
 	 */
 	void UpdateVisualsAfterPlacement();
 
@@ -651,8 +611,8 @@ private:
 	};
 
 	/**
-	 * Brings the built geometry in line with the levels - one plane per ground tile and ground
-	 * beam cell, one box per slab, beam cell, wall and post above that - adding only what is new.
+	 * Brings the built geometry in line with the platforms - one box per interior, per edge and
+	 * per node - adding only what is new.
 	 */
 	void SyncPieces();
 
@@ -691,48 +651,69 @@ private:
 		FName ParameterName,
 		const FLinearColor& Color);
 
-	/** Resolves the world-space Z the whole grid sits at. Cached into GridBaseZ each rebuild. */
+	/** Resolves the world-space Z the whole cube stands at. Cached into GridBaseZ each rebuild. */
 	double ResolveGridBaseZ() const;
 
-	/** Rebuilds every level's derived state from its tiles and walls. Wholesale, so it cannot drift out of step. */
-	void RebuildSurfaces();
+	/** Lattice pitch in cells: a platform's interior plus the one rim line neighbours share. */
+	int32 GetPitch() const;
 
-	/** Adds a level above any that carries a wall, so the beams that wall leaves have somewhere to rest. */
-	void EnsureLevelCapacity();
+	/** GridPlatformsPerSide, clamped so the cube stays within MaxGridDimension cells. */
+	int32 GetPlatformsPerSide() const;
 
-	/** Every interior min corner a first, unconstrained tile could occupy. */
-	void GatherFirstTileCandidates(TArray<FIntPoint>& OutCandidates) const;
+	/** Cells along each side of the cube, worked out afresh rather than read from the readout. */
+	int32 ResolveGridSize() const;
 
-	/** Every interior min corner a next tile could occupy on one level. */
-	void GatherFloorTileCandidates(int32 Level, TArray<FIntPoint>& OutCandidates) const;
+	/** Z of the node layer the first platform is laid on: the one at the cube's centre, or just above it. */
+	int32 GetFirstPlatformLayer() const;
 
-	/** Every tile side a wall could still be raised on, on one level. */
-	void GatherWallCandidates(int32 Level, TArray<FWallSegment>& OutCandidates) const;
+	/** Whether a platform sits on the lattice with its whole footprint inside the cube. */
+	bool IsPlatformOnGrid(const FGridPlatform& Platform) const;
 
-	/** The placement beat: one tile or one wall. Stops its own timer once the grid has no room left. */
+	/** Rebuilds everything derived from Platforms. Wholesale, so it cannot drift out of step. */
+	void RebuildPlatformState();
+
+	/**
+	 * The axes along which a cell carries broad faces, one bit each, or zero when nothing is
+	 * built there. An interior cell carries one; a cell on an edge or a node can carry up to three.
+	 */
+	uint8 GetCellSurfaceAxes(const FIntVector& Cell, bool& bOutInterior) const;
+
+	/** Whether any platform covers this cell. */
+	bool IsSolidCell(const FIntVector& Cell) const;
+
+	/** What one face carries and whether it is built against, resolved together. */
+	void ResolveSurface(const FIntVector& Cell, EGridFace Face, ESurfaceCapacity& OutCapacity, bool& bOutOccupied) const;
+
+	/** Every lattice position the first platform could take. */
+	void GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const;
+
+	/** Every free slot of one kind around the structure, in key order. */
+	void GatherPlatformCandidates(EPlatformKind Kind, TArray<FGridPlatform>& OutCandidates) const;
+
+	/** Draws one platform of a kind from the placement stream and places it. False when that kind has nowhere to go. */
+	bool PlacePlatformOfKind(EPlatformKind Kind);
+
+	/** The placement beat. Stops its own timer once the structure has no room left. */
 	void AdvancePlacement();
 
 	void ResetPlacementStream();
 
+	/** Refreshes the readouts under Grid|Coordinates, which follow both the probe and the structure. */
+	void UpdateDebugReadouts();
+
 	void AppendLatticeLines(TArray<FBatchedLine>& Lines) const;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> FloorTilePlaneMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> HorizontalInteriorPieceMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> WallBeamPlaneMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> VerticalInteriorPieceMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> WallPieceMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> EdgePieceMaterial;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> WallPostPieceMaterial;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> SlabPieceMaterial;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> BeamPieceMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> NodePieceMaterial;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> AllObjectMarkMaterial;
@@ -743,42 +724,59 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> OccupiedMarkMaterial;
 
+	/*
+	 * Everything derived from Platforms. None of it is reflected, so none of it is saved or
+	 * copied with the actor - a loaded level or a PIE copy arrives with the list alone and
+	 * rebuilds the rest. All of it is sparse: keyed by packed cell coordinates, and holding only
+	 * what cannot be worked out from a coordinate on the spot.
+	 */
+
+	/** The platforms that fit the lattice as it stands, each once, in list order. */
+	TArray<FGridPlatform> BuiltPlatforms;
+
+	/** Every slot a platform fills, keyed by min node and normal axis. */
+	TSet<uint64> PlatformKeys;
+
 	/**
-	 * Every cell the overlay has drawn, keyed by level and cell index. Mirrors the mark
-	 * components and is neither saved nor duplicated with them, so a sync that finds the two
-	 * out of step starts again from scratch rather than trusting it.
+	 * Every cell on a built edge or node, with the axes it carries broad faces along. Interior
+	 * cells are not listed: whether one is built follows from the slot it lies in.
+	 */
+	TMap<uint64, uint8> RimCellNormals;
+
+	/** Rim surfaces promoted to all-object, keyed by cell and face. */
+	TSet<uint64> PromotedFaces;
+
+	/** Platforms in the list that the last rebuild left out, so the warning is given once rather than every beat. */
+	int32 ReportedSkippedPlatforms = 0;
+
+	/**
+	 * Every surface the overlay has drawn, keyed by cell and face. Mirrors the mark components
+	 * and is neither saved nor duplicated with them, so a sync that finds the two out of step
+	 * starts again from scratch rather than trusting it.
 	 */
 	TMap<uint64, FSurfaceMarkSlot> SurfaceMarkSlots;
 
-	/** Per colour, the key of the cell each instance stands for, in instance order. */
+	/** Per colour, the key of the surface each instance stands for, in instance order. */
 	TArray<uint64> SurfaceMarkInstanceKeys[SurfaceMarkLayerCount];
 
-	/** Bumped once per sync, to tell the cells it found claimed from ones it did not. */
+	/** Bumped once per sync, to tell the surfaces it found from ones it did not. */
 	uint32 SurfaceMarkSyncStamp = 0;
 
-	/** Ground tiles, drawn as flat planes. Starts from FloorTilePlanes. */
+	/** Interiors of horizontal platforms. Starts from HorizontalInteriorPieces. */
 	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer FloorTilePlaneLayer;
+	FRoomPieceLayer HorizontalInteriorLayer;
 
-	/** Ground beam cells, drawn as flat planes. Starts from WallBeamPlanes. */
+	/** Interiors of vertical platforms. Starts from VerticalInteriorPieces. */
 	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer WallBeamPlaneLayer;
+	FRoomPieceLayer VerticalInteriorLayer;
 
-	/** Tiles above the ground. Starts from SlabPieces. */
+	/** Lattice edges, the beams. Starts from EdgePieces. */
 	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer SlabLayer;
+	FRoomPieceLayer EdgeLayer;
 
-	/** Beam cells above the ground. Starts from BeamPieces. */
+	/** Lattice nodes, the posts. Starts from NodePieces. */
 	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer BeamLayer;
-
-	/** Walls on every level. Starts from WallPieces. */
-	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer WallLayer;
-
-	/** Corner posts on every level. Starts from WallPostPieces. */
-	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer WallPostLayer;
+	FRoomPieceLayer NodeLayer;
 
 	FRandomStream PlacementStream;
 
@@ -793,55 +791,48 @@ private:
 	 * those arrays - so with this actor selected during a run the panel rebuilt thousands of rows
 	 * a beat. BlueprintReadOnly keeps them reachable from Blueprint and MCP.
 	 *
-	 * The six piece components are each only the first chunk of their kind (see FRoomPieceLayer).
+	 * The four piece components are each only the first chunk of their kind (see FRoomPieceLayer).
 	 * Their settings - shadows, collision, mobility - are copied onto every chunk made after them.
 	 */
 
-	/** One instance per tile on the ground, scaled to the tile's whole interior. */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> FloorTilePlanes;
-
-	/** One instance per beam cell on the ground. Adjacent instances are coplanar, so a run reads as one beam. */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> WallBeamPlanes;
-
-	/** One instance per tile above the ground, where a tile is a slab rather than a reading. */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> SlabPieces;
-
-	/** One instance per beam cell above the ground, including the beams left resting on a wall. */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> BeamPieces;
-
 	/**
-	 * One instance per wall, spanning its whole run.
+	 * One instance per horizontal platform, spanning its whole interior.
 	 *
-	 * A wall is drawn as one box because it was placed as one thing, the way a floor tile is
-	 * drawn as one plane.
+	 * A platform's interior is drawn as one box because it was placed as one thing; its rim is
+	 * drawn apart, as edges and nodes, because neighbours share it.
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> WallPieces;
+	TObjectPtr<UInstancedStaticMeshComponent> HorizontalInteriorPieces;
 
-	/** One instance per corner post. Held apart from the walls so it can be coloured apart from them. */
+	/** One instance per vertical platform, spanning its whole interior. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> WallPostPieces;
+	TObjectPtr<UInstancedStaticMeshComponent> VerticalInteriorPieces;
 
-	/** The overlay's green squares: one per all-object cell, on every level. */
+	/** One instance per lattice edge in use, spanning its run. Shared edges are built once. */
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInstancedStaticMeshComponent> EdgePieces;
+
+	/** One instance per lattice node in use. Shared nodes are built once. */
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInstancedStaticMeshComponent> NodePieces;
+
+	/** The overlay's green squares: one per all-object surface. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> AllObjectSurfaceMarks;
 
-	/** The overlay's purple squares: one per wall-surface cell still free to take a wall. */
+	/** The overlay's purple squares: one per wall surface still free to take a wall. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> WallSurfaceMarks;
 
-	/** The overlay's white squares: one per cell already built on. */
+	/** The overlay's white squares: one per surface already built against. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> OccupiedSurfaceMarks;
 
 	/**
-	 * Draws the grid. An actor-owned batcher rather than DrawDebugLine/FlushPersistentDebugLines:
-	 * the global persistent-line buffer is world-wide, so flushing it to redraw this grid would
-	 * also wipe any other system's persistent debug lines, and vice versa.
+	 * Draws the ground lattice and the cube. An actor-owned batcher rather than
+	 * DrawDebugLine/FlushPersistentDebugLines: the global persistent-line buffer is world-wide, so
+	 * flushing it to redraw this grid would also wipe any other system's persistent debug lines,
+	 * and vice versa.
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<ULineBatchComponent> GridLineBatcher;
