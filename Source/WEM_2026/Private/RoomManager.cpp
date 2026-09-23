@@ -36,6 +36,20 @@ namespace
 	/** Edge length of the engine's unit cube, which every wall piece is scaled up from. */
 	constexpr double UnitCubeSize = 100.0;
 
+	/** The overlay's colours, in the order ARoomManager keeps their components and bookkeeping. */
+	enum ESurfaceMarkLayer : int32
+	{
+		AllObjectMarkLayer,
+		WallMarkLayer,
+		OccupiedMarkLayer
+	};
+
+	/** One key per cell per level, so every level's overlay shares a single record. */
+	FORCEINLINE uint64 MakeSurfaceMarkKey(const int32 Level, const int32 CellIndex)
+	{
+		return (static_cast<uint64>(Level) << 32) | static_cast<uint32>(CellIndex);
+	}
+
 	/** The four directions a tile can grow in. */
 	const FIntPoint FloorTileGrowthDirections[] = {
 		FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1)
@@ -162,6 +176,15 @@ ARoomManager::ARoomManager()
 	BeamPieces = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("BeamPieces"));
 	BeamPieces->SetupAttachment(SceneRoot);
 
+	AllObjectSurfaceMarks = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("AllObjectSurfaceMarks"));
+	AllObjectSurfaceMarks->SetupAttachment(SceneRoot);
+
+	WallSurfaceMarks = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("WallSurfaceMarks"));
+	WallSurfaceMarks->SetupAttachment(SceneRoot);
+
+	OccupiedSurfaceMarks = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("OccupiedSurfaceMarks"));
+	OccupiedSurfaceMarks->SetupAttachment(SceneRoot);
+
 	for (UInstancedStaticMeshComponent* Planes : { FloorTilePlanes.Get(), WallBeamPlanes.Get() })
 	{
 		// Flat, zero-thickness surfaces that mark out where things may go. They are not
@@ -181,6 +204,20 @@ ARoomManager::ARoomManager()
 		Pieces->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		Pieces->SetCastShadow(true);
 		Pieces->SetMobility(EComponentMobility::Movable);
+	}
+
+	for (UInstancedStaticMeshComponent* Marks :
+		{ AllObjectSurfaceMarks.Get(), WallSurfaceMarks.Get(), OccupiedSurfaceMarks.Get() })
+	{
+		// Notation laid over notation, one small square per claimed cell - tens of thousands of
+		// them once a 512 grid fills. Kept out of everything that would otherwise track each
+		// one: collision, shadows, distance fields, Lumen and ray tracing.
+		Marks->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Marks->SetCastShadow(false);
+		Marks->bAffectDistanceFieldLighting = false;
+		Marks->bAffectDynamicIndirectLighting = false;
+		Marks->SetVisibleInRayTracing(false);
+		Marks->SetMobility(EComponentMobility::Movable);
 	}
 
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> UnitPlaneMesh(TEXT("/Engine/BasicShapes/Plane.Plane"));
@@ -267,9 +304,18 @@ void ARoomManager::BeginPlay()
 	// visible before anything grows on it.
 	if (bAutoPlaceFloorTiles && FloorTilePlacementInterval > 0.0f)
 	{
+		FTimerManagerTimerParameters BeatParameters;
+		BeatParameters.bLoop = true;
+		BeatParameters.FirstDelay = FloorTilePlacementInterval;
+
+		// A beat that falls behind is dropped, not made up. Catching up would stack several
+		// placements into one frame that is already slow, which only makes the next one slower,
+		// and it would break the rhythm of one piece arriving at a time.
+		BeatParameters.bMaxOncePerFrame = true;
+
 		GetWorldTimerManager().SetTimer(
 			PlacementTimerHandle, this, &ARoomManager::AdvancePlacement,
-			FloorTilePlacementInterval, /*bLoop=*/true, /*InFirstDelay=*/FloorTilePlacementInterval);
+			FloorTilePlacementInterval, BeatParameters);
 	}
 }
 
@@ -546,7 +592,7 @@ bool ARoomManager::PlaceNextFloorTile()
 	Levels[Chosen.Key].Tiles.Add(Chosen.Value);
 
 	RebuildSurfaces();
-	RebuildVisuals();
+	UpdateVisualsAfterPlacement();
 
 	return true;
 }
@@ -627,7 +673,7 @@ bool ARoomManager::PlaceNextWall()
 	Levels[Chosen.Key].Walls.Add(Chosen.Value);
 
 	RebuildSurfaces();
-	RebuildVisuals();
+	UpdateVisualsAfterPlacement();
 
 	return true;
 }
@@ -669,18 +715,9 @@ void ARoomManager::AdvancePlacement()
 	// Nowhere left to grow. Stop the beat rather than retrying on every interval.
 	GetWorldTimerManager().ClearTimer(PlacementTimerHandle);
 
-	int32 TileTotal = 0;
-	int32 WallTotal = 0;
-
-	for (const FGridLevel& Level : Levels)
-	{
-		TileTotal += Level.Tiles.Num();
-		WallTotal += Level.Walls.Num();
-	}
-
 	UE_LOG(LogTemp, Log,
 		TEXT("RoomManager: growth stopped with %d tile(s) and %d wall(s) over %d level(s) - there is no room left."),
-		TileTotal, WallTotal, Levels.Num());
+		TotalTileCount, TotalWallCount, TotalLevelCount);
 }
 
 void ARoomManager::EnsureLevelCapacity()
@@ -892,6 +929,18 @@ void ARoomManager::RebuildSurfaces()
 			}
 		}
 	}
+
+	// The Details panel's view of the stack, in place of the stack itself.
+	TotalTileCount = 0;
+	TotalWallCount = 0;
+
+	for (const FGridLevel& Level : Levels)
+	{
+		TotalTileCount += Level.Tiles.Num();
+		TotalWallCount += Level.Walls.Num();
+	}
+
+	TotalLevelCount = Levels.Num();
 }
 
 double ARoomManager::ResolveGridBaseZ() const
@@ -923,7 +972,19 @@ double ARoomManager::ResolveGridBaseZ() const
 void ARoomManager::RebuildVisuals()
 {
 	RebuildPlanes();
+
+	// Whatever called this may have moved every cell - a new cell size, a new height, a
+	// resized grid - so not one square is kept.
+	ResetSurfaceMarks();
+	SyncSurfaceMarks();
+
 	RebuildDebugGrid();
+}
+
+void ARoomManager::UpdateVisualsAfterPlacement()
+{
+	RebuildPlanes();
+	SyncSurfaceMarks();
 }
 
 UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(
@@ -1149,24 +1210,18 @@ void ARoomManager::RebuildDebugGrid()
 
 	GridLineBatcher->Flush();
 
-	// The lattice and the surfaces are drawn into one batch but toggled separately, so the
-	// floorspace can be read on its own without the gridlines behind it.
+	// Only the lattice is drawn as lines. The surfaces are instanced squares instead: a line
+	// batcher hands every line to the renderer again each frame and is rebuilt whole whenever
+	// one line changes, which a filling grid's worth of cells made the costliest thing in a run.
+	if (!bShowDebugGrid)
+	{
+		return;
+	}
+
 	TArray<FBatchedLine> Lines;
+	AppendLatticeLines(Lines);
 
-	if (bShowDebugGrid)
-	{
-		AppendLatticeLines(Lines);
-	}
-
-	if (bShowSurfaces)
-	{
-		AppendSurfaceLines(Lines);
-	}
-
-	if (!Lines.IsEmpty())
-	{
-		GridLineBatcher->DrawLines(Lines);
-	}
+	GridLineBatcher->DrawLines(Lines);
 }
 
 void ARoomManager::AppendLatticeLines(TArray<FBatchedLine>& Lines) const
@@ -1234,89 +1289,244 @@ void ARoomManager::AppendLatticeLines(TArray<FBatchedLine>& Lines) const
 	}
 }
 
-void ARoomManager::AppendSurfaceLines(TArray<FBatchedLine>& Lines) const
+UInstancedStaticMeshComponent* ARoomManager::GetSurfaceMarkLayer(const int32 Layer) const
 {
+	switch (Layer)
+	{
+	case AllObjectMarkLayer: return AllObjectSurfaceMarks;
+	case WallMarkLayer: return WallSurfaceMarks;
+	case OccupiedMarkLayer: return OccupiedSurfaceMarks;
+	default: return nullptr;
+	}
+}
+
+void ARoomManager::ResetSurfaceMarks()
+{
+	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	{
+		UInstancedStaticMeshComponent* Marks = GetSurfaceMarkLayer(Layer);
+
+		if (Marks && Marks->GetInstanceCount() > 0)
+		{
+			Marks->ClearInstances();
+		}
+
+		SurfaceMarkInstanceKeys[Layer].Reset();
+	}
+
+	SurfaceMarkSlots.Reset();
+}
+
+void ARoomManager::RemoveSurfaceMark(const int32 Layer, const int32 Instance)
+{
+	UInstancedStaticMeshComponent* Marks = GetSurfaceMarkLayer(Layer);
+
+	if (!Marks || !SurfaceMarkInstanceKeys[Layer].IsValidIndex(Instance))
+	{
+		return;
+	}
+
+	TArray<uint64>& Keys = SurfaceMarkInstanceKeys[Layer];
+	const int32 Last = Keys.Num() - 1;
+
+	// Only the last instance is ever removed, so no other square changes index and the record
+	// needs one fix-up at most: the last square is moved into the hole first. The component
+	// has a swap-removal of its own, but it is free to ignore being asked for it, which would
+	// leave this record guessing.
+	if (Instance != Last)
+	{
+		FTransform LastTransform;
+		Marks->GetInstanceTransform(Last, LastTransform, /*bWorldSpace=*/true);
+		Marks->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true);
+
+		Keys[Instance] = Keys[Last];
+		SurfaceMarkSlots.FindChecked(Keys[Instance]).Instance = Instance;
+	}
+
+	Marks->RemoveInstance(Last);
+	Keys.Pop(EAllowShrinking::No);
+}
+
+void ARoomManager::SyncSurfaceMarks()
+{
+	UInstancedStaticMeshComponent* const MarkLayers[SurfaceMarkLayerCount] =
+		{ AllObjectSurfaceMarks, WallSurfaceMarks, OccupiedSurfaceMarks };
+
+	for (const UInstancedStaticMeshComponent* Marks : MarkLayers)
+	{
+		if (!Marks)
+		{
+			return;
+		}
+	}
+
 	// Each claimed cell is drawn as its own inset square, so a run of them reads as a row
 	// of tiles rather than one unbroken sheet of colour.
 	const double Inset = CellSize * SurfaceCellInsetFraction;
 	const double Span = CellSize - 2.0 * Inset;
 
-	if (Span <= 0.0)
+	if (!bShowSurfaces || !PlaneMesh || Levels.IsEmpty() || Span <= 0.0)
 	{
+		ResetSurfaceMarks();
 		return;
 	}
 
-	const FLinearColor AllObjectColor(AllObjectSurfaceColor);
-	const FLinearColor WallSurface(WallSurfaceColor);
-	const FLinearColor OccupiedColor(OccupiedSurfaceColor);
+	// The record is neither saved nor duplicated with the components, so a loaded level or a
+	// PIE copy arrives with squares it knows nothing about. Start clean rather than add to them.
+	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	{
+		if (MarkLayers[Layer]->GetInstanceCount() != SurfaceMarkInstanceKeys[Layer].Num())
+		{
+			ResetSurfaceMarks();
+			break;
+		}
+	}
 
+	const FColor LayerColors[SurfaceMarkLayerCount] =
+		{ AllObjectSurfaceColor, WallSurfaceColor, OccupiedSurfaceColor };
+
+	TObjectPtr<UMaterialInstanceDynamic>* const LayerMaterials[SurfaceMarkLayerCount] =
+		{ &AllObjectMarkMaterial, &WallMarkMaterial, &OccupiedMarkMaterial };
+
+	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	{
+		MarkLayers[Layer]->SetStaticMesh(PlaneMesh);
+		MarkLayers[Layer]->SetMaterial(0, ResolveTintedMaterial(
+			*LayerMaterials[Layer], PlaneMaterial, PlaneColorParameterName, FLinearColor(LayerColors[Layer])));
+	}
+
+	const FVector MarkScale(Span / UnitPlaneSize, Span / UnitPlaneSize, 1.0);
 	const int32 TileSize = FMath::Max(FloorTileSize, 1);
 
-	// Every storey is read the same way, each at its own height, so the stack can be
-	// inspected from the side as well as from above.
-	for (int32 LevelIndex = 0; LevelIndex < Levels.Num(); ++LevelIndex)
+	TArray<FTransform> NewMarks[SurfaceMarkLayerCount];
+	TArray<uint64> NewMarkKeys[SurfaceMarkLayerCount];
+
+	// One pass over every claimed cell. A square already the right colour is left alone; one
+	// whose cell has changed - a beam promoted into floorspace, a wall raised on it - moves to
+	// the right colour; a cell claimed since the last pass gets a new square. Returns false if
+	// the record holds a cell the pass no longer found claimed.
+	auto WalkClaimedCells = [&]() -> bool
 	{
-		const FGridLevel& Level = Levels[LevelIndex];
+		++SurfaceMarkSyncStamp;
+		int32 ClaimedCells = 0;
 
-		// GetCellMinCorner puts a cell on the ground, so the lift is measured from there.
-		const double LevelZ = GetLevelBaseZ(LevelIndex) - GridBaseZ + PlaneZOffset + SurfaceOverlayZBias;
-
-		auto AppendCellSquare = [&](const FIntPoint& Cell)
+		// Every storey is read the same way, each at its own height, so the stack can be
+		// inspected from the side as well as from above.
+		for (int32 LevelIndex = 0; LevelIndex < Levels.Num(); ++LevelIndex)
 		{
-			const int32 Index = CellToIndex(Cell);
+			const FGridLevel& Level = Levels[LevelIndex];
 
-			if (!Level.CellSurfaces.IsValidIndex(Index))
+			// Measured from the planes rather than the grid base, so raising PlaneZOffset
+			// cannot bury the overlay underneath them.
+			const double MarkZ = GetLevelBaseZ(LevelIndex) + PlaneZOffset + SurfaceOverlayZBias;
+
+			auto SyncCell = [&](const FIntPoint& Cell)
 			{
-				return;
-			}
+				const int32 Index = CellToIndex(Cell);
 
-			const EGridSurface Surface = Level.CellSurfaces[Index];
-
-			if (Surface == EGridSurface::Empty)
-			{
-				return;
-			}
-
-			const FVector SquareMin = GetCellMinCorner(Cell) + FVector(Inset, Inset, LevelZ);
-
-			const FVector A = SquareMin;
-			const FVector B = SquareMin + FVector(Span, 0.0, 0.0);
-			const FVector C = SquareMin + FVector(Span, Span, 0.0);
-			const FVector D = SquareMin + FVector(0.0, Span, 0.0);
-
-			// Occupancy is drawn instead of the surface, since what a cell is free to take is
-			// the more useful reading and a built-on cell has stopped offering it.
-			const FLinearColor& Color =
-				(Level.CellOccupied.IsValidIndex(Index) && Level.CellOccupied[Index] != 0)
-					? OccupiedColor
-					: ((Surface == EGridSurface::AllObject) ? AllObjectColor : WallSurface);
-
-			Lines.Emplace(A, B, Color, /*LifeTime=*/0.0f, SurfaceLineThickness, SDPG_World);
-			Lines.Emplace(B, C, Color, /*LifeTime=*/0.0f, SurfaceLineThickness, SDPG_World);
-			Lines.Emplace(C, D, Color, /*LifeTime=*/0.0f, SurfaceLineThickness, SDPG_World);
-			Lines.Emplace(D, A, Color, /*LifeTime=*/0.0f, SurfaceLineThickness, SDPG_World);
-		};
-
-		// A claimed cell is either inside a tile or a beam, and the two lists hold every one of
-		// them with no overlap - a beam is only ever written where no interior has been. So the
-		// same squares come out of walking those lists as out of reading the whole grid, without
-		// asking the 262144 cells of a 512 grid, nearly all empty, one at a time.
-		for (const FIntPoint& TileMin : Level.Tiles)
-		{
-			const FIntPoint TileMax = InteriorMaxCorner(TileMin, TileSize);
-
-			for (int32 Y = TileMin.Y; Y <= TileMax.Y; ++Y)
-			{
-				for (int32 X = TileMin.X; X <= TileMax.X; ++X)
+				if (!Level.CellSurfaces.IsValidIndex(Index) || Level.CellSurfaces[Index] == EGridSurface::Empty)
 				{
-					AppendCellSquare(FIntPoint(X, Y));
+					return;
+				}
+
+				const uint64 Key = MakeSurfaceMarkKey(LevelIndex, Index);
+				FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindOrAdd(Key);
+
+				// Counted once however often the lists name it, so the tally below stays honest.
+				if (Slot.SeenStamp == SurfaceMarkSyncStamp)
+				{
+					return;
+				}
+
+				Slot.SeenStamp = SurfaceMarkSyncStamp;
+				++ClaimedCells;
+
+				// Occupancy is drawn instead of the surface, since what a cell is free to take is
+				// the more useful reading and a built-on cell has stopped offering it.
+				const int32 Layer =
+					(Level.CellOccupied.IsValidIndex(Index) && Level.CellOccupied[Index] != 0)
+						? OccupiedMarkLayer
+						: ((Level.CellSurfaces[Index] == EGridSurface::AllObject) ? AllObjectMarkLayer : WallMarkLayer);
+
+				if (Slot.Layer == Layer)
+				{
+					return;
+				}
+
+				if (Slot.Layer != INDEX_NONE)
+				{
+					RemoveSurfaceMark(Slot.Layer, Slot.Instance);
+				}
+
+				Slot.Layer = Layer;
+				Slot.Instance = INDEX_NONE;
+
+				const FVector Corner = GetCellMinCorner(Cell);
+				const FVector Center(Corner.X + 0.5 * CellSize, Corner.Y + 0.5 * CellSize, MarkZ);
+
+				NewMarks[Layer].Emplace(FRotator::ZeroRotator, Center, MarkScale);
+				NewMarkKeys[Layer].Add(Key);
+			};
+
+			// A claimed cell is either inside a tile or a beam, and the two lists hold every one
+			// of them - a beam is only ever written where no interior has been. So the same
+			// squares come out of walking those lists as out of reading the whole grid, without
+			// asking the 262144 cells of a 512 grid, nearly all empty, one at a time.
+			for (const FIntPoint& TileMin : Level.Tiles)
+			{
+				const FIntPoint TileMax = InteriorMaxCorner(TileMin, TileSize);
+
+				for (int32 Y = TileMin.Y; Y <= TileMax.Y; ++Y)
+				{
+					for (int32 X = TileMin.X; X <= TileMax.X; ++X)
+					{
+						SyncCell(FIntPoint(X, Y));
+					}
 				}
 			}
+
+			for (const FIntPoint& BeamCell : Level.BeamCells)
+			{
+				SyncCell(BeamCell);
+			}
 		}
 
-		for (const FIntPoint& BeamCell : Level.BeamCells)
+		return ClaimedCells == SurfaceMarkSlots.Num();
+	};
+
+	// Placement only ever adds, so a cell once claimed stays claimed and a square never has
+	// to be taken away. If that stops holding the tally will not match: redraw from scratch.
+	if (!WalkClaimedCells())
+	{
+		ResetSurfaceMarks();
+
+		for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
 		{
-			AppendCellSquare(BeamCell);
+			NewMarks[Layer].Reset();
+			NewMarkKeys[Layer].Reset();
 		}
+
+		WalkClaimedCells();
+	}
+
+	// Each colour's new squares go in as one batch, for the same reason the planes do.
+	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	{
+		if (NewMarks[Layer].IsEmpty())
+		{
+			continue;
+		}
+
+		TArray<uint64>& Keys = SurfaceMarkInstanceKeys[Layer];
+		const int32 FirstInstance = Keys.Num();
+
+		MarkLayers[Layer]->AddInstances(NewMarks[Layer], /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+
+		for (int32 Offset = 0; Offset < NewMarkKeys[Layer].Num(); ++Offset)
+		{
+			SurfaceMarkSlots.FindChecked(NewMarkKeys[Layer][Offset]).Instance = FirstInstance + Offset;
+		}
+
+		Keys.Append(NewMarkKeys[Layer]);
 	}
 }

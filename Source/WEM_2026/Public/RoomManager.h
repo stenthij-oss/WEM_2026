@@ -240,9 +240,25 @@ public:
 	 *
 	 * The tiles and walls in here are the whole of what has been placed; everything else is
 	 * derived from them, so this list alone is the simulation's state.
+	 *
+	 * Deliberately kept out of the Details panel. Every placement changes it, and the panel
+	 * answers a changed array by rebuilding its whole property tree - with this actor selected
+	 * during a run that cost over a second a frame. The counts below stand in for it there.
 	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid|Floorspace")
+	UPROPERTY(BlueprintReadOnly, Category = "Grid|Floorspace")
 	TArray<FGridLevel> Levels;
+
+	/** Tiles laid down across every level. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
+	int32 TotalTileCount = 0;
+
+	/** Walls raised across every level. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
+	int32 TotalWallCount = 0;
+
+	/** How many storeys the stack is currently deep. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Floorspace")
+	int32 TotalLevelCount = 0;
 
 	/**
 	 * Chance that a beat raises a wall rather than laying a floor tile.
@@ -370,6 +386,9 @@ public:
 	 * green and purple. This is the only view that shows which beams have been promoted -
 	 * the planes cannot, since a promoted beam is still a beam - so it reads on top of them
 	 * rather than instead of them, and both are on by default.
+	 *
+	 * The squares are instanced and only the cells a placement changed are touched, so the
+	 * overlay costs little however far the grid has filled.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	bool bShowSurfaces = true;
@@ -400,10 +419,6 @@ public:
 	/** Drawn thicker than the interior so the grid reads as surrounded by a boundary line. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug", meta = (ClampMin = "0.1"))
 	float BoundaryLineThickness = 5.0f;
-
-	/** Heavy enough that an inset cell square reads as filled rather than outlined. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug", meta = (ClampMin = "0.1"))
-	float SurfaceLineThickness = 4.0f;
 
 	/** Marks DebugCell in the viewport so a single cell can be located by coordinate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Coordinates")
@@ -560,11 +575,43 @@ protected:
 	//~ End AActor Interface
 
 private:
-	/** Everything that has to follow a change to the tiles: the planes and the debug draw. */
+	/** How many colours the surface overlay has: all-object, wall, and occupied. One component each. */
+	static constexpr int32 SurfaceMarkLayerCount = 3;
+
+	/** Where one cell's overlay square stands: which colour's component, and which instance of it. */
+	struct FSurfaceMarkSlot
+	{
+		int32 Layer = INDEX_NONE;
+
+		/** INDEX_NONE while the square is still waiting to be added. */
+		int32 Instance = INDEX_NONE;
+
+		/** The sync that last found this cell claimed. Anything older is no longer claimed at all. */
+		uint32 SeenStamp = 0;
+	};
+
+	/** Every visual from scratch: the planes, the overlay and the debug lattice. */
 	void RebuildVisuals();
+
+	/**
+	 * What has to follow one placement. A placement only ever adds to the grid, so the lattice
+	 * stays as it is and the overlay takes just the cells that changed.
+	 */
+	void UpdateVisualsAfterPlacement();
 
 	/** Flushes and redraws the debug lattice. Owned batcher, so no other system's lines are touched. */
 	void RebuildDebugGrid();
+
+	/** Drops every overlay square and the record of them, so the next sync draws the lot. */
+	void ResetSurfaceMarks();
+
+	/** Brings the overlay in line with the surfaces, adding, recolouring or dropping only what differs. */
+	void SyncSurfaceMarks();
+
+	/** Takes one square out of a colour's component without moving any square but the last. */
+	void RemoveSurfaceMark(int32 Layer, int32 Instance);
+
+	UInstancedStaticMeshComponent* GetSurfaceMarkLayer(int32 Layer) const;
 
 	/** Rebuilds the built geometry: one plane per floor tile, one per beam cell, one box per wall and post. */
 	void RebuildPlanes();
@@ -603,7 +650,6 @@ private:
 	void ResetPlacementStream();
 
 	void AppendLatticeLines(TArray<FBatchedLine>& Lines) const;
-	void AppendSurfaceLines(TArray<FBatchedLine>& Lines) const;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> FloorTilePlaneMaterial;
@@ -623,6 +669,28 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> BeamPieceMaterial;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> AllObjectMarkMaterial;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> WallMarkMaterial;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> OccupiedMarkMaterial;
+
+	/**
+	 * Every cell the overlay has drawn, keyed by level and cell index. Mirrors the mark
+	 * components and is neither saved nor duplicated with them, so a sync that finds the two
+	 * out of step starts again from scratch rather than trusting it.
+	 */
+	TMap<uint64, FSurfaceMarkSlot> SurfaceMarkSlots;
+
+	/** Per colour, the key of the cell each instance stands for, in instance order. */
+	TArray<uint64> SurfaceMarkInstanceKeys[SurfaceMarkLayerCount];
+
+	/** Bumped once per sync, to tell the cells it found claimed from ones it did not. */
+	uint32 SurfaceMarkSyncStamp = 0;
+
 	FRandomStream PlacementStream;
 
 	FTimerHandle PlacementTimerHandle;
@@ -630,20 +698,27 @@ private:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USceneComponent> SceneRoot;
 
+	/*
+	 * The instanced components below are not VisibleAnywhere. The Details panel shows a visible
+	 * component's properties inline, its per-instance array included, and every placement changes
+	 * those arrays - so with this actor selected during a run the panel rebuilt thousands of rows
+	 * a beat. BlueprintReadOnly keeps them reachable from Blueprint and MCP.
+	 */
+
 	/** One instance per tile on the ground, scaled to the tile's whole interior. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> FloorTilePlanes;
 
 	/** One instance per beam cell on the ground. Adjacent instances are coplanar, so a run reads as one beam. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> WallBeamPlanes;
 
 	/** One instance per tile above the ground, where a tile is a slab rather than a reading. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> SlabPieces;
 
 	/** One instance per beam cell above the ground, including the beams left resting on a wall. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> BeamPieces;
 
 	/**
@@ -652,12 +727,24 @@ private:
 	 * A wall is drawn as one box because it was placed as one thing, the way a floor tile is
 	 * drawn as one plane.
 	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> WallPieces;
 
 	/** One instance per corner post. Held apart from the walls so it can be coloured apart from them. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> WallPostPieces;
+
+	/** The overlay's green squares: one per all-object cell, on every level. */
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInstancedStaticMeshComponent> AllObjectSurfaceMarks;
+
+	/** The overlay's purple squares: one per wall-surface cell still free to take a wall. */
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInstancedStaticMeshComponent> WallSurfaceMarks;
+
+	/** The overlay's white squares: one per cell already built on. */
+	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UInstancedStaticMeshComponent> OccupiedSurfaceMarks;
 
 	/**
 	 * Draws the grid. An actor-owned batcher rather than DrawDebugLine/FlushPersistentDebugLines:
