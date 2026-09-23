@@ -868,17 +868,19 @@ bool ARoomManager::CanPlacePlatform(const FGridPlatform& Platform) const
 	const int32 Module = GetModule();
 	const int32 NormalAxis = AxisIndex(Platform.Normal);
 	bool bTouchesStructure = false;
+	bool bFlush = true;
 	bool bFoldsLegally = true;
 
 	// The placement is judged against every platform it would share a module edge with, not only
-	// the one it was found from. Continuing a platform in its own plane asks nothing more, but a
-	// single fold that is refused refuses the whole placement - otherwise a wall carrying on from
-	// one already standing could be raised over a seam that has opened, closing it again.
+	// the one it was found from. It has to lie flush with each of them. Continuing a platform in
+	// its own plane asks nothing more, but a single fold that is refused refuses the whole
+	// placement - otherwise a wall carrying on from one already standing could be raised over a
+	// seam that has opened, closing it again.
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
 		// Only its rim can be shared, and only where some platform already runs around the same
 		// edge. IsSpaceFree has already seen to it that none runs across it.
-		if (!bRim || !bFoldsLegally || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		if (!bRim || !bFlush || !bFoldsLegally || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
 		{
 			return;
 		}
@@ -888,12 +890,32 @@ bool ARoomManager::CanPlacePlatform(const FGridPlatform& Platform) const
 		FModuleFace Faces[4];
 		GetEdgeFaces(Edge, Module, Faces);
 
+		bool bFoldChecked = false;
+
 		for (const FModuleFace& Face : Faces)
 		{
-			if (Face.Normal == NormalAxis || !ModuleFaceOwners.Contains(MakeModuleFaceKey(Face.MinNode, Face.Normal)))
+			const int32* Owner = ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal));
+
+			if (!Owner)
 			{
 				continue;
 			}
+
+			// Every platform met along the edge, whichever way it faces, has to be met flush.
+			if (!IsFlushWith(Platform, BuiltPlatforms[*Owner], Edge.Axis))
+			{
+				bFlush = false;
+				return;
+			}
+
+			// A neighbour on the other side of this placement's plane would be folded off from
+			// the same run toward the same side, so one check answers for both.
+			if (Face.Normal == NormalAxis || bFoldChecked)
+			{
+				continue;
+			}
+
+			bFoldChecked = true;
 
 			// A fold leaves the edge along the neighbour's normal, to one side of it or the
 			// other. Every cell of the edge's run has to be offering itself on that side: wall
@@ -911,15 +933,11 @@ bool ARoomManager::CanPlacePlatform(const FGridPlatform& Platform) const
 
 				bFoldsLegally = Capacity == ESurfaceCapacity::Wall && !bOccupied;
 			}
-
-			// A neighbour on the other side of this placement's plane would be folded off from
-			// the same run toward the same side, so one check answers for both.
-			break;
 		}
 	});
 
 	// A placement touching nothing would start a second structure; growth only ever extends the one.
-	return bFoldsLegally && bTouchesStructure;
+	return bFlush && bFoldsLegally && bTouchesStructure;
 }
 
 void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const
@@ -1343,9 +1361,40 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 	return bFree;
 }
 
+bool ARoomManager::IsFlushWith(const FGridPlatform& Platform, const FGridPlatform& Neighbour, const int32 SharedAxis) const
+{
+	// Where a platform's side runs along the shared line: from its min node, as far as it reaches
+	// along that axis.
+	auto GetSide = [this, SharedAxis](const FGridPlatform& Side, int32& OutStart, int32& OutEnd)
+	{
+		int32 SpanU, SpanV, U, V;
+		GetPlatformSpans(Side, SpanU, SpanV);
+		GetInPlaneAxes(AxisIndex(Side.Normal), U, V);
+
+		OutStart = Side.MinNode[SharedAxis];
+		OutEnd = OutStart + (SharedAxis == U ? SpanU : (SharedAxis == V ? SpanV : 0));
+	};
+
+	int32 Start, End, NeighbourStart, NeighbourEnd;
+	GetSide(Platform, Start, End);
+	GetSide(Neighbour, NeighbourStart, NeighbourEnd);
+
+	const int32 StartStep = FMath::Abs(Start - NeighbourStart);
+	const int32 EndStep = FMath::Abs(End - NeighbourEnd);
+
+	// A step shorter than any tile's side leaves a notch beside it that nothing can fill flush.
+	auto IsFillable = [this](const int32 Step)
+	{
+		return Step == 0 || Step >= SmallestTileSide;
+	};
+
+	return (StartStep == 0 || EndStep == 0) && IsFillable(StartStep) && IsFillable(EndStep);
+}
+
 void ARoomManager::ResolveUsableTiles()
 {
 	UsableTiles.Reset();
+	SmallestTileSide = 0;
 
 	const int32 Module = GetModule();
 	TArray<FString> Problems;
@@ -1361,6 +1410,9 @@ void ARoomManager::ResolveUsableTiles()
 		if (IsTileUsable(Tile))
 		{
 			UsableTiles.Add(Tile);
+
+			const int32 ShorterSide = FMath::Min(Tile->Width, Tile->Length);
+			SmallestTileSide = SmallestTileSide == 0 ? ShorterSide : FMath::Min(SmallestTileSide, ShorterSide);
 		}
 		else
 		{

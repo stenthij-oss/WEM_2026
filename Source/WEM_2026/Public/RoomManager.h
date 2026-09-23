@@ -232,8 +232,12 @@ struct FSurfaceMarkLayer
  * picks one. From there the structure has as far to grow on every side before it reaches the
  * cube's faces. Every one after grows off the structure, sharing at least one module edge of rim
  * with a platform already placed: either carrying it on in its own plane, or folding off it - up
- * and down from a floor, sideways from a wall. It may sit anywhere along the edge it shares, a
- * module at a time.
+ * and down from a floor, sideways from a wall.
+ *
+ * It lies flush with every platform it shares rim with. Along the line the two share, their sides
+ * start or end together - one corner at least lines up, so tiles never stagger - and wherever the
+ * other end does not, the step between them is at least the shortest side of any tile. A step any
+ * shorter would leave a notch no tile could ever be laid into flush.
  *
  * A placement is free when it lies wholly inside the cube and on nothing already built but rim
  * it can share: none of its module faces is taken, nothing runs across its interior, and its own
@@ -612,7 +616,8 @@ public:
 	 *
 	 * It has to sit on the lattice with its whole footprint inside the cube, taking no module
 	 * face already taken, with nothing built across its interior and no other interior under its
-	 * rim, and share at least one module edge with a platform already placed. For every platform
+	 * rim, and share at least one module edge with a platform already placed. It has to lie flush
+	 * with every platform it shares an edge with, in its plane or across it. For every platform
 	 * it would fold off - one it shares an edge with but faces across - every cell of each shared
 	 * edge's run must still offer a free wall surface on the side it would fold toward. Before
 	 * anything is placed, only FirstTile, horizontal and at the middle of the cube's centre
@@ -862,6 +867,13 @@ private:
 	 */
 	bool IsSpaceFree(const FGridPlatform& Platform) const;
 
+	/**
+	 * Whether a platform lies flush with a neighbour it shares rim with, along the axis of the
+	 * line they share: their sides there start or end together, and wherever they do not, the
+	 * step between them is at least SmallestTileSide.
+	 */
+	bool IsFlushWith(const FGridPlatform& Platform, const FGridPlatform& Neighbour, int32 SharedAxis) const;
+
 	/** Brings the usable tiles and the warnings about the rest up to date with Tiles, FirstTile and the module. */
 	void ResolveUsableTiles();
 
@@ -1020,6 +1032,9 @@ private:
 
 	/** The tiles growth draws from: Tiles, less empty entries, repeats, and any that do not fit the lattice. */
 	TArray<TObjectPtr<UPlatformTileData>> UsableTiles;
+
+	/** The shortest side of any usable tile: the narrowest step between two flush platforms that growth could still fill. */
+	int32 SmallestTileSide = 0;
 
 	/**
 	 * Every free placement, per usable tile and in the same order as UsableTiles, then per kind,
