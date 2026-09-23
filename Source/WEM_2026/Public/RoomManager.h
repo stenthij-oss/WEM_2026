@@ -201,8 +201,11 @@ struct FSurfaceMarkLayer
  *
  * Growth
  * ------
- * The first platform is horizontal and in the sky: on the node layer at the cube's centre, at a
- * random lattice position across it. Every one after grows off an edge of a platform already
+ * The first platform is horizontal and in the sky, at the heart of the cube: on the node layer at
+ * its centre, and at the middle of that layer - the one lattice position there when the cube is
+ * an odd number of platforms across, or, when it is even, one of the four meeting at the centre
+ * node, drawn from the placement stream. From there the structure has as far to grow on every
+ * side before it reaches the cube's faces. Every one after grows off an edge of a platform already
  * placed. An edge is shared by up to four slots, two in each of the two planes that contain it,
  * so each edge offers three more: the coplanar slot that carries its platform on past it, and
  * the two that fold off it - up and down from a floor, sideways from a wall.
@@ -566,8 +569,8 @@ public:
 	 * empty and whose interior is unbuilt, sharing at least one edge with a platform already
 	 * placed. For every platform it would fold off - one it shares an edge with but faces
 	 * across - every cell of that edge's run must still offer a free wall surface on the side it
-	 * would fold toward. Before anything is placed, only a horizontal platform on the cube's
-	 * centre layer passes.
+	 * would fold toward. Before anything is placed, only a horizontal platform at the middle of
+	 * the cube's centre layer passes.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
 	bool CanPlacePlatform(const FIntVector& MinNode, EGridAxis Normal) const;
@@ -771,6 +774,13 @@ private:
 	/** Z of the node layer the first platform is laid on: the one at the cube's centre, or just above it. */
 	int32 GetFirstPlatformLayer() const;
 
+	/**
+	 * The lattice positions nearest the cube's centre, along X and along Y alike, counted in
+	 * platforms from its corner: one when the cube is an odd number of platforms across, the
+	 * two either side of the centre node when it is even.
+	 */
+	void GetFirstPlatformSlots(int32& OutFirstSlot, int32& OutLastSlot) const;
+
 	/** Whether a platform sits on the lattice with its whole footprint inside the cube. */
 	bool IsPlatformOnGrid(const FGridPlatform& Platform) const;
 
@@ -808,7 +818,7 @@ private:
 	/** What one face carries and whether it is built against, resolved together. */
 	void ResolveSurface(const FIntVector& Cell, EGridFace Face, ESurfaceCapacity& OutCapacity, bool& bOutOccupied) const;
 
-	/** Every lattice position the first platform could take. */
+	/** Every lattice position the first platform could take: the one or four at the centre of the centre layer. */
 	void GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const;
 
 	/** Every free slot of one kind around the structure, in key order. Walks the whole structure. */

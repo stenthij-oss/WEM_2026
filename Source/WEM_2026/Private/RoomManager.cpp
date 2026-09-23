@@ -693,10 +693,18 @@ bool ARoomManager::CanPlacePlatform(const FIntVector& MinNode, const EGridAxis N
 	}
 
 	// With nothing placed there is nothing to grow from, so the first platform has a rule of
-	// its own: horizontal, and on the centre layer.
+	// its own: horizontal, on the centre layer, and at the centre of it.
 	if (BuiltPlatforms.IsEmpty())
 	{
-		return Normal == EGridAxis::Z && MinNode.Z == GetFirstPlatformLayer();
+		int32 FirstSlot, LastSlot;
+		GetFirstPlatformSlots(FirstSlot, LastSlot);
+
+		const int32 FirstNode = FirstSlot * GetPitch();
+		const int32 LastNode = LastSlot * GetPitch();
+
+		return Normal == EGridAxis::Z && MinNode.Z == GetFirstPlatformLayer()
+			&& MinNode.X >= FirstNode && MinNode.X <= LastNode
+			&& MinNode.Y >= FirstNode && MinNode.Y <= LastNode;
 	}
 
 	if (PlatformKeys.Contains(MakePlatformKey(Candidate)))
@@ -778,14 +786,16 @@ void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandi
 	OutCandidates.Reset();
 
 	const int32 Pitch = GetPitch();
-	const int32 PlatformsPerSide = GetPlatformsPerSide();
 	const int32 Layer = GetFirstPlatformLayer();
 
-	// Every lattice position across the centre layer. The lattice is pinned to the cube, so the
-	// first platform only chooses where on it to start, never where the lattice falls.
-	for (int32 SlotY = 0; SlotY < PlatformsPerSide; ++SlotY)
+	int32 FirstSlot, LastSlot;
+	GetFirstPlatformSlots(FirstSlot, LastSlot);
+
+	// The lattice positions at the middle of the centre layer, so the structure starts at the
+	// heart of the cube and has as far to grow on every side before it reaches the faces.
+	for (int32 SlotY = FirstSlot; SlotY <= LastSlot; ++SlotY)
 	{
-		for (int32 SlotX = 0; SlotX < PlatformsPerSide; ++SlotX)
+		for (int32 SlotX = FirstSlot; SlotX <= LastSlot; ++SlotX)
 		{
 			OutCandidates.Add(MakePlatform(FIntVector(SlotX * Pitch, SlotY * Pitch, Layer), AxisIndex(EGridAxis::Z)));
 		}
@@ -985,6 +995,16 @@ int32 ARoomManager::GetFirstPlatformLayer() const
 	// side one lands exactly on the centre; with an odd count the centre falls mid-pitch, and
 	// the layer just above it is taken.
 	return ((GetPlatformsPerSide() + 1) / 2) * GetPitch();
+}
+
+void ARoomManager::GetFirstPlatformSlots(int32& OutFirstSlot, int32& OutLastSlot) const
+{
+	// Lattice positions across the cube, counted in platforms from its corner. With an odd
+	// count one sits squarely on the centre; with an even count the centre falls on a node, and
+	// the two either side of it are equally near.
+	const int32 PlatformsPerSide = GetPlatformsPerSide();
+	OutFirstSlot = (PlatformsPerSide - 1) / 2;
+	OutLastSlot = PlatformsPerSide / 2;
 }
 
 bool ARoomManager::IsPlatformOnGrid(const FGridPlatform& Platform) const
