@@ -13,15 +13,16 @@ class ULineBatchComponent;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
+class UPlatformTileData;
 class UStaticMesh;
 
 /** Defined in Components/LineBatchComponent.h; only the drawing code in the .cpp needs it. */
 struct FBatchedLine;
 
 /**
- * The two kinds of platform. Every platform is the same size and built the same way - the
- * kind only says which way it faces, which is what makes a floor, a wall and a ceiling one
- * object.
+ * The two kinds of platform. Every platform is built the same way, whatever tile it is laid
+ * from - the kind only says which way it faces, which is what makes a floor, a wall and a
+ * ceiling one object.
  */
 UENUM(BlueprintType)
 enum class EPlatformKind : uint8
@@ -74,11 +75,12 @@ enum class ESurfaceCapacity : uint8
 };
 
 /**
- * One placed platform: a single face of the lattice, named by its min node and the axis it
- * faces along.
+ * One placed platform: a rectangle of the lattice's module faces, named by its min node, the axis
+ * it faces along, and the tile it was laid from.
  *
  * Only the axis is stored. The kind follows from it - facing Z is horizontal, facing X or Y
- * is vertical - so storing the kind as well would only leave room for the two to disagree.
+ * is vertical - so storing the kind as well would only leave room for the two to disagree. Its
+ * size follows from the tile the same way, so changing a tile reshapes every platform laid from it.
  */
 USTRUCT(BlueprintType)
 struct FGridPlatform
@@ -92,6 +94,14 @@ struct FGridPlatform
 	/** The axis the platform faces along. Its two broad faces look out either way along it. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
 	EGridAxis Normal = EGridAxis::Z;
+
+	/** The tile it was laid from, which gives it its size and what it is built with. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	TObjectPtr<UPlatformTileData> Tile;
+
+	/** Laid the other way round: the tile's length runs where its width would, and its width where its length would. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	bool bTurned = false;
 
 	EPlatformKind GetKind() const
 	{
@@ -113,8 +123,8 @@ struct FGridSurfaceRef
 };
 
 /**
- * One kind of built piece - horizontal interior, vertical interior, edge, node - spread over a
- * run of small instanced components, "chunks", filled one at a time.
+ * One kind of built piece - horizontal interior, vertical interior, a tile's own mesh, edge,
+ * node - spread over a run of small instanced components, "chunks", filled one at a time.
  *
  * Lumen throws away its surface cache for every instance of a component whose instance count
  * changes, then recaptures all of it over the frames that follow. With a kind of piece in one
@@ -129,8 +139,9 @@ struct FRoomPieceLayer
 
 	/**
 	 * Oldest first, and only the last is ever still being filled. The first is the actor's own
-	 * component for this kind of piece; the rest are made as the structure grows and never saved.
-	 * Not copied with the actor either: each layer property on ARoomManager is DuplicateTransient.
+	 * component for this kind of piece, or for a tile's mesh one made alongside the layer; the
+	 * rest are made as the structure grows. None but the actor's own are saved, and none are
+	 * copied with the actor: each layer property on ARoomManager is DuplicateTransient.
 	 */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UInstancedStaticMeshComponent>> Chunks;
@@ -140,6 +151,20 @@ struct FRoomPieceLayer
 
 	/** Bumped once per sync. Never zero after the first, which marks a piece as not yet drawn. */
 	uint32 SyncStamp = 0;
+};
+
+/** The interiors of platforms whose tile brings a mesh of its own: one piece layer per tile. */
+USTRUCT()
+struct FTileMeshLayer
+{
+	GENERATED_BODY()
+
+	UPROPERTY(Transient)
+	TObjectPtr<UPlatformTileData> Tile;
+
+	/** Its first chunk is made with the layer, set up like HorizontalInteriorPieces, rather than being one of the actor's own. */
+	UPROPERTY(Transient)
+	FRoomPieceLayer Pieces;
 };
 
 /**
@@ -184,44 +209,48 @@ struct FSurfaceMarkLayer
  *
  * The lattice
  * -----------
- * Everything placed is a platform: a PlatformSize x PlatformSize interior ringed by a one-cell
+ * Everything placed is a platform, laid from one of the Tiles: an interior ringed by a one-cell
  * rim of beams, one cell thick. Neighbouring platforms share their rims rather than doubling
- * them up, so they sit at a pitch of PlatformSize + 1 and the whole structure lies on one
- * lattice. Its nodes, one every pitch along each axis, are the posts where beams meet; its
- * edges are the PlatformSize cells of beam between two neighbouring nodes; and each of its
- * faces is one slot a platform can fill - interior, four edges and four nodes. A platform is
- * named by its min node and the axis it faces along, and two platforms can share edges and
- * nodes but never interior cells.
+ * them up, so a tile is measured beam to beam, and every size is a whole number of lattice
+ * modules - LatticeModule cells, the step from one lattice node to the next along each axis. The
+ * nodes are where beams can meet; a module edge is the LatticeModule - 1 cells of beam between
+ * two neighbouring nodes; a module face is the square four module edges ring. A platform covers a
+ * rectangle of module faces in one plane. Every edge and node around it is its rim, and every one
+ * inside it is interior, bridged without a beam. It is named by its min node and the axis it
+ * faces along, and two platforms can share rim but never interior.
  *
  * The lattice is pinned to the cube rather than to whatever happens to be placed first. Nodes
- * sit at every multiple of the pitch from the cube's corner, and the cube is sized in whole
- * platforms - GridPlatformsPerSide of them - so a node lands on its far face as well. A
- * structure that grows out to the edge therefore finishes flush with the cube, its outer beams
- * lying on the cube's faces on every side.
+ * sit at every multiple of the module from the cube's corner, and the cube is rounded down to
+ * whole modules, so a node lands on its far face as well. A structure that grows out to the edge
+ * therefore finishes flush with the cube, its outer beams lying on the cube's faces on every side.
  *
  * Growth
  * ------
- * The first platform is horizontal and in the sky, at the heart of the cube: on the node layer at
- * its centre, and at the middle of that layer - the one lattice position there when the cube is
- * an odd number of platforms across, or, when it is even, one of the four meeting at the centre
- * node, drawn from the placement stream. From there the structure has as far to grow on every
- * side before it reaches the cube's faces. Every one after grows off an edge of a platform already
- * placed. An edge is shared by up to four slots, two in each of the two planes that contain it,
- * so each edge offers three more: the coplanar slot that carries its platform on past it, and
- * the two that fold off it - up and down from a floor, sideways from a wall.
+ * The first platform is always laid from FirstTile, horizontal and in the sky, at the heart of
+ * the cube: on the node layer at its centre, and centred on that layer as nearly as the lattice
+ * allows - where the centre falls between two positions along an axis, the placement stream
+ * picks one. From there the structure has as far to grow on every side before it reaches the
+ * cube's faces. Every one after grows off the structure, sharing at least one module edge of rim
+ * with a platform already placed: either carrying it on in its own plane, or folding off it - up
+ * and down from a floor, sideways from a wall. It may sit anywhere along the edge it shares, a
+ * module at a time.
  *
- * A slot is free when it is empty, lies wholly inside the cube, and none of its interior has
- * been built. A fold asks more: the edge it folds off must still be offering itself on the side
- * the fold goes toward, which means every cell of the edge's run has to present a face there
- * that is wall surface and not yet built against. The posts at the run's ends are not asked,
- * since a post is shared by whatever meets at it. That is what keeps walls on the outside of the
- * floorspace: the moment two floors conjoin, the edge between them opens into all-object surface
- * and no longer offers itself.
+ * A placement is free when it lies wholly inside the cube and on nothing already built but rim
+ * it can share: none of its module faces is taken, nothing runs across its interior, and its own
+ * rim runs across no other platform's interior. A fold asks more: every module edge it shares
+ * with a platform it folds off must still be offering itself on the side the fold goes toward,
+ * which means every cell of that edge's run has to present a face there that is wall surface and
+ * not yet built against. The nodes are not asked, since a node is shared by whatever meets at it.
+ * That is what keeps walls on the outside of the floorspace: the moment two floors conjoin, the
+ * seam between them opens into all-object surface and no longer offers itself.
  *
- * A slot is judged against every platform it touches, not only the one it was found from - it
- * has to fold legally off each perpendicular platform it shares an edge with. So a wall that
+ * A placement is judged against every platform it touches, not only the one it was found from -
+ * it has to fold legally off each perpendicular platform it shares an edge with. So a wall that
  * would carry on from one already standing still cannot be raised over a seam that has opened,
  * and a surface that has opened is never closed again afterwards.
+ *
+ * Each beat rolls which kind to try first, then which tile, by the tiles' weights among those
+ * with somewhere to go, then draws one of that tile's free placements.
  *
  * Surfaces
  * --------
@@ -230,16 +259,17 @@ struct FSurfaceMarkLayer
  * platforms facing two ways both run through carries surfaces along both.
  *
  * What a surface carries follows from the cell: interior surfaces carry anything, rim surfaces
- * walls only. A surface is occupied once the cell it looks into has been built, and occupancy
- * outranks what it carries.
+ * walls only. A tile can close off one side of its interior (UPlatformTileData::BlockedFace), and
+ * there it carries nothing and is not a surface at all. A surface is occupied once the cell it
+ * looks into has been built, and occupancy outranks what it carries.
  *
  * A rim surface caught between two fields stops being rim and joins them: a wall surface
  * flanked, within its own plane and on its own side, by all-object surfaces on opposite sides is
  * promoted to all-object. Occupied surfaces never promote and never count as all-object for the
- * ones beside them. The outer rim can never satisfy the rule, since it always has emptiness on
- * one side, so a field grows while staying enclosed. Promotions feed each other - the node at
- * the centre of a 2x2 only opens once the seams around it have - so the rule is resolved to a
- * fixpoint.
+ * ones beside them, and neither does a blocked side. The outer rim can never satisfy the rule,
+ * since it always has emptiness on one side, so a field grows while staying enclosed. Promotions
+ * feed each other - the node at the centre of a 2x2 only opens once the seams around it have -
+ * so the rule is resolved to a fixpoint.
  *
  * Because promotion goes side by side, a wall divides only the side it stands on. A wall raised
  * on a free edge builds against that edge's top faces, which stay closed; a floor conjoining
@@ -267,23 +297,19 @@ class WEM_2026_API ARoomManager : public AActor
 public:
 	ARoomManager();
 
-	/** Hard cap on cells along each side of the cube. Re-applied in code, since the cube is sized in platforms. */
+	/** Hard cap on cells along each side of the cube. Re-applied in code. */
 	static constexpr int32 MaxGridDimension = 512;
 
 	/**
-	 * Size of the cube, counted in platforms along each side.
+	 * Cells along each side of the cube.
 	 *
-	 * Counted in platforms rather than cells so the lattice always fits it exactly: a cube of
-	 * whole platforms has a node on both of its faces along every axis, which is what lets a
-	 * structure's outer beams lie flush with it. Clamped in code so the cube stays within
-	 * MaxGridDimension cells.
+	 * Rounded down in code to a whole number of lattice modules and the node that closes the far
+	 * side, so the lattice fits the cube exactly: a node lands on both of its faces along every
+	 * axis, which is what lets a structure's outer beams lie flush with it. Counted in cells rather
+	 * than in platforms, since platforms now come in more than one size.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1"))
-	int32 GridPlatformsPerSide = 6;
-
-	/** Cells along each side of the cube: a pitch per platform, plus the node that closes the far side. Readout only. */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid")
-	int32 GridSize = 0;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "3", ClampMax = "512"))
+	int32 GridSize = 65;
 
 	/** Edge length of one cell, in centimetres. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid", meta = (ClampMin = "1.0"))
@@ -301,9 +327,24 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Placement")
 	TEnumAsByte<ECollisionChannel> LandscapeTraceChannel = ECC_WorldStatic;
 
-	/** Cells per side of one platform's interior, before its beam rim. The lattice pitch is one more. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "1"))
-	int32 PlatformSize = 8;
+	/**
+	 * Cells from one lattice node to the next along each axis: the step every tile's size, and
+	 * every platform's position, is a whole number of. A tile whose sides are not is left out of
+	 * growth, with a warning.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "2"))
+	int32 LatticeModule = 4;
+
+	/** The tiles growth lays platforms from, each chosen by its weight. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
+	TArray<TObjectPtr<UPlatformTileData>> Tiles;
+
+	/**
+	 * The tile the first platform is always laid from, whatever its weight. It need not be among
+	 * Tiles as well; if it is not, it is only ever laid first. Nothing grows without it.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
+	TObjectPtr<UPlatformTileData> FirstTile;
 
 	/** Seconds between automatic placements. One platform, rim and all, per beat. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "0.0"))
@@ -326,7 +367,8 @@ public:
 	 *
 	 * The roll only decides which kind is tried first: when the chosen kind has nowhere to go
 	 * the other one takes the beat, so a beat is lost only when the structure has room for
-	 * neither. That also covers the opening beat, which only a horizontal can take.
+	 * neither. That also covers the opening beat, which only a horizontal can take. The tile is
+	 * rolled after the kind.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float VerticalPlacementChance = 0.5f;
@@ -360,7 +402,8 @@ public:
 
 	/**
 	 * Unit box every piece is built from: the engine's 100cm cube, centred on its own origin.
-	 * Anything with those conventions can be swapped in.
+	 * Anything with those conventions can be swapped in. Across the interior of a tile with a
+	 * mesh of its own, that mesh is built instead.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	TObjectPtr<UStaticMesh> PieceMesh;
@@ -379,7 +422,8 @@ public:
 	FName PieceColorParameterName = FName(TEXT("Color"));
 
 	/**
-	 * The interiors of horizontal platforms - floor and ceiling at once.
+	 * The interiors of horizontal platforms - floor and ceiling at once. A tile's own mesh keeps
+	 * its own materials rather than taking this or the colour below.
 	 *
 	 * These are straight linear albedos and not pitched to suit an exposure: the pieces are
 	 * lit, so what lands on screen is whatever the level's exposure makes of them. A level left
@@ -394,11 +438,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	FLinearColor VerticalInteriorColor = FLinearColor(0.25f, 0.10f, 0.03f);
 
-	/** The beams: one run per lattice edge, however many platforms share it. */
+	/** The beams: one run per module edge of rim, however many platforms share it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	FLinearColor EdgeColor = FLinearColor(0.21f, 0.21f, 0.21f);
 
-	/** The posts: one per lattice node, however many beams meet there. */
+	/** The posts: one per lattice node of rim, however many beams meet there. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	FLinearColor NodeColor = FLinearColor(0.21f, 0.21f, 0.21f);
 
@@ -563,23 +607,25 @@ public:
 	int32 GetPlatformCount() const;
 
 	/**
-	 * Whether a platform could be placed at this min node, facing along this axis.
+	 * Whether a platform could be placed: at its min node, facing along its axis, laid from its
+	 * tile the way round it says.
 	 *
-	 * It has to sit on the lattice with its whole footprint inside the cube, in a slot that is
-	 * empty and whose interior is unbuilt, sharing at least one edge with a platform already
-	 * placed. For every platform it would fold off - one it shares an edge with but faces
-	 * across - every cell of that edge's run must still offer a free wall surface on the side it
-	 * would fold toward. Before anything is placed, only a horizontal platform at the middle of
-	 * the cube's centre layer passes.
+	 * It has to sit on the lattice with its whole footprint inside the cube, taking no module
+	 * face already taken, with nothing built across its interior and no other interior under its
+	 * rim, and share at least one module edge with a platform already placed. For every platform
+	 * it would fold off - one it shares an edge with but faces across - every cell of each shared
+	 * edge's run must still offer a free wall surface on the side it would fold toward. Before
+	 * anything is placed, only FirstTile, horizontal and at the middle of the cube's centre
+	 * layer, passes.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
-	bool CanPlacePlatform(const FIntVector& MinNode, EGridAxis Normal) const;
+	bool CanPlacePlatform(const FGridPlatform& Platform) const;
 
 	/**
-	 * One beat of growth: rolls which kind to try first, places one platform - the other kind
-	 * if the first has nowhere to go - and brings everything derived up to date. The platform is
-	 * drawn from the placement stream out of every free slot across the whole structure at once.
-	 * Returns false when neither kind fits anywhere.
+	 * One beat of growth: rolls which kind to try first, then which tile, places one platform -
+	 * the other kind if the first has nowhere to go - and brings everything derived up to date.
+	 * The platform is drawn from the placement stream out of every free placement of that tile
+	 * across the whole structure at once. Returns false when neither kind fits anywhere.
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
 	bool PlaceNextPlatform();
@@ -602,8 +648,12 @@ private:
 	/** How many colours the surface overlay has: all-object, wall, and occupied. A chunked layer each. */
 	static constexpr int32 SurfaceMarkLayerCount = 3;
 
-	/** How many kinds of platform there are, which is how many candidate lists are kept. */
+	/** How many kinds of platform there are, which is how many candidate lists each tile keeps. */
 	static constexpr int32 PlatformKindCount = 2;
+
+	/** How a module edge is taken in: around a platform as rim, or across one as interior. */
+	static constexpr uint8 RimEdgeUse = 1 << 0;
+	static constexpr uint8 InteriorEdgeUse = 1 << 1;
 
 	/** Where one surface's overlay square stands: which colour, which of its chunks, and which instance there. */
 	struct FSurfaceMarkSlot
@@ -665,10 +715,16 @@ private:
 	bool AreSurfaceMarksIntact() const;
 
 	/**
-	 * Resolves one surface and moves its square to the colour it should be, queueing a new square
-	 * in Pending when it needs one. Returns true when the square had to be added or recoloured.
+	 * The colour one surface's square should be, or INDEX_NONE when the face is not a surface at
+	 * all - nothing built faces that way, or a tile has blocked that side off.
 	 */
-	bool SyncSurfaceMark(const FIntVector& Cell, EGridFace Face, uint64 Key, FSurfaceMarkSlot& Slot, FPendingSurfaceMarks& Pending);
+	int32 ResolveSurfaceMarkLayer(const FIntVector& Cell, EGridFace Face) const;
+
+	/**
+	 * Moves one surface's square to the colour Layer, queueing a new square in Pending when it
+	 * needs one. Returns true when the square had to be added or recoloured.
+	 */
+	bool SyncSurfaceMark(const FIntVector& Cell, EGridFace Face, uint64 Key, int32 Layer, FSurfaceMarkSlot& Slot, FPendingSurfaceMarks& Pending);
 
 	/** Adds the queued squares, filling each colour's last chunk and starting a new one whenever that is full. */
 	void AddPendingSurfaceMarks(const FPendingSurfaceMarks& Pending);
@@ -693,10 +749,22 @@ private:
 		FTransform Transform;
 	};
 
+	/** Pieces sorted by the layer each goes to: one platform's worth, or the whole structure's. */
+	struct FGatheredPieces
+	{
+		TArray<FPlacedPiece> HorizontalInteriors;
+		TArray<FPlacedPiece> VerticalInteriors;
+		TArray<FPlacedPiece> Edges;
+		TArray<FPlacedPiece> Nodes;
+
+		/** Interiors of tiles that bring a mesh of their own, per tile. */
+		TMap<UPlatformTileData*, TArray<FPlacedPiece>> MeshInteriors;
+	};
+
 	/**
-	 * Brings the built geometry in line with the platforms - one box per interior, per edge and
-	 * per node - adding only what is new. Walks the whole structure. Returns how many pieces it
-	 * had to add.
+	 * Brings the built geometry in line with the platforms - one piece per interior, per module
+	 * edge and per node of rim - adding only what is new. Walks the whole structure. Returns how
+	 * many pieces it had to add.
 	 */
 	int32 SyncPieces();
 
@@ -707,15 +775,16 @@ private:
 	void AppendPlatformPieces(const FGridPlatform& Platform);
 
 	/** One platform's pieces, appended to the list for each kind. */
-	void GatherPlatformPieces(
-		const FGridPlatform& Platform,
-		TArray<FPlacedPiece>& OutHorizontalInteriors,
-		TArray<FPlacedPiece>& OutVerticalInteriors,
-		TArray<FPlacedPiece>& OutEdges,
-		TArray<FPlacedPiece>& OutNodes) const;
+	void GatherPlatformPieces(const FGridPlatform& Platform, FGatheredPieces& OutPieces) const;
 
 	/** Drops every piece of every kind, so the next sync builds the lot. */
 	void ResetPieces();
+
+	/** The layer a tile's mesh is built in, made the first time the tile needs one. */
+	FTileMeshLayer& FindOrAddTileMeshLayer(UPlatformTileData* Tile);
+
+	/** Takes down every tile's mesh layer, first chunk and all. */
+	void ResetTileMeshLayers();
 
 	/**
 	 * Adds the pieces a layer has not drawn yet. If a piece it did draw is missing from Pieces,
@@ -738,16 +807,18 @@ private:
 	/** Empties a layer back to its first chunk, cleared. */
 	void ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk);
 
-	/** Destroys every chunk but the first, clears that, and leaves it as the only one. */
+	/** Destroys every chunk but the first, clears that, and leaves it as the only one. With no first, destroys the lot. */
 	void ResetChunks(TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks, UInstancedStaticMeshComponent* FirstChunk);
 
 	/**
-	 * Starts a new chunk and appends it to Chunks. Set up like the first - mesh and material
-	 * included - so the first has to be brought up to date before this is called.
+	 * Starts a new chunk and appends it to Chunks. Set up like FirstChunk - mesh and material
+	 * included - so that has to be brought up to date before this is called. Named after it
+	 * unless given a name of its own.
 	 */
 	UInstancedStaticMeshComponent* AddInstancedChunk(
 		TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
-		UInstancedStaticMeshComponent* FirstChunk);
+		UInstancedStaticMeshComponent* FirstChunk,
+		FName BaseName = NAME_None);
 
 	/**
 	 * Dynamic instance of a base material tinted to Color, made once and re-tinted after that.
@@ -762,27 +833,37 @@ private:
 	/** Resolves the world-space Z the whole cube stands at. Cached into GridBaseZ each rebuild. */
 	double ResolveGridBaseZ() const;
 
-	/** Lattice pitch in cells: a platform's interior plus the one rim line neighbours share. */
-	int32 GetPitch() const;
+	/** LatticeModule, clamped so that at least one module, and the node closing it, fit the cube. */
+	int32 GetModule() const;
 
-	/** GridPlatformsPerSide, clamped so the cube stays within MaxGridDimension cells. */
-	int32 GetPlatformsPerSide() const;
-
-	/** Cells along each side of the cube, worked out afresh rather than read from the readout. */
+	/** Cells along each side of the cube: GridSize, clamped and rounded down to whole modules and the closing node. */
 	int32 ResolveGridSize() const;
 
 	/** Z of the node layer the first platform is laid on: the one at the cube's centre, or just above it. */
 	int32 GetFirstPlatformLayer() const;
 
-	/**
-	 * The lattice positions nearest the cube's centre, along X and along Y alike, counted in
-	 * platforms from its corner: one when the cube is an odd number of platforms across, the
-	 * two either side of the centre node when it is even.
-	 */
-	void GetFirstPlatformSlots(int32& OutFirstSlot, int32& OutLastSlot) const;
+	/** Whether a tile can be laid on the lattice as it stands: both of its sides whole multiples of the module. */
+	bool IsTileUsable(const UPlatformTileData* Tile) const;
 
-	/** Whether a platform sits on the lattice with its whole footprint inside the cube. */
+	/**
+	 * A platform's size in cells, beam to beam, along its first and second in-plane axes - its
+	 * tile's width and length, swapped when it is turned. False when its tile is not usable.
+	 */
+	bool GetPlatformSpans(const FGridPlatform& Platform, int32& OutSpanFirst, int32& OutSpanSecond) const;
+
+	/** Whether a platform sits on the lattice, laid from a usable tile, with its whole footprint inside the cube. */
 	bool IsPlatformOnGrid(const FGridPlatform& Platform) const;
+
+	/**
+	 * Whether a platform on the grid would stand on nothing already built but rim it can share:
+	 * none of its module faces taken, nothing built along any module edge across its interior,
+	 * and no other platform's interior along the module edges around it. The half of
+	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well.
+	 */
+	bool IsSpaceFree(const FGridPlatform& Platform) const;
+
+	/** Brings the usable tiles and the warnings about the rest up to date with Tiles, FirstTile and the module. */
+	void ResolveUsableTiles();
 
 	/**
 	 * Rebuilds everything derived from Platforms. Wholesale, so it cannot drift out of step -
@@ -791,14 +872,17 @@ private:
 	void RebuildPlatformState();
 
 	/**
-	 * Takes one newly placed platform into the derived state without rebuilding it: its slot and
-	 * rim, the surfaces it builds against, and the promotions that spread out from it. Collects
-	 * every surface whose capacity or occupancy may have changed, for the overlay.
+	 * Takes one newly placed platform into the derived state without rebuilding it: its module
+	 * faces, edges and rim, the surfaces it builds against, and the promotions that spread out
+	 * from it. Collects every surface whose capacity or occupancy may have changed, for the overlay.
 	 */
 	void AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGridSurfaceRef>& OutChangedSurfaces);
 
-	/** Records a platform's rim cells, each with the axis the platform faces along. */
-	void RecordRimCells(const FGridPlatform& Platform);
+	/**
+	 * Adds a platform to BuiltPlatforms and records what it takes in: its module faces, its
+	 * module edges - rim or interior - and its rim cells, each with the axis it faces along.
+	 */
+	void RecordPlatform(const FGridPlatform& Platform);
 
 	/**
 	 * The promotion rule: flanked, within its own plane and on its own side, by open all-object
@@ -808,9 +892,21 @@ private:
 
 	/**
 	 * The axes along which a cell carries broad faces, one bit each, or zero when nothing is
-	 * built there. An interior cell carries one; a cell on an edge or a node can carry up to three.
+	 * built there. An interior cell carries one, and names the platform it is interior to in
+	 * OutInteriorOwner - an index into BuiltPlatforms, or INDEX_NONE for anything else. A cell of
+	 * rim, on a module edge or a node, can carry up to three.
 	 */
-	uint8 GetCellSurfaceAxes(const FIntVector& Cell, bool& bOutInterior) const;
+	uint8 GetCellSurfaceAxes(const FIntVector& Cell, int32& OutInteriorOwner) const;
+
+	/**
+	 * The platform whose interior takes in a cell lying on the lattice plane facing NormalAxis:
+	 * the one covering every module face the cell touches in that plane. INDEX_NONE when there is
+	 * none - a cell on a platform's rim touches a face outside it.
+	 */
+	int32 FindInteriorOwner(const FIntVector& Cell, int32 NormalAxis) const;
+
+	/** Whether a platform's tile has blocked off this side of its interior. */
+	bool IsFaceBlocked(const FGridPlatform& Platform, EGridFace Face) const;
 
 	/** Whether any platform covers this cell. */
 	bool IsSolidCell(const FIntVector& Cell) const;
@@ -818,19 +914,29 @@ private:
 	/** What one face carries and whether it is built against, resolved together. */
 	void ResolveSurface(const FIntVector& Cell, EGridFace Face, ESurfaceCapacity& OutCapacity, bool& bOutOccupied) const;
 
-	/** Every lattice position the first platform could take: the one or four at the centre of the centre layer. */
+	/**
+	 * Every placement FirstTile could take to start the structure: centred on the cube's centre
+	 * layer, one to four of them for each way round it may lie.
+	 */
 	void GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const;
 
-	/** Every free slot of one kind around the structure, in key order. Walks the whole structure. */
-	void GatherPlatformCandidates(EPlatformKind Kind, TArray<FGridPlatform>& OutCandidates) const;
+	/** Every free placement of every usable tile around the structure, into TileCandidates. Walks the whole structure. */
+	void GatherPlatformCandidates();
 
-	/** Gathers both candidate lists afresh if a rebuild has left them stale. */
+	/** Gathers every tile's candidate lists afresh if a rebuild has left them stale. */
 	void EnsurePlatformCandidates();
 
-	/** Re-judges one slot, adding it to or dropping it from its kind's candidates to match. */
-	void RefreshPlatformCandidate(const FGridPlatform& Slot);
+	/**
+	 * Re-judges one placement of the usable tile at TileIndex, adding it to or dropping it from
+	 * its list to match. A placement not listed is only judged when bMayHaveComeFree says a
+	 * placement may just have given it something to grow off. Returns whether it was judged.
+	 */
+	bool RefreshPlatformCandidate(int32 TileIndex, const FGridPlatform& Candidate, bool bMayHaveComeFree);
 
-	/** Draws one platform of a kind from the placement stream and places it. False when that kind has nowhere to go. */
+	/**
+	 * Draws one platform of a kind from the placement stream - a tile by weight, then one of its
+	 * placements - and places it. False when that kind has nowhere to go.
+	 */
 	bool PlacePlatformOfKind(EPlatformKind Kind);
 
 	/**
@@ -870,41 +976,67 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> OccupiedMarkMaterial;
 
+	/** One usable tile, and every free placement of it per kind (indexed by EPlatformKind), each list in ascending key order. */
+	struct FTileCandidates
+	{
+		TObjectPtr<UPlatformTileData> Tile;
+		TArray<FGridPlatform> ByKind[PlatformKindCount];
+	};
+
 	/*
 	 * Everything derived from Platforms. None of it is reflected, so none of it is saved or
 	 * copied with the actor - a loaded level or a PIE copy arrives with the list alone and
 	 * rebuilds the rest. All of it is sparse: keyed by packed cell coordinates, and holding only
 	 * what cannot be worked out from a coordinate on the spot. RebuildPlatformState makes it from
 	 * scratch; AddPlacedPlatform keeps it up to date one placement at a time.
+	 *
+	 * The tiles are held here by pointer only. Tiles and Platforms hold them for real.
 	 */
 
 	/** The platforms that fit the lattice as it stands, each once, in list order. */
 	TArray<FGridPlatform> BuiltPlatforms;
 
-	/** Every slot a platform fills, keyed by min node and normal axis. */
-	TSet<uint64> PlatformKeys;
+	/**
+	 * Every module face a platform covers, keyed by min node and normal axis, with the index in
+	 * BuiltPlatforms of the platform covering it. A platform's own key is its min face's.
+	 */
+	TMap<uint64, int32> ModuleFaceOwners;
 
 	/**
-	 * Every cell on a built edge or node, with the axes it carries broad faces along. Interior
-	 * cells are not listed: whether one is built follows from the slot it lies in.
+	 * Every module edge a platform takes in, keyed by min node and axis: RimEdgeUse where one runs
+	 * around a platform, InteriorEdgeUse where one runs across a platform's interior.
+	 */
+	TMap<uint64, uint8> ModuleEdgeUses;
+
+	/**
+	 * Every cell of rim - on a module edge or node around a platform - with the axes it carries
+	 * broad faces along. Interior cells are not listed: whether one is built follows from the
+	 * module faces around it.
 	 */
 	TMap<uint64, uint8> RimCellNormals;
 
 	/** Rim surfaces promoted to all-object, keyed by cell and face. */
 	TSet<uint64> PromotedFaces;
 
+	/** The tiles growth draws from: Tiles, less empty entries, repeats, and any that do not fit the lattice. */
+	TArray<TObjectPtr<UPlatformTileData>> UsableTiles;
+
 	/**
-	 * Every free slot, per kind (indexed by EPlatformKind), in ascending key order - the order
-	 * the placement stream draws from. Kept up to date placement by placement: only slots around an
-	 * edge that a placement touched or opened can have changed, so only those are judged again.
+	 * Every free placement, per usable tile and in the same order as UsableTiles, then per kind,
+	 * in ascending key order - the order the placement stream draws from. Kept up to date
+	 * placement by placement: only placements taking in a module edge that a placement touched or
+	 * opened can have changed, so only those are judged again.
 	 */
-	TArray<FGridPlatform> PlatformCandidates[PlatformKindCount];
+	TArray<FTileCandidates> TileCandidates;
 
 	/** Set by every rebuild, and by the first placement; the next draw then gathers the lists afresh. */
 	bool bPlatformCandidatesStale = true;
 
 	/** Platforms in the list that the last rebuild left out, so the warning is given once rather than every beat. */
 	int32 ReportedSkippedPlatforms = 0;
+
+	/** What the last warning about the tiles said, so it is given again only when that changes. */
+	FString ReportedTileProblems;
 
 	/** Placements since wem.RoomManager.VerifyEvery last checked one, and the tally of those checks. */
 	int32 PlacementsSinceVerify = 0;
@@ -950,13 +1082,17 @@ private:
 	UPROPERTY(Transient, DuplicateTransient)
 	FRoomPieceLayer VerticalInteriorLayer;
 
-	/** Lattice edges, the beams. Starts from EdgePieces. */
+	/** Module edges of rim, the beams. Starts from EdgePieces. */
 	UPROPERTY(Transient, DuplicateTransient)
 	FRoomPieceLayer EdgeLayer;
 
-	/** Lattice nodes, the posts. Starts from NodePieces. */
+	/** Lattice nodes of rim, the posts. Starts from NodePieces. */
 	UPROPERTY(Transient, DuplicateTransient)
 	FRoomPieceLayer NodeLayer;
+
+	/** Interiors of platforms whose tile brings its own mesh, a layer per tile. Made at runtime and never saved. */
+	UPROPERTY(Transient, DuplicateTransient)
+	TArray<FTileMeshLayer> TileMeshLayers;
 
 	FRandomStream PlacementStream;
 
@@ -977,7 +1113,8 @@ private:
 	 */
 
 	/**
-	 * One instance per horizontal platform, spanning its whole interior.
+	 * One instance per horizontal platform, spanning its whole interior - unless its tile brings
+	 * a mesh of its own, which is built in a layer of that tile's instead.
 	 *
 	 * A platform's interior is drawn as one box because it was placed as one thing; its rim is
 	 * drawn apart, as edges and nodes, because neighbours share it.
@@ -989,11 +1126,11 @@ private:
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> VerticalInteriorPieces;
 
-	/** One instance per lattice edge in use, spanning its run. Shared edges are built once. */
+	/** One instance per module edge of rim, spanning its run. Shared edges are built once. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> EdgePieces;
 
-	/** One instance per lattice node in use. Shared nodes are built once. */
+	/** One instance per lattice node of rim. Shared nodes are built once. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> NodePieces;
 

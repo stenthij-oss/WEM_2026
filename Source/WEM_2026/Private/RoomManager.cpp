@@ -2,6 +2,7 @@
 
 #include "RoomManager.h"
 
+#include "PlatformTileData.h"
 #include "Algo/BinarySearch.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
@@ -123,11 +124,15 @@ namespace
 		return Step;
 	}
 
-	/** The two axes a platform facing along NormalAxis lies across. */
-	FORCEINLINE void GetInPlaneAxes(const int32 NormalAxis, int32& OutU, int32& OutV)
+	/**
+	 * The two axes a platform facing along NormalAxis lies across, in the order its tile's width
+	 * and length run: the first is always level, and up a wall the second is height. Across a
+	 * floor they are X and Y; along a wall facing X, Y and Z; along one facing Y, X and Z.
+	 */
+	FORCEINLINE void GetInPlaneAxes(const int32 NormalAxis, int32& OutFirst, int32& OutSecond)
 	{
-		OutU = (NormalAxis + 1) % 3;
-		OutV = (NormalAxis + 2) % 3;
+		OutFirst = NormalAxis == 0 ? 1 : 0;
+		OutSecond = NormalAxis == 2 ? 1 : 2;
 	}
 
 	/** EGridFace runs +X, -X, +Y, -Y, +Z, -Z, so the axis and the sign fall straight out of it. */
@@ -157,21 +162,42 @@ namespace
 		return MakeTaggedKey(Cell, static_cast<int32>(Face));
 	}
 
-	FORCEINLINE FGridPlatform MakePlatform(const FIntVector& MinNode, const int32 NormalAxis)
+	FORCEINLINE FGridPlatform MakePlatform(
+		const FIntVector& MinNode,
+		const int32 NormalAxis,
+		UPlatformTileData* Tile,
+		const bool bTurned)
 	{
 		FGridPlatform Platform;
 		Platform.MinNode = MinNode;
 		Platform.Normal = static_cast<EGridAxis>(NormalAxis);
+		Platform.Tile = Tile;
+		Platform.bTurned = bTurned;
 		return Platform;
 	}
 
-	/** A platform is named by its slot, so a slot filled twice is still one key. */
-	FORCEINLINE uint64 MakePlatformKey(const FGridPlatform& Platform)
+	/** A module face is named by its min node and the axis it faces along. */
+	FORCEINLINE uint64 MakeModuleFaceKey(const FIntVector& MinNode, const int32 NormalAxis)
 	{
-		return MakeTaggedKey(Platform.MinNode, AxisIndex(Platform.Normal));
+		return MakeTaggedKey(MinNode, NormalAxis);
 	}
 
-	/** One lattice edge: the node its run starts from, and the axis the run heads along. */
+	/** A platform is named by its min module face, which no other platform can ever cover. */
+	FORCEINLINE uint64 MakePlatformKey(const FGridPlatform& Platform)
+	{
+		return MakeModuleFaceKey(Platform.MinNode, AxisIndex(Platform.Normal));
+	}
+
+	/**
+	 * A placement of a tile: its platform key, with which way round it lies in the key's top bit,
+	 * which no tag reaches. Each tile keeps lists of its own, so the tile needs no bits here.
+	 */
+	FORCEINLINE uint64 MakeCandidateKey(const FGridPlatform& Candidate)
+	{
+		return MakePlatformKey(Candidate) | (Candidate.bTurned ? (uint64(1) << 63) : 0);
+	}
+
+	/** One module edge: the node its run starts from, and the axis the run heads along. */
 	struct FLatticeEdge
 	{
 		FIntVector Node = FIntVector::ZeroValue;
@@ -184,57 +210,122 @@ namespace
 		return MakeTaggedKey(Edge.Node, Edge.Axis);
 	}
 
-	/** A platform's four edges: two across each of its in-plane axes. */
-	void GetPlatformEdges(const FGridPlatform& Platform, const int32 Pitch, FLatticeEdge (&OutEdges)[4])
+	/** One module face: the node at its min corner, and the axis it faces along. */
+	struct FModuleFace
+	{
+		FIntVector MinNode = FIntVector::ZeroValue;
+		int32 Normal = 0;
+	};
+
+	/**
+	 * Calls Visit(MinNode) for every module face a platform covers, given its spans along its
+	 * first and second in-plane axes.
+	 */
+	template <typename FunctorType>
+	void ForEachModuleFace(
+		const FGridPlatform& Platform,
+		const int32 SpanU,
+		const int32 SpanV,
+		const int32 Module,
+		FunctorType&& Visit)
 	{
 		int32 U, V;
 		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
 
-		OutEdges[0] = { Platform.MinNode, U };
-		OutEdges[1] = { Platform.MinNode + AxisStep(V, Pitch), U };
-		OutEdges[2] = { Platform.MinNode, V };
-		OutEdges[3] = { Platform.MinNode + AxisStep(U, Pitch), V };
-	}
-
-	/** A platform's four nodes, the posts at its corners. */
-	void GetPlatformNodes(const FGridPlatform& Platform, const int32 Pitch, FIntVector (&OutNodes)[4])
-	{
-		int32 U, V;
-		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
-
-		OutNodes[0] = Platform.MinNode;
-		OutNodes[1] = Platform.MinNode + AxisStep(U, Pitch);
-		OutNodes[2] = Platform.MinNode + AxisStep(V, Pitch);
-		OutNodes[3] = Platform.MinNode + AxisStep(U, Pitch) + AxisStep(V, Pitch);
+		for (int32 StepV = 0; StepV < SpanV; StepV += Module)
+		{
+			for (int32 StepU = 0; StepU < SpanU; StepU += Module)
+			{
+				Visit(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV));
+			}
+		}
 	}
 
 	/**
-	 * The four slots that meet along one edge, two in each plane that contains it. For an edge
-	 * along X, the slots facing Z sit either side of it along Y, and the slots facing Y sit
-	 * either side of it along Z. Some may fall outside the cube; the caller checks.
+	 * Calls Visit(Edge, bRim) for every module edge a platform takes in: those around it, which
+	 * are its rim, and those across it, which its interior bridges.
 	 */
-	void GetEdgeSlots(const FLatticeEdge& Edge, const int32 Pitch, FGridPlatform (&OutSlots)[4])
+	template <typename FunctorType>
+	void ForEachModuleEdge(
+		const FGridPlatform& Platform,
+		const int32 SpanU,
+		const int32 SpanV,
+		const int32 Module,
+		FunctorType&& Visit)
+	{
+		int32 U, V;
+		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+		// The edges running along U, on every line of nodes across V...
+		for (int32 StepV = 0; StepV <= SpanV; StepV += Module)
+		{
+			for (int32 StepU = 0; StepU < SpanU; StepU += Module)
+			{
+				Visit(FLatticeEdge{ Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), U }, StepV == 0 || StepV == SpanV);
+			}
+		}
+
+		// ...and the edges running along V, on every line of nodes across U.
+		for (int32 StepU = 0; StepU <= SpanU; StepU += Module)
+		{
+			for (int32 StepV = 0; StepV < SpanV; StepV += Module)
+			{
+				Visit(FLatticeEdge{ Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), V }, StepU == 0 || StepU == SpanU);
+			}
+		}
+	}
+
+	/** Calls Visit(Node) for every lattice node around a platform: its corners, and every node along its rim between them. */
+	template <typename FunctorType>
+	void ForEachRimNode(
+		const FGridPlatform& Platform,
+		const int32 SpanU,
+		const int32 SpanV,
+		const int32 Module,
+		FunctorType&& Visit)
+	{
+		int32 U, V;
+		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+		for (int32 StepV = 0; StepV <= SpanV; StepV += Module)
+		{
+			for (int32 StepU = 0; StepU <= SpanU; StepU += Module)
+			{
+				if (StepU == 0 || StepU == SpanU || StepV == 0 || StepV == SpanV)
+				{
+					Visit(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV));
+				}
+			}
+		}
+	}
+
+	/**
+	 * The four module faces that meet along one module edge, two in each plane that contains it.
+	 * For an edge along X, the faces facing Z sit either side of it along Y, and the faces facing
+	 * Y sit either side of it along Z. Some may fall outside the cube; the caller checks.
+	 */
+	void GetEdgeFaces(const FLatticeEdge& Edge, const int32 Module, FModuleFace (&OutFaces)[4])
 	{
 		const int32 AxisA = (Edge.Axis + 1) % 3;
 		const int32 AxisB = (Edge.Axis + 2) % 3;
 
-		OutSlots[0] = MakePlatform(Edge.Node, AxisA);
-		OutSlots[1] = MakePlatform(Edge.Node - AxisStep(AxisB, Pitch), AxisA);
-		OutSlots[2] = MakePlatform(Edge.Node, AxisB);
-		OutSlots[3] = MakePlatform(Edge.Node - AxisStep(AxisA, Pitch), AxisB);
+		OutFaces[0] = { Edge.Node, AxisA };
+		OutFaces[1] = { Edge.Node - AxisStep(AxisB, Module), AxisA };
+		OutFaces[2] = { Edge.Node, AxisB };
+		OutFaces[3] = { Edge.Node - AxisStep(AxisA, Module), AxisB };
 	}
 
 	/**
 	 * The edge whose run a cell lies on: a cell on exactly two lattice planes, which leaves one
 	 * axis it runs along. False for a node, an interior cell, or a cell off the lattice.
 	 */
-	bool GetRunEdge(const FIntVector& Cell, const int32 Pitch, FLatticeEdge& OutEdge)
+	bool GetRunEdge(const FIntVector& Cell, const int32 Module, FLatticeEdge& OutEdge)
 	{
 		int32 RunAxis = INDEX_NONE;
 
 		for (int32 Axis = 0; Axis < 3; ++Axis)
 		{
-			if (Cell[Axis] % Pitch != 0)
+			if (Cell[Axis] % Module != 0)
 			{
 				if (RunAxis != INDEX_NONE)
 				{
@@ -251,7 +342,7 @@ namespace
 		}
 
 		OutEdge.Node = Cell;
-		OutEdge.Node[RunAxis] -= Cell[RunAxis] % Pitch;
+		OutEdge.Node[RunAxis] -= Cell[RunAxis] % Module;
 		OutEdge.Axis = RunAxis;
 		return true;
 	}
@@ -269,19 +360,81 @@ namespace
 		return static_cast<int32>(Kind);
 	}
 
-	/** Calls Visit(Cell, bRim) for every cell of a platform: interior, edges and nodes alike. */
+	/**
+	 * Calls Visit(Cell, bRim) for every cell of a platform - interior, edges and nodes alike -
+	 * given its spans along its first and second in-plane axes.
+	 */
 	template <typename FunctorType>
-	void ForEachPlatformCell(const FGridPlatform& Platform, const int32 Pitch, FunctorType&& Visit)
+	void ForEachPlatformCell(const FGridPlatform& Platform, const int32 SpanU, const int32 SpanV, FunctorType&& Visit)
 	{
 		int32 U, V;
 		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
 
-		for (int32 StepV = 0; StepV <= Pitch; ++StepV)
+		for (int32 StepV = 0; StepV <= SpanV; ++StepV)
 		{
-			for (int32 StepU = 0; StepU <= Pitch; ++StepU)
+			for (int32 StepU = 0; StepU <= SpanU; ++StepU)
 			{
-				const bool bRim = StepU == 0 || StepU == Pitch || StepV == 0 || StepV == Pitch;
+				const bool bRim = StepU == 0 || StepU == SpanU || StepV == 0 || StepV == SpanV;
 				Visit(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), bRim);
+			}
+		}
+	}
+
+	/**
+	 * Calls Visit(TileIndex, Candidate, bOnRim) for every placement of every tile in Tiles whose
+	 * footprint takes in one module edge: in either plane that contains the edge, each way round
+	 * the tile may lie, at every module step that still covers the edge. bOnRim says whether the
+	 * edge runs around the placement rather than across it; with bRimOnly, only those are
+	 * visited. Every tile has to be usable on the lattice. Placements may fall outside the cube;
+	 * the caller checks.
+	 */
+	template <typename FunctorType>
+	void ForEachPlacementAround(
+		const FLatticeEdge& Edge,
+		const TConstArrayView<TObjectPtr<UPlatformTileData>> Tiles,
+		const int32 Module,
+		const bool bRimOnly,
+		FunctorType&& Visit)
+	{
+		for (const int32 NormalAxis : { (Edge.Axis + 1) % 3, (Edge.Axis + 2) % 3 })
+		{
+			// Within that plane the edge runs along one axis, and a placement reaches away from it
+			// along the other.
+			const int32 AcrossAxis = 3 - NormalAxis - Edge.Axis;
+
+			int32 U, V;
+			GetInPlaneAxes(NormalAxis, U, V);
+
+			for (int32 TileIndex = 0; TileIndex < Tiles.Num(); ++TileIndex)
+			{
+				UPlatformTileData* Tile = Tiles[TileIndex];
+
+				for (const bool bTurned : { false, true })
+				{
+					if (bTurned && (!Tile->bCanTurn || Tile->Width == Tile->Length))
+					{
+						continue;
+					}
+
+					const int32 SpanU = bTurned ? Tile->Length : Tile->Width;
+					const int32 SpanV = bTurned ? Tile->Width : Tile->Length;
+					const int32 SpanAlong = Edge.Axis == U ? SpanU : SpanV;
+					const int32 SpanAcross = AcrossAxis == U ? SpanU : SpanV;
+
+					// Across, the edge is either one of the placement's two sides - a step of
+					// SpanAcross goes from the one straight to the other - or any line between.
+					const int32 AcrossStep = bRimOnly ? SpanAcross : Module;
+
+					for (int32 Along = 0; Along < SpanAlong; Along += Module)
+					{
+						for (int32 Across = 0; Across <= SpanAcross; Across += AcrossStep)
+						{
+							const FIntVector MinNode = Edge.Node - AxisStep(Edge.Axis, Along) - AxisStep(AcrossAxis, Across);
+
+							Visit(TileIndex, MakePlatform(MinNode, NormalAxis, Tile, bTurned), Across == 0 || Across == SpanAcross);
+						}
+					}
+				}
 			}
 		}
 	}
@@ -453,15 +606,15 @@ void ARoomManager::OnConstruction(const FTransform& Transform)
 	Super::OnConstruction(Transform);
 
 	// Re-clamp in code so the caps hold even if the values are set outside the Details panel.
-	// The platform comes first, since how many of them fit across the cube depends on it.
-	PlatformSize = FMath::Clamp(PlatformSize, 1, MaxGridDimension - 2);
-	GridPlatformsPerSide = GetPlatformsPerSide();
+	// The module comes first, since the cube is rounded to whole modules of it.
+	LatticeModule = GetModule();
+	GridSize = ResolveGridSize();
 
 	// One height sample for the whole cube, resolved before anything asks for a cell position.
 	GridBaseZ = ResolveGridBaseZ();
 
-	// Everything derived is rebuilt from the list, so resizing the cube or the platform
-	// re-resolves it from scratch.
+	// Everything derived is rebuilt from the list, so resizing the cube, changing the module or
+	// swapping a tile re-resolves it from scratch.
 	RebuildPlatformState();
 	UpdateDebugReadouts();
 
@@ -634,8 +787,6 @@ void ARoomManager::GatherSurfaces(
 		return;
 	}
 
-	const int32 Pitch = GetPitch();
-
 	// Two coplanar platforms both name the rim they share, so a rim surface is listed only the
 	// first time. Interiors are never shared and are not tracked.
 	TSet<uint64> ListedRimSurfaces;
@@ -644,7 +795,10 @@ void ARoomManager::GatherSurfaces(
 	{
 		const int32 NormalAxis = AxisIndex(Platform.Normal);
 
-		ForEachPlatformCell(Platform, Pitch, [&](const FIntVector& Cell, const bool bRim)
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+
+		ForEachPlatformCell(Platform, SpanU, SpanV, [&](const FIntVector& Cell, const bool bRim)
 		{
 			for (const int32 Sign : { 1, -1 })
 			{
@@ -681,76 +835,62 @@ int32 ARoomManager::GetPlatformCount() const
 	return BuiltPlatforms.Num();
 }
 
-bool ARoomManager::CanPlacePlatform(const FIntVector& MinNode, const EGridAxis Normal) const
+bool ARoomManager::CanPlacePlatform(const FGridPlatform& Platform) const
 {
-	const FGridPlatform Candidate = MakePlatform(MinNode, AxisIndex(Normal));
-
-	// On the lattice, with the whole footprint - interior, rim and far nodes - inside the cube.
-	// That alone keeps anything from going below the ground layer.
-	if (!IsPlatformOnGrid(Candidate))
+	// On the lattice, laid from a usable tile, with the whole footprint - interior, rim and far
+	// nodes - inside the cube. That alone keeps anything from going below the ground layer.
+	if (!IsPlatformOnGrid(Platform))
 	{
 		return false;
 	}
 
 	// With nothing placed there is nothing to grow from, so the first platform has a rule of
-	// its own: horizontal, on the centre layer, and at the centre of it.
+	// its own: FirstTile, horizontal, at the centre of the centre layer.
 	if (BuiltPlatforms.IsEmpty())
 	{
-		int32 FirstSlot, LastSlot;
-		GetFirstPlatformSlots(FirstSlot, LastSlot);
+		TArray<FGridPlatform> FirstCandidates;
+		GatherFirstPlatformCandidates(FirstCandidates);
 
-		const int32 FirstNode = FirstSlot * GetPitch();
-		const int32 LastNode = LastSlot * GetPitch();
-
-		return Normal == EGridAxis::Z && MinNode.Z == GetFirstPlatformLayer()
-			&& MinNode.X >= FirstNode && MinNode.X <= LastNode
-			&& MinNode.Y >= FirstNode && MinNode.Y <= LastNode;
-	}
-
-	if (PlatformKeys.Contains(MakePlatformKey(Candidate)))
-	{
-		return false;
-	}
-
-	// No interior cell may already be built. On one lattice an interior is all or nothing - the
-	// only thing that can cover any of it is this slot's own platform - so one cell stands for
-	// all of them.
-	int32 U, V;
-	GetInPlaneAxes(AxisIndex(Normal), U, V);
-
-	if (IsSolidCell(MinNode + AxisStep(U) + AxisStep(V)))
-	{
-		return false;
-	}
-
-	const int32 Pitch = GetPitch();
-	const int32 RunLength = Pitch - 1;
-	bool bTouchesStructure = false;
-
-	// The candidate is judged against every platform it would share an edge with, not only the
-	// one it was found from. Continuing a platform in its own plane asks nothing more, but a
-	// single fold that is refused refuses the whole slot - otherwise a wall carrying on from one
-	// already standing could be raised over a seam that has opened, closing it again.
-	FLatticeEdge Edges[4];
-	GetPlatformEdges(Candidate, Pitch, Edges);
-
-	for (const FLatticeEdge& Edge : Edges)
-	{
-		FGridPlatform Slots[4];
-		GetEdgeSlots(Edge, Pitch, Slots);
-
-		for (const FGridPlatform& Neighbour : Slots)
+		return FirstCandidates.ContainsByPredicate([&Platform](const FGridPlatform& Candidate)
 		{
-			const bool bIsCandidate = Neighbour.Normal == Candidate.Normal && Neighbour.MinNode == Candidate.MinNode;
+			return Candidate.Tile == Platform.Tile && MakeCandidateKey(Candidate) == MakeCandidateKey(Platform);
+		});
+	}
 
-			if (bIsCandidate || !IsPlatformOnGrid(Neighbour) || !PlatformKeys.Contains(MakePlatformKey(Neighbour)))
-			{
-				continue;
-			}
+	if (!IsSpaceFree(Platform))
+	{
+		return false;
+	}
 
-			bTouchesStructure = true;
+	int32 SpanU, SpanV;
+	GetPlatformSpans(Platform, SpanU, SpanV);
 
-			if (Neighbour.Normal == Candidate.Normal)
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	bool bTouchesStructure = false;
+	bool bFoldsLegally = true;
+
+	// The placement is judged against every platform it would share a module edge with, not only
+	// the one it was found from. Continuing a platform in its own plane asks nothing more, but a
+	// single fold that is refused refuses the whole placement - otherwise a wall carrying on from
+	// one already standing could be raised over a seam that has opened, closing it again.
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		// Only its rim can be shared, and only where some platform already runs around the same
+		// edge. IsSpaceFree has already seen to it that none runs across it.
+		if (!bRim || !bFoldsLegally || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		{
+			return;
+		}
+
+		bTouchesStructure = true;
+
+		FModuleFace Faces[4];
+		GetEdgeFaces(Edge, Module, Faces);
+
+		for (const FModuleFace& Face : Faces)
+		{
+			if (Face.Normal == NormalAxis || !ModuleFaceOwners.Contains(MakeModuleFaceKey(Face.MinNode, Face.Normal)))
 			{
 				continue;
 			}
@@ -758,106 +898,136 @@ bool ARoomManager::CanPlacePlatform(const FIntVector& MinNode, const EGridAxis N
 			// A fold leaves the edge along the neighbour's normal, to one side of it or the
 			// other. Every cell of the edge's run has to be offering itself on that side: wall
 			// surface, not yet built against. A seam that has opened reads as all-object and a
-			// side already folded off reads as occupied, and either refuses. The posts at the
-			// run's ends are not asked, since a post is shared by whatever meets at it.
-			const int32 FoldAxis = AxisIndex(Neighbour.Normal);
-			const EGridFace Toward = MakeFace(FoldAxis, MinNode[FoldAxis] == Edge.Node[FoldAxis] ? 1 : -1);
+			// side already folded off reads as occupied, and either refuses. The nodes at the
+			// run's ends are not asked, since a node is shared by whatever meets at it.
+			const int32 FoldAxis = Face.Normal;
+			const EGridFace Toward = MakeFace(FoldAxis, Platform.MinNode[FoldAxis] == Edge.Node[FoldAxis] ? 1 : -1);
 
-			for (int32 RunStep = 1; RunStep <= RunLength; ++RunStep)
+			for (int32 RunStep = 1; RunStep < Module && bFoldsLegally; ++RunStep)
 			{
 				ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
 				bool bOccupied = false;
 				ResolveSurface(Edge.Node + AxisStep(Edge.Axis, RunStep), Toward, Capacity, bOccupied);
 
-				if (Capacity != ESurfaceCapacity::Wall || bOccupied)
-				{
-					return false;
-				}
+				bFoldsLegally = Capacity == ESurfaceCapacity::Wall && !bOccupied;
 			}
-		}
-	}
 
-	// A slot touching nothing would start a second structure; growth only ever extends the one.
-	return bTouchesStructure;
+			// A neighbour on the other side of this placement's plane would be folded off from
+			// the same run toward the same side, so one check answers for both.
+			break;
+		}
+	});
+
+	// A placement touching nothing would start a second structure; growth only ever extends the one.
+	return bFoldsLegally && bTouchesStructure;
 }
 
 void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const
 {
 	OutCandidates.Reset();
 
-	const int32 Pitch = GetPitch();
+	if (!IsTileUsable(FirstTile))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+	const int32 ModulesPerSide = (ResolveGridSize() - 1) / Module;
 	const int32 Layer = GetFirstPlatformLayer();
 
-	int32 FirstSlot, LastSlot;
-	GetFirstPlatformSlots(FirstSlot, LastSlot);
-
-	// The lattice positions at the middle of the centre layer, so the structure starts at the
-	// heart of the cube and has as far to grow on every side before it reaches the faces.
-	for (int32 SlotY = FirstSlot; SlotY <= LastSlot; ++SlotY)
+	for (const bool bTurned : { false, true })
 	{
-		for (int32 SlotX = FirstSlot; SlotX <= LastSlot; ++SlotX)
+		if (bTurned && (!FirstTile->bCanTurn || FirstTile->Width == FirstTile->Length))
 		{
-			OutCandidates.Add(MakePlatform(FIntVector(SlotX * Pitch, SlotY * Pitch, Layer), AxisIndex(EGridAxis::Z)));
+			continue;
+		}
+
+		// Counted in modules from the cube's corner. Centred on the layer, so the structure starts
+		// at the heart of the cube and has as far to grow on every side before it reaches the
+		// faces. Where the tile and the cube differ by an odd number of modules the centre falls
+		// between two positions, and both are offered.
+		const int32 SpanX = (bTurned ? FirstTile->Length : FirstTile->Width) / Module;
+		const int32 SpanY = (bTurned ? FirstTile->Width : FirstTile->Length) / Module;
+
+		if (SpanX > ModulesPerSide || SpanY > ModulesPerSide)
+		{
+			continue;
+		}
+
+		for (int32 SlotY = (ModulesPerSide - SpanY) / 2; SlotY <= (ModulesPerSide - SpanY + 1) / 2; ++SlotY)
+		{
+			for (int32 SlotX = (ModulesPerSide - SpanX) / 2; SlotX <= (ModulesPerSide - SpanX + 1) / 2; ++SlotX)
+			{
+				OutCandidates.Add(MakePlatform(
+					FIntVector(SlotX * Module, SlotY * Module, Layer), AxisIndex(EGridAxis::Z), FirstTile, bTurned));
+			}
 		}
 	}
 }
 
-void ARoomManager::GatherPlatformCandidates(const EPlatformKind Kind, TArray<FGridPlatform>& OutCandidates) const
+void ARoomManager::GatherPlatformCandidates()
 {
-	OutCandidates.Reset();
+	TileCandidates.Reset();
+	TileCandidates.SetNum(UsableTiles.Num());
 
-	// The empty cube is the one case with nothing to grow from, and only a horizontal starts it.
+	for (int32 TileIndex = 0; TileIndex < UsableTiles.Num(); ++TileIndex)
+	{
+		TileCandidates[TileIndex].Tile = UsableTiles[TileIndex];
+	}
+
+	// The empty cube is the one case with nothing to grow from. Its first platform is drawn from
+	// a list of its own.
 	if (BuiltPlatforms.IsEmpty())
 	{
-		if (Kind == EPlatformKind::SurfaceHorizontal)
-		{
-			GatherFirstPlatformCandidates(OutCandidates);
-		}
-
 		return;
 	}
 
-	const int32 Pitch = GetPitch();
+	const int32 Module = GetModule();
 
-	// Neighbouring platforms share edges, and so share candidates; test each slot once.
-	TSet<uint64> Considered;
+	// Neighbouring platforms share edges, and so share placements; each is judged once.
+	TArray<TSet<uint64>> Considered;
+	Considered.SetNum(UsableTiles.Num());
 
-	// Every slot around every edge of every platform goes into one draw, so the structure grows
-	// wherever there is room rather than finishing one part before starting the next.
+	// Every placement around every edge of every platform goes into one draw, so the structure
+	// grows wherever there is room rather than finishing one part before starting the next.
 	for (const FGridPlatform& Platform : BuiltPlatforms)
 	{
-		FLatticeEdge Edges[4];
-		GetPlatformEdges(Platform, Pitch, Edges);
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
 
-		for (const FLatticeEdge& Edge : Edges)
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 		{
-			FGridPlatform Slots[4];
-			GetEdgeSlots(Edge, Pitch, Slots);
-
-			for (const FGridPlatform& Slot : Slots)
+			if (!bRim)
 			{
-				if (Slot.GetKind() != Kind || !IsPlatformOnGrid(Slot))
-				{
-					continue;
-				}
-
-				bool bAlreadyConsidered = false;
-				Considered.Add(MakePlatformKey(Slot), &bAlreadyConsidered);
-
-				if (!bAlreadyConsidered && CanPlacePlatform(Slot.MinNode, Slot.Normal))
-				{
-					OutCandidates.Add(Slot);
-				}
+				return;
 			}
-		}
+
+			ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/true,
+				[&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
+			{
+				bool bAlreadyConsidered = false;
+				Considered[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyConsidered);
+
+				if (!bAlreadyConsidered && CanPlacePlatform(Candidate))
+				{
+					TileCandidates[TileIndex].ByKind[KindIndex(Candidate.GetKind())].Add(Candidate);
+				}
+			});
+		});
 	}
 
 	// Drawn from in key order rather than the order they were found in, so what the stream picks
 	// depends only on which platforms stand - not on the order the list happens to hold them.
-	OutCandidates.Sort([](const FGridPlatform& A, const FGridPlatform& B)
+	for (FTileCandidates& Candidates : TileCandidates)
 	{
-		return MakePlatformKey(A) < MakePlatformKey(B);
-	});
+		for (TArray<FGridPlatform>& KindCandidates : Candidates.ByKind)
+		{
+			KindCandidates.Sort([](const FGridPlatform& A, const FGridPlatform& B)
+			{
+				return MakeCandidateKey(A) < MakeCandidateKey(B);
+			});
+		}
+	}
 }
 
 void ARoomManager::EnsurePlatformCandidates()
@@ -867,49 +1037,123 @@ void ARoomManager::EnsurePlatformCandidates()
 		return;
 	}
 
-	GatherPlatformCandidates(EPlatformKind::SurfaceHorizontal, PlatformCandidates[KindIndex(EPlatformKind::SurfaceHorizontal)]);
-	GatherPlatformCandidates(EPlatformKind::SurfaceVertical, PlatformCandidates[KindIndex(EPlatformKind::SurfaceVertical)]);
+	GatherPlatformCandidates();
 
 	bPlatformCandidatesStale = false;
 }
 
-void ARoomManager::RefreshPlatformCandidate(const FGridPlatform& Slot)
+bool ARoomManager::RefreshPlatformCandidate(
+	const int32 TileIndex,
+	const FGridPlatform& Candidate,
+	const bool bMayHaveComeFree)
 {
-	TArray<FGridPlatform>& Candidates = PlatformCandidates[KindIndex(Slot.GetKind())];
+	TArray<FGridPlatform>& Candidates = TileCandidates[TileIndex].ByKind[KindIndex(Candidate.GetKind())];
 
-	const uint64 Key = MakePlatformKey(Slot);
-	const int32 Index = Algo::LowerBoundBy(Candidates, Key, [](const FGridPlatform& Candidate)
+	const uint64 Key = MakeCandidateKey(Candidate);
+	const int32 Index = Algo::LowerBoundBy(Candidates, Key, [](const FGridPlatform& Listed)
 	{
-		return MakePlatformKey(Candidate);
+		return MakeCandidateKey(Listed);
 	});
 
-	const bool bListed = Candidates.IsValidIndex(Index) && MakePlatformKey(Candidates[Index]) == Key;
-	const bool bFree = CanPlacePlatform(Slot.MinNode, Slot.Normal);
+	const bool bListed = Candidates.IsValidIndex(Index) && MakeCandidateKey(Candidates[Index]) == Key;
+
+	// Growth only ever takes room away, except where it brings a placement something to grow off.
+	// So a placement that is not listed stays unlisted unless it may just have gained that.
+	if (!bListed && !bMayHaveComeFree)
+	{
+		return false;
+	}
+
+	const bool bFree = CanPlacePlatform(Candidate);
 
 	// Inserted where it sorts, so the list stays in the key order a full gather would give it.
 	if (bFree && !bListed)
 	{
-		Candidates.Insert(Slot, Index);
+		Candidates.Insert(Candidate, Index);
 	}
 	else if (!bFree && bListed)
 	{
 		Candidates.RemoveAt(Index);
 	}
+
+	return true;
 }
 
 bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 {
-	EnsurePlatformCandidates();
+	FGridPlatform Platform;
 
-	const TArray<FGridPlatform>& Candidates = PlatformCandidates[KindIndex(Kind)];
-
-	if (Candidates.IsEmpty())
+	if (BuiltPlatforms.IsEmpty())
 	{
-		return false;
+		// The empty cube is the one case with nothing to grow from, and only FirstTile, laid
+		// horizontal, starts it - whatever its weight.
+		if (Kind != EPlatformKind::SurfaceHorizontal)
+		{
+			return false;
+		}
+
+		TArray<FGridPlatform> FirstCandidates;
+		GatherFirstPlatformCandidates(FirstCandidates);
+
+		if (FirstCandidates.IsEmpty())
+		{
+			return false;
+		}
+
+		Platform = FirstCandidates[PlacementStream.RandRange(0, FirstCandidates.Num() - 1)];
+	}
+	else
+	{
+		EnsurePlatformCandidates();
+
+		// The tile is rolled only among those with somewhere to go, so a tile with no room left
+		// never costs the beat while another has some.
+		auto GetDrawWeight = [Kind](const FTileCandidates& Candidates) -> float
+		{
+			return Candidates.ByKind[KindIndex(Kind)].IsEmpty() ? 0.0f : FMath::Max(Candidates.Tile->Weight, 0.0f);
+		};
+
+		float TotalWeight = 0.0f;
+		for (const FTileCandidates& Candidates : TileCandidates)
+		{
+			TotalWeight += GetDrawWeight(Candidates);
+		}
+
+		if (TotalWeight <= 0.0f)
+		{
+			return false;
+		}
+
+		float Roll = PlacementStream.FRand() * TotalWeight;
+		const FTileCandidates* ChosenTile = nullptr;
+
+		for (const FTileCandidates& Candidates : TileCandidates)
+		{
+			const float Weight = GetDrawWeight(Candidates);
+
+			if (Weight <= 0.0f)
+			{
+				continue;
+			}
+
+			// Taken whenever it is in the running, so rounding at the very top of the roll still
+			// lands on the last tile that could have been drawn.
+			ChosenTile = &Candidates;
+
+			if (Roll < Weight)
+			{
+				break;
+			}
+
+			Roll -= Weight;
+		}
+
+		const TArray<FGridPlatform>& Candidates = ChosenTile->ByKind[KindIndex(Kind)];
+
+		// Copied out, since taking the platform in changes the list it was drawn from.
+		Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
 	}
 
-	// Copied out, since taking the platform in changes the list it was drawn from.
-	const FGridPlatform Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
 	Platforms.Add(Platform);
 
 	TArray<FGridSurfaceRef> ChangedSurfaces;
@@ -973,61 +1217,81 @@ void ARoomManager::AdvancePlacement()
 		PlatformCount, HorizontalPlatformCount, VerticalPlatformCount);
 }
 
-int32 ARoomManager::GetPitch() const
+int32 ARoomManager::GetModule() const
 {
-	return FMath::Clamp(PlatformSize, 1, MaxGridDimension - 2) + 1;
-}
-
-int32 ARoomManager::GetPlatformsPerSide() const
-{
-	// The pitch is capped so that at least one platform, and the node closing it, always fits.
-	return FMath::Clamp(GridPlatformsPerSide, 1, (MaxGridDimension - 1) / GetPitch());
+	// Capped so that at least one module, and the node closing it, always fit the cube.
+	return FMath::Clamp(LatticeModule, 2, MaxGridDimension - 1);
 }
 
 int32 ARoomManager::ResolveGridSize() const
 {
-	return GetPlatformsPerSide() * GetPitch() + 1;
+	const int32 Module = GetModule();
+	const int32 Cells = FMath::Clamp(GridSize, Module + 1, MaxGridDimension);
+
+	// Whole modules, and the node that closes the far side, so a node lands on every face.
+	return ((Cells - 1) / Module) * Module + 1;
 }
 
 int32 ARoomManager::GetFirstPlatformLayer() const
 {
-	// Node layers run from the ground to the cube's top. With an even count of platforms per
-	// side one lands exactly on the centre; with an odd count the centre falls mid-pitch, and
-	// the layer just above it is taken.
-	return ((GetPlatformsPerSide() + 1) / 2) * GetPitch();
+	// Node layers run from the ground to the cube's top. With an even count of modules per side
+	// one lands exactly on the centre; with an odd count the centre falls mid-module, and the
+	// layer just above it is taken.
+	const int32 Module = GetModule();
+	const int32 ModulesPerSide = (ResolveGridSize() - 1) / Module;
+
+	return ((ModulesPerSide + 1) / 2) * Module;
 }
 
-void ARoomManager::GetFirstPlatformSlots(int32& OutFirstSlot, int32& OutLastSlot) const
+bool ARoomManager::IsTileUsable(const UPlatformTileData* Tile) const
 {
-	// Lattice positions across the cube, counted in platforms from its corner. With an odd
-	// count one sits squarely on the centre; with an even count the centre falls on a node, and
-	// the two either side of it are equally near.
-	const int32 PlatformsPerSide = GetPlatformsPerSide();
-	OutFirstSlot = (PlatformsPerSide - 1) / 2;
-	OutLastSlot = PlatformsPerSide / 2;
+	const int32 Module = GetModule();
+
+	return Tile
+		&& Tile->Width >= Module && Tile->Width % Module == 0
+		&& Tile->Length >= Module && Tile->Length % Module == 0;
+}
+
+bool ARoomManager::GetPlatformSpans(const FGridPlatform& Platform, int32& OutSpanFirst, int32& OutSpanSecond) const
+{
+	OutSpanFirst = 0;
+	OutSpanSecond = 0;
+
+	if (!IsTileUsable(Platform.Tile))
+	{
+		return false;
+	}
+
+	OutSpanFirst = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+	OutSpanSecond = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+	return true;
 }
 
 bool ARoomManager::IsPlatformOnGrid(const FGridPlatform& Platform) const
 {
 	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	int32 SpanU, SpanV;
 
-	if (NormalAxis < 0 || NormalAxis > 2)
+	if (NormalAxis < 0 || NormalAxis > 2 || !GetPlatformSpans(Platform, SpanU, SpanV))
 	{
 		return false;
 	}
 
-	const int32 Pitch = GetPitch();
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	const int32 Module = GetModule();
 	const int32 LastNode = ResolveGridSize() - 1;
 
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
 		const int32 Coordinate = Platform.MinNode[Axis];
 
-		// Across its plane a platform reaches a whole pitch past its min node, so the far rim
-		// has to fit inside too, which leaves one pitch less room there than along its normal.
-		const int32 Limit = Axis == NormalAxis ? LastNode : LastNode - Pitch;
+		// Across its plane a platform reaches its span past its min node, so its far rim has to
+		// fit inside too. Along its normal it is one cell thick and reaches no further.
+		const int32 Reach = Axis == U ? SpanU : (Axis == V ? SpanV : 0);
 
-		if (Coordinate < 0 || Coordinate > Limit || Coordinate % Pitch != 0)
+		if (Coordinate < 0 || Coordinate + Reach > LastNode || Coordinate % Module != 0)
 		{
 			return false;
 		}
@@ -1036,38 +1300,129 @@ bool ARoomManager::IsPlatformOnGrid(const FGridPlatform& Platform) const
 	return true;
 }
 
+bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
+{
+	int32 SpanU, SpanV;
+
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	bool bFree = true;
+
+	// Another platform in the same plane would cover one of its module faces.
+	ForEachModuleFace(Platform, SpanU, SpanV, Module, [&](const FIntVector& FaceMinNode)
+	{
+		bFree = bFree && !ModuleFaceOwners.Contains(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+	});
+
+	if (!bFree)
+	{
+		return false;
+	}
+
+	// A platform standing across the plane can only meet it along module edges. Across the
+	// interior nothing may meet it at all. Around the rim a neighbour's rim may, since rim is
+	// shared - that is how anything grows - but a neighbour's interior may not.
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (!bFree)
+		{
+			return;
+		}
+
+		if (const uint8* Uses = ModuleEdgeUses.Find(MakeEdgeKey(Edge)))
+		{
+			bFree = bRim && (*Uses & InteriorEdgeUse) == 0;
+		}
+	});
+
+	return bFree;
+}
+
+void ARoomManager::ResolveUsableTiles()
+{
+	UsableTiles.Reset();
+
+	const int32 Module = GetModule();
+	TArray<FString> Problems;
+
+	for (UPlatformTileData* Tile : Tiles)
+	{
+		// An empty entry is only one not filled in yet, and a repeat adds nothing.
+		if (!Tile || UsableTiles.Contains(Tile))
+		{
+			continue;
+		}
+
+		if (IsTileUsable(Tile))
+		{
+			UsableTiles.Add(Tile);
+		}
+		else
+		{
+			Problems.Add(FString::Printf(TEXT("tile '%s' (%d x %d) is not a whole number of %d-cell modules along both sides, and is left out"),
+				*Tile->GetName(), Tile->Width, Tile->Length, Module));
+		}
+	}
+
+	if (!FirstTile)
+	{
+		Problems.Add(TEXT("there is no FirstTile, so nothing grows"));
+	}
+	else if (!IsTileUsable(FirstTile))
+	{
+		Problems.Add(FString::Printf(TEXT("FirstTile '%s' (%d x %d) is not a whole number of %d-cell modules along both sides, so nothing grows"),
+			*FirstTile->GetName(), FirstTile->Width, FirstTile->Length, Module));
+	}
+
+	// This runs on every edit and every check, so the warning is only given when what it would
+	// say has changed.
+	const FString Report = FString::Join(Problems, TEXT("; "));
+
+	if (Report != ReportedTileProblems)
+	{
+		ReportedTileProblems = Report;
+
+		if (!Report.IsEmpty())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("RoomManager: %s."), *Report);
+		}
+	}
+}
+
 void ARoomManager::RebuildPlatformState()
 {
-	GridSize = ResolveGridSize();
+	// The tiles first, since which of them fit the lattice decides which platforms do.
+	ResolveUsableTiles();
 
 	BuiltPlatforms.Reset();
-	PlatformKeys.Reset();
+	ModuleFaceOwners.Reset();
+	ModuleEdgeUses.Reset();
 	RimCellNormals.Reset();
 	PromotedFaces.Reset();
 
 	// The candidates follow from everything below, so they are gathered afresh on the next draw.
 	bPlatformCandidatesStale = true;
 
-	// Only the platforms that fit the lattice as it stands now. One placed under a different
-	// platform size or a larger cube no longer does, and is left out rather than drawn across the
-	// grid - but kept in the list, so changing the size back brings it back.
+	// Only the platforms that fit the lattice as it stands now, each on room of its own. One laid
+	// from a tile that has since changed size, under a different module or in a larger cube may no
+	// longer fit, or may now run into one listed before it. It is left out rather than drawn
+	// across the grid - but kept in the list, so changing things back brings it back.
 	int32 SkippedPlatforms = 0;
 
 	for (const FGridPlatform& Platform : Platforms)
 	{
-		if (!IsPlatformOnGrid(Platform))
+		if (!IsPlatformOnGrid(Platform) || !IsSpaceFree(Platform))
 		{
 			++SkippedPlatforms;
 			continue;
 		}
 
-		bool bAlreadyBuilt = false;
-		PlatformKeys.Add(MakePlatformKey(Platform), &bAlreadyBuilt);
-
-		if (!bAlreadyBuilt)
-		{
-			BuiltPlatforms.Add(Platform);
-		}
+		RecordPlatform(Platform);
 	}
 
 	// This runs on every edit and every check, so the warning is only given when what it would
@@ -1079,14 +1434,9 @@ void ARoomManager::RebuildPlatformState()
 		if (SkippedPlatforms > 0)
 		{
 			UE_LOG(LogTemp, Warning,
-				TEXT("RoomManager: %d platform(s) in the list do not fit a lattice of PlatformSize %d across %d platform(s) per side, and are left out. ClearPlatforms starts over."),
-				SkippedPlatforms, GetPitch() - 1, GetPlatformsPerSide());
+				TEXT("RoomManager: %d platform(s) in the list do not fit the lattice as it stands - their tile is missing or not a whole number of %d-cell modules, they fall outside the %d-cell cube, or they run into a platform listed before them - and are left out. ClearPlatforms starts over."),
+				SkippedPlatforms, GetModule(), ResolveGridSize());
 		}
-	}
-
-	for (const FGridPlatform& Platform : BuiltPlatforms)
-	{
-		RecordRimCells(Platform);
 	}
 
 	// A rim surface caught between two fields is no longer rim, so it joins them (see
@@ -1178,11 +1528,10 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 {
 	OutChangedSurfaces.Reset();
 
-	const uint64 PlatformKey = MakePlatformKey(Platform);
-
-	// Only ever handed a free slot, which is on the lattice and not yet built. Anything else is
-	// left to the wholesale rebuild, and the visuals are told to start over with it.
-	if (!ensure(IsPlatformOnGrid(Platform) && !PlatformKeys.Contains(PlatformKey)))
+	// Only ever handed a free placement, which is on the lattice and stands on nothing but rim it
+	// can share. Anything else is left to the wholesale rebuild, and the visuals are told to start
+	// over with it.
+	if (!ensure(IsPlatformOnGrid(Platform) && IsSpaceFree(Platform)))
 	{
 		RebuildPlatformState();
 		bPiecesComplete = false;
@@ -1198,9 +1547,7 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		bPlatformCandidatesStale = true;
 	}
 
-	BuiltPlatforms.Add(Platform);
-	PlatformKeys.Add(PlatformKey);
-	RecordRimCells(Platform);
+	RecordPlatform(Platform);
 
 	++PlatformCount;
 
@@ -1213,7 +1560,10 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		++VerticalPlatformCount;
 	}
 
-	const int32 Pitch = GetPitch();
+	int32 SpanU, SpanV;
+	GetPlatformSpans(Platform, SpanU, SpanV);
+
+	const int32 Module = GetModule();
 	const int32 NormalAxis = AxisIndex(Platform.Normal);
 	const EGridFace FrontFace = MakeFace(NormalAxis, 1);
 	const EGridFace BackFace = MakeFace(NormalAxis, -1);
@@ -1222,7 +1572,7 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 	// worked through, since every promotion can open the surfaces beside it.
 	TArray<FGridSurfaceRef> PromotionQueue;
 
-	ForEachPlatformCell(Platform, Pitch, [&](const FIntVector& Cell, const bool bRim)
+	ForEachPlatformCell(Platform, SpanU, SpanV, [&](const FIntVector& Cell, const bool bRim)
 	{
 		// The platform's own two broad faces: new surfaces, or rim ones a neighbour already brought.
 		OutChangedSurfaces.Add(MakeSurfaceRef(Cell, FrontFace));
@@ -1244,8 +1594,8 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 			{
 				const FIntVector Neighbour = Cell + AxisStep(Axis, Sign);
 
-				bool bInterior = false;
-				if ((GetCellSurfaceAxes(Neighbour, bInterior) & AxisBit(Axis)) != 0)
+				int32 NeighbourOwner = INDEX_NONE;
+				if ((GetCellSurfaceAxes(Neighbour, NeighbourOwner) & AxisBit(Axis)) != 0)
 				{
 					OutChangedSurfaces.Add(MakeSurfaceRef(Neighbour, MakeFace(Axis, -Sign)));
 				}
@@ -1272,10 +1622,10 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 
 		// Only an open rim surface is ever decided: an interior carries anything already, and a
 		// surface built against holds its side shut.
-		bool bInterior = false;
-		const uint8 SurfaceAxes = GetCellSurfaceAxes(Surface.Cell, bInterior);
+		int32 InteriorOwner = INDEX_NONE;
+		const uint8 SurfaceAxes = GetCellSurfaceAxes(Surface.Cell, InteriorOwner);
 
-		if (bInterior
+		if (InteriorOwner != INDEX_NONE
 			|| (SurfaceAxes & AxisBit(FaceAxis(Surface.Face))) == 0
 			|| IsSolidCell(Surface.Cell + FaceStep(Surface.Face))
 			|| !IsFlankedByOpenFields(Surface.Cell, Surface.Face))
@@ -1302,63 +1652,94 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		return;
 	}
 
-	// A slot is judged by its own edges: which platforms stand around them, and what the runs
-	// along them still offer. So the only slots whose standing can have changed are the ones
-	// around this platform's edges - which it now stands on, or folds away from - and the ones
-	// around an edge whose run has just been promoted, which no longer offers a fold. Posts are
-	// never asked, so a promoted node changes nothing here.
+	// A placement is judged by the module edges it takes in: what stands along them, and what the
+	// runs around its rim still offer. So the only placements whose standing can have changed are
+	// those taking in an edge this platform takes in - which they would now share, stand across,
+	// or fold away from - and those taking in an edge whose run has just been promoted, which no
+	// longer offers a fold. Nodes are never asked, so a promoted node changes nothing here.
 	TArray<FLatticeEdge> ChangedEdges;
-	TArray<uint64> ChangedEdgeKeys;
+	TSet<uint64> ChangedEdgeKeys;
+	TSet<uint64> NewRimEdgeKeys;
 
 	auto AddChangedEdge = [&ChangedEdges, &ChangedEdgeKeys](const FLatticeEdge& Edge)
 	{
-		const uint64 EdgeKey = MakeEdgeKey(Edge);
+		bool bAlreadyAdded = false;
+		ChangedEdgeKeys.Add(MakeEdgeKey(Edge), &bAlreadyAdded);
 
-		if (!ChangedEdgeKeys.Contains(EdgeKey))
+		if (!bAlreadyAdded)
 		{
-			ChangedEdgeKeys.Add(EdgeKey);
 			ChangedEdges.Add(Edge);
 		}
 	};
 
-	FLatticeEdge PlatformEdges[4];
-	GetPlatformEdges(Platform, Pitch, PlatformEdges);
-
-	for (const FLatticeEdge& Edge : PlatformEdges)
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
 		AddChangedEdge(Edge);
-	}
+
+		if (bRim)
+		{
+			NewRimEdgeKeys.Add(MakeEdgeKey(Edge));
+		}
+	});
 
 	for (const FGridSurfaceRef& Surface : PromotedSurfaces)
 	{
 		FLatticeEdge Edge;
-		if (GetRunEdge(Surface.Cell, Pitch, Edge))
+		if (GetRunEdge(Surface.Cell, Module, Edge))
 		{
 			AddChangedEdge(Edge);
 		}
 	}
 
-	// This platform's own slot is among them, and drops out of the lists here too.
+	// Everything else a placement asks for only ever closes as the structure grows, so a placement
+	// not yet listed can only have come free by coming to share a module edge of rim with this
+	// platform - and only those are judged, along with every listed one. This platform's own
+	// placement is among the listed, and drops out here too.
+	TArray<TSet<uint64>> Judged;
+	Judged.SetNum(TileCandidates.Num());
+
 	for (const FLatticeEdge& Edge : ChangedEdges)
 	{
-		FGridPlatform Slots[4];
-		GetEdgeSlots(Edge, Pitch, Slots);
+		const bool bNewRim = NewRimEdgeKeys.Contains(MakeEdgeKey(Edge));
 
-		for (const FGridPlatform& Slot : Slots)
+		ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/false,
+			[&](const int32 TileIndex, const FGridPlatform& Candidate, const bool bOnRim)
 		{
-			RefreshPlatformCandidate(Slot);
-		}
+			const uint64 Key = MakeCandidateKey(Candidate);
+
+			if (!Judged[TileIndex].Contains(Key) && RefreshPlatformCandidate(TileIndex, Candidate, bNewRim && bOnRim))
+			{
+				Judged[TileIndex].Add(Key);
+			}
+		});
 	}
 }
 
-void ARoomManager::RecordRimCells(const FGridPlatform& Platform)
+void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 {
-	// A cell on an edge can be rim to platforms facing two ways, and a node to all three; each
+	int32 SpanU, SpanV;
+	GetPlatformSpans(Platform, SpanU, SpanV);
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	const int32 PlatformIndex = BuiltPlatforms.Add(Platform);
+
+	ForEachModuleFace(Platform, SpanU, SpanV, Module, [&](const FIntVector& FaceMinNode)
+	{
+		ModuleFaceOwners.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis), PlatformIndex);
+	});
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [this](const FLatticeEdge& Edge, const bool bRim)
+	{
+		ModuleEdgeUses.FindOrAdd(MakeEdgeKey(Edge)) |= bRim ? RimEdgeUse : InteriorEdgeUse;
+	});
+
+	// A cell of rim can be rim to platforms facing two ways, and a node to all three; each
 	// platform brings the pair of faces along its own normal, which is how a cell comes to carry
 	// surfaces along more than one axis.
-	const uint8 NormalBit = AxisBit(AxisIndex(Platform.Normal));
+	const uint8 NormalBit = AxisBit(NormalAxis);
 
-	ForEachPlatformCell(Platform, GetPitch(), [this, NormalBit](const FIntVector& Cell, const bool bRim)
+	ForEachPlatformCell(Platform, SpanU, SpanV, [this, NormalBit](const FIntVector& Cell, const bool bRim)
 	{
 		if (bRim)
 		{
@@ -1403,16 +1784,12 @@ bool ARoomManager::IsFlankedByOpenFields(const FIntVector& Cell, const EGridFace
 void ARoomManager::VerifyIncrementalState()
 {
 	// What the placements built up, one at a time.
-	const TSet<uint64> IncrementalPlatformKeys = PlatformKeys;
+	const TMap<uint64, int32> IncrementalFaceOwners = ModuleFaceOwners;
+	const TMap<uint64, uint8> IncrementalEdgeUses = ModuleEdgeUses;
 	const TMap<uint64, uint8> IncrementalRimCellNormals = RimCellNormals;
 	const TSet<uint64> IncrementalPromotedFaces = PromotedFaces;
 	const bool bHadCandidates = !bPlatformCandidatesStale;
-
-	TArray<FGridPlatform> IncrementalCandidates[PlatformKindCount];
-	for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
-	{
-		IncrementalCandidates[Kind] = PlatformCandidates[Kind];
-	}
+	const TArray<FTileCandidates> IncrementalCandidates = TileCandidates;
 
 	// And what the wholesale rebuild makes of the same list. That is kept either way: it is the
 	// reference, so a slip is reported once and not carried forward.
@@ -1443,41 +1820,60 @@ void ARoomManager::VerifyIncrementalState()
 		}
 	};
 
-	CompareKeySets(TEXT("platform keys"), IncrementalPlatformKeys, PlatformKeys);
+	auto CompareMaps = [&Mismatches](const TCHAR* Name, const auto& Incremental, const auto& Rebuilt)
+	{
+		int32 Differences = FMath::Abs(Incremental.Num() - Rebuilt.Num());
+
+		for (const auto& Entry : Rebuilt)
+		{
+			const auto* IncrementalValue = Incremental.Find(Entry.Key);
+			Differences += (IncrementalValue && *IncrementalValue == Entry.Value) ? 0 : 1;
+		}
+
+		if (Differences > 0)
+		{
+			Mismatches.Add(FString::Printf(TEXT("%s: %d differ"), Name, Differences));
+		}
+	};
+
+	CompareMaps(TEXT("module faces"), IncrementalFaceOwners, ModuleFaceOwners);
+	CompareMaps(TEXT("module edges"), IncrementalEdgeUses, ModuleEdgeUses);
+	CompareMaps(TEXT("rim cells"), IncrementalRimCellNormals, RimCellNormals);
 	CompareKeySets(TEXT("promoted surfaces"), IncrementalPromotedFaces, PromotedFaces);
-
-	int32 RimMismatches = FMath::Abs(IncrementalRimCellNormals.Num() - RimCellNormals.Num());
-	for (const TPair<uint64, uint8>& RimCell : RimCellNormals)
-	{
-		const uint8* IncrementalAxes = IncrementalRimCellNormals.Find(RimCell.Key);
-		RimMismatches += (IncrementalAxes && *IncrementalAxes == RimCell.Value) ? 0 : 1;
-	}
-
-	if (RimMismatches > 0)
-	{
-		Mismatches.Add(FString::Printf(TEXT("rim cells: %d differ"), RimMismatches));
-	}
 
 	// Compared in order, since the order is what the placement stream draws from.
 	if (bHadCandidates)
 	{
-		for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
+		bool bSame = IncrementalCandidates.Num() == TileCandidates.Num();
+		int32 KeptCandidates = 0;
+		int32 RebuiltCandidates = 0;
+
+		for (int32 TileIndex = 0; TileIndex < TileCandidates.Num(); ++TileIndex)
 		{
-			const TArray<FGridPlatform>& Incremental = IncrementalCandidates[Kind];
-			const TArray<FGridPlatform>& Rebuilt = PlatformCandidates[Kind];
-
-			bool bSame = Incremental.Num() == Rebuilt.Num();
-			for (int32 Index = 0; bSame && Index < Rebuilt.Num(); ++Index)
+			for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
 			{
-				bSame = MakePlatformKey(Incremental[Index]) == MakePlatformKey(Rebuilt[Index]);
-			}
+				const TArray<FGridPlatform>& Rebuilt = TileCandidates[TileIndex].ByKind[Kind];
+				RebuiltCandidates += Rebuilt.Num();
 
-			if (!bSame)
-			{
-				Mismatches.Add(FString::Printf(TEXT("%s candidates: %d kept, %d rebuilt"),
-					Kind == KindIndex(EPlatformKind::SurfaceHorizontal) ? TEXT("horizontal") : TEXT("vertical"),
-					Incremental.Num(), Rebuilt.Num()));
+				if (!IncrementalCandidates.IsValidIndex(TileIndex))
+				{
+					continue;
+				}
+
+				const TArray<FGridPlatform>& Incremental = IncrementalCandidates[TileIndex].ByKind[Kind];
+				KeptCandidates += Incremental.Num();
+
+				bSame = bSame && Incremental.Num() == Rebuilt.Num();
+				for (int32 Index = 0; bSame && Index < Rebuilt.Num(); ++Index)
+				{
+					bSame = MakeCandidateKey(Incremental[Index]) == MakeCandidateKey(Rebuilt[Index]);
+				}
 			}
+		}
+
+		if (!bSame)
+		{
+			Mismatches.Add(FString::Printf(TEXT("candidates: %d kept, %d rebuilt"), KeptCandidates, RebuiltCandidates));
 		}
 	}
 
@@ -1510,29 +1906,29 @@ void ARoomManager::VerifyIncrementalState()
 	}
 }
 
-uint8 ARoomManager::GetCellSurfaceAxes(const FIntVector& Cell, bool& bOutInterior) const
+uint8 ARoomManager::GetCellSurfaceAxes(const FIntVector& Cell, int32& OutInteriorOwner) const
 {
-	bOutInterior = false;
+	OutInteriorOwner = INDEX_NONE;
 
 	if (!IsValidCell(Cell))
 	{
 		return 0;
 	}
 
-	const int32 Pitch = GetPitch();
+	const int32 Module = GetModule();
 
 	// Which lattice planes the cell lies on says what it could be: on none, it is inside one of
-	// the lattice's cubes, where nothing is ever built; on one, it is interior to the one slot in
-	// that plane; on two it is on an edge, and on three it is a node.
+	// the lattice's cubes, where nothing is ever built; on one, it can only be interior; on two
+	// or three - a module edge or a node - it can be rim, or interior to a platform bridging it.
+	uint8 LatticePlanes = 0;
 	int32 LatticePlaneCount = 0;
-	int32 LatticePlaneAxis = INDEX_NONE;
 
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
-		if (Cell[Axis] % Pitch == 0)
+		if (Cell[Axis] % Module == 0)
 		{
+			LatticePlanes |= AxisBit(Axis);
 			++LatticePlaneCount;
-			LatticePlaneAxis = Axis;
 		}
 	}
 
@@ -1541,37 +1937,100 @@ uint8 ARoomManager::GetCellSurfaceAxes(const FIntVector& Cell, bool& bOutInterio
 		return 0;
 	}
 
-	// An interior cell is built exactly when its slot is filled, so interiors need no record of
-	// their own - which is most of every platform.
-	if (LatticePlaneCount == 1)
+	// Rim can have been brought by any of several platforms, so it is recorded.
+	if (LatticePlaneCount >= 2)
 	{
-		FIntVector SlotMinNode = Cell;
-
-		for (int32 Axis = 0; Axis < 3; ++Axis)
+		if (const uint8* RimAxes = RimCellNormals.Find(MakeCellKey(Cell)))
 		{
-			SlotMinNode[Axis] -= Cell[Axis] % Pitch;
+			return *RimAxes;
 		}
-
-		if (!PlatformKeys.Contains(MakeTaggedKey(SlotMinNode, LatticePlaneAxis)))
-		{
-			return 0;
-		}
-
-		bOutInterior = true;
-		return AxisBit(LatticePlaneAxis);
 	}
 
-	// An edge or a node can have been brought by any of several platforms, so those are recorded.
-	const uint8* RimAxes = RimCellNormals.Find(MakeCellKey(Cell));
+	// Interior follows from the module faces around it, so it needs no record of its own - which
+	// is most of every platform. Nothing but the one platform ever takes in an interior cell.
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if ((LatticePlanes & AxisBit(Axis)) == 0)
+		{
+			continue;
+		}
 
-	return RimAxes ? *RimAxes : 0;
+		const int32 PlaneOwner = FindInteriorOwner(Cell, Axis);
+
+		if (PlaneOwner != INDEX_NONE)
+		{
+			OutInteriorOwner = PlaneOwner;
+			return AxisBit(Axis);
+		}
+	}
+
+	return 0;
+}
+
+int32 ARoomManager::FindInteriorOwner(const FIntVector& Cell, const int32 NormalAxis) const
+{
+	const int32 Module = GetModule();
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// Along each in-plane axis the cell lies within one module, or on the line between two, so it
+	// touches one module face of the plane, two, or four. It is interior only if one platform
+	// covers all of them.
+	const int32 FirstModuleU = Cell[U] % Module == 0 ? Cell[U] / Module - 1 : Cell[U] / Module;
+	const int32 FirstModuleV = Cell[V] % Module == 0 ? Cell[V] / Module - 1 : Cell[V] / Module;
+
+	if (FirstModuleU < 0 || FirstModuleV < 0)
+	{
+		return INDEX_NONE;
+	}
+
+	int32 CoveringPlatform = INDEX_NONE;
+
+	for (int32 ModuleV = FirstModuleV; ModuleV <= Cell[V] / Module; ++ModuleV)
+	{
+		for (int32 ModuleU = FirstModuleU; ModuleU <= Cell[U] / Module; ++ModuleU)
+		{
+			FIntVector FaceMinNode = Cell;
+			FaceMinNode[U] = ModuleU * Module;
+			FaceMinNode[V] = ModuleV * Module;
+
+			const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+
+			if (!FaceOwner || (CoveringPlatform != INDEX_NONE && *FaceOwner != CoveringPlatform))
+			{
+				return INDEX_NONE;
+			}
+
+			CoveringPlatform = *FaceOwner;
+		}
+	}
+
+	return CoveringPlatform;
+}
+
+bool ARoomManager::IsFaceBlocked(const FGridPlatform& Platform, const EGridFace Face) const
+{
+	if (!Platform.Tile)
+	{
+		return false;
+	}
+
+	// Top and bottom are the tile's own, and a platform always lies with its top looking out
+	// along its normal - up from a floor, out along +X or +Y from a wall.
+	switch (Platform.Tile->BlockedFace)
+	{
+	case ETileBlockedFace::Top: return FaceSign(Face) > 0;
+	case ETileBlockedFace::Bottom: return FaceSign(Face) < 0;
+	default: return false;
+	}
 }
 
 bool ARoomManager::IsSolidCell(const FIntVector& Cell) const
 {
-	bool bInterior = false;
+	int32 InteriorOwner = INDEX_NONE;
 
-	return GetCellSurfaceAxes(Cell, bInterior) != 0;
+	return GetCellSurfaceAxes(Cell, InteriorOwner) != 0;
 }
 
 void ARoomManager::ResolveSurface(
@@ -1583,8 +2042,8 @@ void ARoomManager::ResolveSurface(
 	OutCapacity = ESurfaceCapacity::Empty;
 	bOutOccupied = false;
 
-	bool bInterior = false;
-	const uint8 SurfaceAxes = GetCellSurfaceAxes(Cell, bInterior);
+	int32 InteriorOwner = INDEX_NONE;
+	const uint8 SurfaceAxes = GetCellSurfaceAxes(Cell, InteriorOwner);
 
 	// Nothing built here faces this way. The thin outer edge of a rim lands here too: it faces
 	// across its platform, not along the platform's normal.
@@ -1593,11 +2052,18 @@ void ARoomManager::ResolveSurface(
 		return;
 	}
 
+	// A side a tile has blocked off is not a surface at all. Only an interior can be: the rim
+	// around it is shared with its neighbours, and stays a surface for them.
+	if (InteriorOwner != INDEX_NONE && IsFaceBlocked(BuiltPlatforms[InteriorOwner], Face))
+	{
+		return;
+	}
+
 	// Occupancy outranks what a surface carries, but does not replace it: an occupied rim
 	// surface is still wall surface, it has only stopped being a free one.
 	bOutOccupied = IsSolidCell(Cell + FaceStep(Face));
 
-	OutCapacity = (bInterior || PromotedFaces.Contains(MakeFaceKey(Cell, Face)))
+	OutCapacity = (InteriorOwner != INDEX_NONE || PromotedFaces.Contains(MakeFaceKey(Cell, Face)))
 		? ESurfaceCapacity::AllObject
 		: ESurfaceCapacity::Wall;
 }
@@ -1640,8 +2106,8 @@ void ARoomManager::UpdateDebugReadouts()
 			{
 				const FIntVector Cell = ProbeCell + FIntVector(OffsetX, OffsetY, OffsetZ);
 
-				bool bInterior = false;
-				const uint8 SurfaceAxes = GetCellSurfaceAxes(Cell, bInterior);
+				int32 InteriorOwner = INDEX_NONE;
+				const uint8 SurfaceAxes = GetCellSurfaceAxes(Cell, InteriorOwner);
 
 				for (int32 Axis = 0; Axis < 3; ++Axis)
 				{
@@ -1653,6 +2119,13 @@ void ARoomManager::UpdateDebugReadouts()
 					for (const int32 Sign : { 1, -1 })
 					{
 						const EGridFace Face = MakeFace(Axis, Sign);
+
+						// A side a tile has blocked off is no surface to find.
+						if (InteriorOwner != INDEX_NONE && IsFaceBlocked(BuiltPlatforms[InteriorOwner], Face))
+						{
+							continue;
+						}
+
 						const uint64 Key = MakeFaceKey(Cell, Face);
 						const double DistanceSquared =
 							FVector::DistSquared(DebugProbeLocation, GetSurfaceWorldTransform(Cell, Face).GetLocation());
@@ -1762,10 +2235,7 @@ int32 ARoomManager::SyncPieces()
 
 	// Every piece that should be standing, each named by what it stands for. A kind that is
 	// switched off is simply left empty, which its layer reads as having been taken away.
-	TArray<FPlacedPiece> HorizontalInteriorBoxes;
-	TArray<FPlacedPiece> VerticalInteriorBoxes;
-	TArray<FPlacedPiece> EdgeBoxes;
-	TArray<FPlacedPiece> NodeBoxes;
+	FGatheredPieces Pieces;
 
 	const bool bDrawPieces = bShowPieces && PieceMesh;
 
@@ -1773,23 +2243,45 @@ int32 ARoomManager::SyncPieces()
 	{
 		for (const FGridPlatform& Platform : BuiltPlatforms)
 		{
-			GatherPlatformPieces(Platform, HorizontalInteriorBoxes, VerticalInteriorBoxes, EdgeBoxes, NodeBoxes);
+			GatherPlatformPieces(Platform, Pieces);
 		}
 	}
 
 	int32 AddedPieces = 0;
 
-	AddedPieces += SyncPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, HorizontalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, Pieces.HorizontalInteriors, PieceMesh, ResolveTintedMaterial(
 		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
 
-	AddedPieces += SyncPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces, VerticalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces, Pieces.VerticalInteriors, PieceMesh, ResolveTintedMaterial(
 		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
 
-	AddedPieces += SyncPieceLayer(EdgeLayer, EdgePieces, EdgeBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(EdgeLayer, EdgePieces, Pieces.Edges, PieceMesh, ResolveTintedMaterial(
 		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
 
-	AddedPieces += SyncPieceLayer(NodeLayer, NodePieces, NodeBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(NodeLayer, NodePieces, Pieces.Nodes, PieceMesh, ResolveTintedMaterial(
 		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
+
+	// A tile that brings its own mesh has a layer of its own. One whose tile has nothing left to
+	// build - taken out of the structure, or its mesh cleared - is taken down rather than kept empty.
+	for (int32 LayerIndex = TileMeshLayers.Num() - 1; LayerIndex >= 0; --LayerIndex)
+	{
+		FTileMeshLayer& Layer = TileMeshLayers[LayerIndex];
+
+		if (!Pieces.MeshInteriors.Contains(Layer.Tile.Get()))
+		{
+			ResetChunks(Layer.Pieces.Chunks, nullptr);
+			TileMeshLayers.RemoveAt(LayerIndex);
+		}
+	}
+
+	// The mesh keeps its own materials, so no tint is put over it.
+	for (const TPair<UPlatformTileData*, TArray<FPlacedPiece>>& MeshInteriors : Pieces.MeshInteriors)
+	{
+		FTileMeshLayer& Layer = FindOrAddTileMeshLayer(MeshInteriors.Key);
+
+		AddedPieces += SyncPieceLayer(
+			Layer.Pieces, Layer.Pieces.Chunks[0], MeshInteriors.Value, MeshInteriors.Key->Mesh, /*Material=*/nullptr);
+	}
 
 	// Only a sync that built every platform can be added to one placement at a time.
 	bPiecesComplete = bDrawPieces;
@@ -1799,10 +2291,17 @@ int32 ARoomManager::SyncPieces()
 
 void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 {
-	const bool bLayersIntact = IsPieceLayerIntact(HorizontalInteriorLayer, HorizontalInteriorPieces)
+	bool bLayersIntact = IsPieceLayerIntact(HorizontalInteriorLayer, HorizontalInteriorPieces)
 		&& IsPieceLayerIntact(VerticalInteriorLayer, VerticalInteriorPieces)
 		&& IsPieceLayerIntact(EdgeLayer, EdgePieces)
 		&& IsPieceLayerIntact(NodeLayer, NodePieces);
+
+	for (const FTileMeshLayer& Layer : TileMeshLayers)
+	{
+		bLayersIntact = bLayersIntact
+			&& !Layer.Pieces.Chunks.IsEmpty()
+			&& IsPieceLayerIntact(Layer.Pieces, Layer.Pieces.Chunks[0]);
+	}
 
 	// Anything but the plain case - pieces switched off, never built in full, or a layer out of
 	// step with its record - is left to the full sync.
@@ -1812,63 +2311,74 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 		return;
 	}
 
-	TArray<FPlacedPiece> HorizontalInteriorBoxes;
-	TArray<FPlacedPiece> VerticalInteriorBoxes;
-	TArray<FPlacedPiece> EdgeBoxes;
-	TArray<FPlacedPiece> NodeBoxes;
-	GatherPlatformPieces(Platform, HorizontalInteriorBoxes, VerticalInteriorBoxes, EdgeBoxes, NodeBoxes);
+	FGatheredPieces Pieces;
+	GatherPlatformPieces(Platform, Pieces);
 
 	// An edge or a node a neighbour already built is skipped, so a shared piece is still built once.
-	auto AppendToLayer = [this](
+	auto AppendToLayer = [](
+		FRoomPieceLayer& Layer,
+		const TConstArrayView<FPlacedPiece> LayerPieces,
+		TArray<FTransform>& OutNewPieces)
+	{
+		for (const FPlacedPiece& Piece : LayerPieces)
+		{
+			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
+
+			// Any stamp but zero marks a piece as drawn, and the full sync that made this layer
+			// complete - or the making of a tile's layer - left SyncStamp above zero.
+			if (Stamp == 0)
+			{
+				Stamp = Layer.SyncStamp;
+				OutNewPieces.Add(Piece.Transform);
+			}
+		}
+	};
+
+	auto AppendToFixedLayer = [this, &AppendToLayer](
 		FRoomPieceLayer& Layer,
 		UInstancedStaticMeshComponent* FirstChunk,
-		const TConstArrayView<FPlacedPiece> Pieces,
+		const TConstArrayView<FPlacedPiece> LayerPieces,
 		UMaterialInterface* Material)
 	{
 		ApplyMeshAndMaterial(Layer.Chunks, PieceMesh, Material);
 
 		TArray<FTransform> NewPieces;
-
-		for (const FPlacedPiece& Piece : Pieces)
-		{
-			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
-
-			// Any stamp but zero marks a piece as drawn, and the full sync that made this layer
-			// complete left SyncStamp above zero.
-			if (Stamp == 0)
-			{
-				Stamp = Layer.SyncStamp;
-				NewPieces.Add(Piece.Transform);
-			}
-		}
-
+		AppendToLayer(Layer, LayerPieces, NewPieces);
 		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
 	};
 
-	AppendToLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, HorizontalInteriorBoxes, ResolveTintedMaterial(
+	AppendToFixedLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, Pieces.HorizontalInteriors, ResolveTintedMaterial(
 		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
 
-	AppendToLayer(VerticalInteriorLayer, VerticalInteriorPieces, VerticalInteriorBoxes, ResolveTintedMaterial(
+	AppendToFixedLayer(VerticalInteriorLayer, VerticalInteriorPieces, Pieces.VerticalInteriors, ResolveTintedMaterial(
 		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
 
-	AppendToLayer(EdgeLayer, EdgePieces, EdgeBoxes, ResolveTintedMaterial(
+	AppendToFixedLayer(EdgeLayer, EdgePieces, Pieces.Edges, ResolveTintedMaterial(
 		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
 
-	AppendToLayer(NodeLayer, NodePieces, NodeBoxes, ResolveTintedMaterial(
+	AppendToFixedLayer(NodeLayer, NodePieces, Pieces.Nodes, ResolveTintedMaterial(
 		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
+
+	for (const TPair<UPlatformTileData*, TArray<FPlacedPiece>>& MeshInteriors : Pieces.MeshInteriors)
+	{
+		FTileMeshLayer& Layer = FindOrAddTileMeshLayer(MeshInteriors.Key);
+		ApplyMeshAndMaterial(Layer.Pieces.Chunks, MeshInteriors.Key->Mesh, /*Material=*/nullptr);
+
+		TArray<FTransform> NewPieces;
+		AppendToLayer(Layer.Pieces, MeshInteriors.Value, NewPieces);
+		AddPiecesToLayer(Layer.Pieces, Layer.Pieces.Chunks[0], NewPieces);
+	}
 }
 
-void ARoomManager::GatherPlatformPieces(
-	const FGridPlatform& Platform,
-	TArray<FPlacedPiece>& OutHorizontalInteriors,
-	TArray<FPlacedPiece>& OutVerticalInteriors,
-	TArray<FPlacedPiece>& OutEdges,
-	TArray<FPlacedPiece>& OutNodes) const
+void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGatheredPieces& OutPieces) const
 {
-	const int32 Pitch = GetPitch();
-	const double RunExtent = static_cast<double>(Pitch - 1) * CellSize;
+	int32 SpanU, SpanV;
+	GetPlatformSpans(Platform, SpanU, SpanV);
 
-	// Everything on the lattice is axis-aligned, so every piece is the unit cube scaled to the
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+	// Everything on the lattice is axis-aligned, so every box is the unit cube scaled to the
 	// cells it fills, and none needs turning.
 	auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
 	{
@@ -1876,41 +2386,60 @@ void ARoomManager::GatherPlatformPieces(
 	};
 
 	int32 U, V;
-	GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+	GetInPlaneAxes(NormalAxis, U, V);
 
-	// One box for the whole interior - a platform is one thing that was placed, so it is drawn
+	// One piece for the whole interior - a platform is one thing that was placed, so it is drawn
 	// as one thing.
 	FVector InteriorExtent(CellSize);
-	InteriorExtent[U] = RunExtent;
-	InteriorExtent[V] = RunExtent;
+	InteriorExtent[U] = static_cast<double>(SpanU - 1) * CellSize;
+	InteriorExtent[V] = static_cast<double>(SpanV - 1) * CellSize;
 
-	TArray<FPlacedPiece>& InteriorBoxes =
-		Platform.GetKind() == EPlatformKind::SurfaceHorizontal ? OutHorizontalInteriors : OutVerticalInteriors;
+	const FIntVector InteriorMinCell = Platform.MinNode + AxisStep(U) + AxisStep(V);
+	const uint64 PlatformKey = MakePlatformKey(Platform);
 
-	InteriorBoxes.Add(FPlacedPiece{
-		MakePlatformKey(Platform), MakeBox(Platform.MinNode + AxisStep(U) + AxisStep(V), InteriorExtent) });
-
-	// The rim is drawn per edge and per node, each named by what it is rather than by the
-	// platform that brought it. A neighbour sharing one names the same piece, so it is built
-	// once, and no two beams - nor a beam and a post - can ever overlap.
-	FLatticeEdge Edges[4];
-	GetPlatformEdges(Platform, Pitch, Edges);
-
-	for (const FLatticeEdge& Edge : Edges)
+	if (Platform.Tile && Platform.Tile->Mesh)
 	{
+		// The tile's own mesh stands at the interior's centre at its own size, its top looking
+		// out along the platform's normal and its width running wherever the tile's width does.
+		const FVector Normal(AxisStep(NormalAxis));
+		const FVector WidthDirection(AxisStep(Platform.bTurned ? V : U));
+		const FVector Centre = GetCellMinCorner(InteriorMinCell) + 0.5 * InteriorExtent;
+
+		OutPieces.MeshInteriors.FindOrAdd(Platform.Tile.Get()).Add(FPlacedPiece{
+			PlatformKey, FTransform(FRotationMatrix::MakeFromXZ(WidthDirection, Normal).ToQuat(), Centre) });
+	}
+	else
+	{
+		TArray<FPlacedPiece>& InteriorBoxes = Platform.GetKind() == EPlatformKind::SurfaceHorizontal
+			? OutPieces.HorizontalInteriors
+			: OutPieces.VerticalInteriors;
+
+		InteriorBoxes.Add(FPlacedPiece{ PlatformKey, MakeBox(InteriorMinCell, InteriorExtent) });
+	}
+
+	// The rim is drawn per module edge and per node, each named by what it is rather than by the
+	// platform that brought it. A neighbour sharing one names the same piece, so it is built
+	// once - even where a neighbour shares only part of a side - and no two beams, nor a beam
+	// and a post, can ever overlap.
+	const double RunExtent = static_cast<double>(Module - 1) * CellSize;
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (!bRim)
+		{
+			return;
+		}
+
 		FVector EdgeExtent(CellSize);
 		EdgeExtent[Edge.Axis] = RunExtent;
 
-		OutEdges.Add(FPlacedPiece{ MakeEdgeKey(Edge), MakeBox(Edge.Node + AxisStep(Edge.Axis), EdgeExtent) });
-	}
+		OutPieces.Edges.Add(FPlacedPiece{ MakeEdgeKey(Edge), MakeBox(Edge.Node + AxisStep(Edge.Axis), EdgeExtent) });
+	});
 
-	FIntVector Nodes[4];
-	GetPlatformNodes(Platform, Pitch, Nodes);
-
-	for (const FIntVector& Node : Nodes)
+	ForEachRimNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
 	{
-		OutNodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
-	}
+		OutPieces.Nodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
+	});
 }
 
 void ARoomManager::ResetPieces()
@@ -1919,8 +2448,50 @@ void ARoomManager::ResetPieces()
 	ResetPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces);
 	ResetPieceLayer(EdgeLayer, EdgePieces);
 	ResetPieceLayer(NodeLayer, NodePieces);
+	ResetTileMeshLayers();
 
 	bPiecesComplete = false;
+}
+
+FTileMeshLayer& ARoomManager::FindOrAddTileMeshLayer(UPlatformTileData* Tile)
+{
+	FTileMeshLayer* Layer = TileMeshLayers.FindByPredicate([Tile](const FTileMeshLayer& Existing)
+	{
+		return Existing.Tile == Tile;
+	});
+
+	if (!Layer)
+	{
+		Layer = &TileMeshLayers.AddDefaulted_GetRef();
+		Layer->Tile = Tile;
+	}
+
+	// Its first chunk is made here rather than being one of the actor's own, so if that has been
+	// lost there is nothing of the layer worth keeping: it starts again.
+	if (Layer->Pieces.Chunks.IsEmpty() || !IsValid(Layer->Pieces.Chunks[0]))
+	{
+		ResetChunks(Layer->Pieces.Chunks, nullptr);
+		Layer->Pieces.PieceStamps.Reset();
+
+		// A stamp of zero means "not drawn yet", so the layer's own has to start above it.
+		Layer->Pieces.SyncStamp = FMath::Max<uint32>(Layer->Pieces.SyncStamp, 1);
+
+		// Set up like the plain interiors it stands in for. The tile's mesh, with its own
+		// materials, goes on when the layer is first filled.
+		AddInstancedChunk(Layer->Pieces.Chunks, HorizontalInteriorPieces, FName(*FString::Printf(TEXT("%s_Pieces"), *Tile->GetName())));
+	}
+
+	return *Layer;
+}
+
+void ARoomManager::ResetTileMeshLayers()
+{
+	for (FTileMeshLayer& Layer : TileMeshLayers)
+	{
+		ResetChunks(Layer.Pieces.Chunks, nullptr);
+	}
+
+	TileMeshLayers.Reset();
 }
 
 int32 ARoomManager::SyncPieceLayer(
@@ -2076,11 +2647,12 @@ void ARoomManager::ResetChunks(
 
 UInstancedStaticMeshComponent* ARoomManager::AddInstancedChunk(
 	TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
-	UInstancedStaticMeshComponent* FirstChunk)
+	UInstancedStaticMeshComponent* FirstChunk,
+	const FName BaseName)
 {
 	// Named after the first chunk, so the component list reads EdgePieces, EdgePieces_1, ...
-	const FName ChunkName =
-		MakeUniqueObjectName(this, UInstancedStaticMeshComponent::StaticClass(), FirstChunk->GetFName());
+	const FName ChunkName = MakeUniqueObjectName(
+		this, UInstancedStaticMeshComponent::StaticClass(), BaseName.IsNone() ? FirstChunk->GetFName() : BaseName);
 
 	// Rebuilt from the platform list whenever it is needed, so never saved, and never copied
 	// along with the actor - a PIE or pasted copy starts from its own first chunks and grows its own.
@@ -2302,23 +2874,32 @@ void ARoomManager::RemoveSurfaceMark(const int32 Layer, const int32 Chunk, const
 	Keys.Pop(EAllowShrinking::No);
 }
 
-bool ARoomManager::SyncSurfaceMark(
-	const FIntVector& Cell,
-	const EGridFace Face,
-	const uint64 Key,
-	FSurfaceMarkSlot& Slot,
-	FPendingSurfaceMarks& Pending)
+int32 ARoomManager::ResolveSurfaceMarkLayer(const FIntVector& Cell, const EGridFace Face) const
 {
 	ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
 	bool bOccupied = false;
 	ResolveSurface(Cell, Face, Capacity, bOccupied);
 
+	if (Capacity == ESurfaceCapacity::Empty)
+	{
+		return INDEX_NONE;
+	}
+
 	// Occupancy is drawn instead of the capacity, since what a surface is free to take is the
 	// more useful reading and a built-against surface has stopped offering it.
-	const int32 Layer = bOccupied
+	return bOccupied
 		? OccupiedMarkLayer
 		: (Capacity == ESurfaceCapacity::AllObject ? AllObjectMarkLayer : WallMarkLayer);
+}
 
+bool ARoomManager::SyncSurfaceMark(
+	const FIntVector& Cell,
+	const EGridFace Face,
+	const uint64 Key,
+	const int32 Layer,
+	FSurfaceMarkSlot& Slot,
+	FPendingSurfaceMarks& Pending)
+{
 	if (Slot.Layer == Layer)
 	{
 		return false;
@@ -2417,7 +2998,6 @@ int32 ARoomManager::SyncSurfaceMarks()
 
 	RefreshSurfaceMarkMaterials();
 
-	const int32 Pitch = GetPitch();
 	const FVector MarkScale = MakeSurfaceMarkScale(CellSize);
 
 	FPendingSurfaceMarks Pending;
@@ -2442,10 +3022,21 @@ int32 ARoomManager::SyncSurfaceMarks()
 			const int32 NormalAxis = AxisIndex(Platform.Normal);
 			const EGridFace PlatformFaces[2] = { MakeFace(NormalAxis, 1), MakeFace(NormalAxis, -1) };
 
-			ForEachPlatformCell(Platform, Pitch, [&](const FIntVector& Cell, bool)
+			int32 SpanU, SpanV;
+			GetPlatformSpans(Platform, SpanU, SpanV);
+
+			ForEachPlatformCell(Platform, SpanU, SpanV, [&](const FIntVector& Cell, bool)
 			{
 				for (const EGridFace Face : PlatformFaces)
 				{
+					// A side a tile has blocked off is no surface, and never has a square.
+					const int32 Layer = ResolveSurfaceMarkLayer(Cell, Face);
+
+					if (Layer == INDEX_NONE)
+					{
+						continue;
+					}
+
 					const uint64 Key = MakeFaceKey(Cell, Face);
 					FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindOrAdd(Key);
 
@@ -2458,7 +3049,7 @@ int32 ARoomManager::SyncSurfaceMarks()
 					Slot.SeenStamp = SurfaceMarkSyncStamp;
 					++FoundSurfaces;
 
-					if (SyncSurfaceMark(Cell, Face, Key, Slot, Pending))
+					if (SyncSurfaceMark(Cell, Face, Key, Layer, Slot, Pending))
 					{
 						++ChangedMarks;
 					}
@@ -2511,8 +3102,16 @@ void ARoomManager::UpdateSurfaceMarks(const TConstArrayView<FGridSurfaceRef> Sur
 	// A surface can be named more than once; after the first it is already the right colour.
 	for (const FGridSurfaceRef& Surface : Surfaces)
 	{
+		// A side a tile has blocked off is no surface, and never has a square.
+		const int32 Layer = ResolveSurfaceMarkLayer(Surface.Cell, Surface.Face);
+
+		if (Layer == INDEX_NONE)
+		{
+			continue;
+		}
+
 		const uint64 Key = MakeFaceKey(Surface.Cell, Surface.Face);
-		SyncSurfaceMark(Surface.Cell, Surface.Face, Key, SurfaceMarkSlots.FindOrAdd(Key), Pending);
+		SyncSurfaceMark(Surface.Cell, Surface.Face, Key, Layer, SurfaceMarkSlots.FindOrAdd(Key), Pending);
 	}
 
 	AddPendingSurfaceMarks(Pending);
