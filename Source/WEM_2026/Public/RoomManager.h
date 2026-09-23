@@ -104,6 +104,36 @@ struct FGridLevel
 };
 
 /**
+ * One kind of built piece - floor tile, beam, slab, wall, post - spread over a run of small
+ * instanced components, "chunks", filled one at a time.
+ *
+ * Lumen throws away its surface cache for every instance of a component whose instance count
+ * changes, then recaptures all of it over the frames that follow. With a kind of piece in one
+ * component, every placement did that to the whole tower, and with the camera inside it - where
+ * every surface is close and wants its cache at high resolution - that recapture was most of the
+ * frame. In chunks, a placement only ever grows the chunk still being filled.
+ */
+USTRUCT()
+struct FRoomPieceLayer
+{
+	GENERATED_BODY()
+
+	/**
+	 * Oldest first, and only the last is ever still being filled. The first is the actor's own
+	 * component for this kind of piece; the rest are made as the grid fills and never saved.
+	 * Not copied with the actor either: each layer property on ARoomManager is DuplicateTransient.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UInstancedStaticMeshComponent>> Chunks;
+
+	/** Every piece drawn so far, keyed by what it stands for, with the sync that last found it. */
+	TMap<uint64, uint32> PieceStamps;
+
+	/** Bumped once per sync. Never zero after the first, which marks a piece as not yet drawn. */
+	uint32 SyncStamp = 0;
+};
+
+/**
  * Directs the simulation's grid: a debug-visible lattice laid out across the landscape.
  *
  * The grid's corner origin is this actor's own world-space location and extends into
@@ -613,8 +643,43 @@ private:
 
 	UInstancedStaticMeshComponent* GetSurfaceMarkLayer(int32 Layer) const;
 
-	/** Rebuilds the built geometry: one plane per floor tile, one per beam cell, one box per wall and post. */
-	void RebuildPlanes();
+	/** One piece as its layer sees it: what it stands for, and where it goes. */
+	struct FPlacedPiece
+	{
+		uint64 Key = 0;
+		FTransform Transform;
+	};
+
+	/**
+	 * Brings the built geometry in line with the levels - one plane per ground tile and ground
+	 * beam cell, one box per slab, beam cell, wall and post above that - adding only what is new.
+	 */
+	void SyncPieces();
+
+	/** Drops every piece of every kind, so the next sync builds the lot. */
+	void ResetPieces();
+
+	/**
+	 * Adds the pieces a layer has not drawn yet, filling its open chunk and starting a new one
+	 * whenever that is full. If a piece it did draw is missing from Pieces, the layer is rebuilt
+	 * from scratch instead - growth never takes a piece away, so that only follows a reset.
+	 */
+	void SyncPieceLayer(
+		FRoomPieceLayer& Layer,
+		UInstancedStaticMeshComponent* FirstChunk,
+		TConstArrayView<FPlacedPiece> Pieces,
+		UStaticMesh* Mesh,
+		UMaterialInterface* Material);
+
+	/** Empties a layer back to its first chunk, cleared. */
+	void ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk);
+
+	/** Starts a new chunk for a layer, set up like its first. */
+	UInstancedStaticMeshComponent* AddPieceChunk(
+		FRoomPieceLayer& Layer,
+		UInstancedStaticMeshComponent* FirstChunk,
+		UStaticMesh* Mesh,
+		UMaterialInterface* Material);
 
 	/**
 	 * Dynamic instance of a base material tinted to Color, made once and re-tinted after that.
@@ -691,6 +756,30 @@ private:
 	/** Bumped once per sync, to tell the cells it found claimed from ones it did not. */
 	uint32 SurfaceMarkSyncStamp = 0;
 
+	/** Ground tiles, drawn as flat planes. Starts from FloorTilePlanes. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer FloorTilePlaneLayer;
+
+	/** Ground beam cells, drawn as flat planes. Starts from WallBeamPlanes. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer WallBeamPlaneLayer;
+
+	/** Tiles above the ground. Starts from SlabPieces. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer SlabLayer;
+
+	/** Beam cells above the ground. Starts from BeamPieces. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer BeamLayer;
+
+	/** Walls on every level. Starts from WallPieces. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer WallLayer;
+
+	/** Corner posts on every level. Starts from WallPostPieces. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FRoomPieceLayer WallPostLayer;
+
 	FRandomStream PlacementStream;
 
 	FTimerHandle PlacementTimerHandle;
@@ -703,6 +792,9 @@ private:
 	 * component's properties inline, its per-instance array included, and every placement changes
 	 * those arrays - so with this actor selected during a run the panel rebuilt thousands of rows
 	 * a beat. BlueprintReadOnly keeps them reachable from Blueprint and MCP.
+	 *
+	 * The six piece components are each only the first chunk of their kind (see FRoomPieceLayer).
+	 * Their settings - shadows, collision, mobility - are copied onto every chunk made after them.
 	 */
 
 	/** One instance per tile on the ground, scaled to the tile's whole interior. */

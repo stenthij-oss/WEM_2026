@@ -44,11 +44,26 @@ namespace
 		OccupiedMarkLayer
 	};
 
-	/** One key per cell per level, so every level's overlay shares a single record. */
-	FORCEINLINE uint64 MakeSurfaceMarkKey(const int32 Level, const int32 CellIndex)
+	/** One key per cell per level, so every level shares a single record of what is drawn where. */
+	FORCEINLINE uint64 MakeCellKey(const int32 Level, const int32 CellIndex)
 	{
 		return (static_cast<uint64>(Level) << 32) | static_cast<uint32>(CellIndex);
 	}
+
+	/** A wall is named by its tile and a side rather than by a cell, so the side goes in the top byte. */
+	FORCEINLINE uint64 MakeWallKey(const int32 Level, const int32 TileCellIndex, const EGridSide Side)
+	{
+		return MakeCellKey(Level, TileCellIndex) | ((static_cast<uint64>(Side) + 1) << 56);
+	}
+
+	/**
+	 * Most pieces one chunk of a piece layer holds before a fresh chunk is started.
+	 *
+	 * A placement only ever grows the chunks still being filled, and Lumen recaptures the whole
+	 * surface cache of any component it grows - at most 300 cards a frame - so this bounds what
+	 * one placement costs it. Smaller is cheaper per placement but means more components to draw.
+	 */
+	constexpr int32 PieceChunkCapacity = 128;
 
 	/** The four directions a tile can grow in. */
 	const FIntPoint FloorTileGrowthDirections[] = {
@@ -156,8 +171,9 @@ ARoomManager::ARoomManager()
 	GridLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("GridLineBatcher"));
 	GridLineBatcher->SetupAttachment(SceneRoot);
 
-	// Instanced rather than a component per piece: a saturated 52x52 grid is a couple of
-	// thousand planes, which is one draw call each way like this.
+	// Instanced rather than a component per piece: a grid fills with thousands of them. Each of
+	// these six is only the first chunk of its kind; SyncPieceLayer adds more as the grid fills,
+	// set up the way these are set up here.
 	FloorTilePlanes = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("FloorTilePlanes"));
 	FloorTilePlanes->SetupAttachment(SceneRoot);
 
@@ -971,10 +987,11 @@ double ARoomManager::ResolveGridBaseZ() const
 
 void ARoomManager::RebuildVisuals()
 {
-	RebuildPlanes();
-
 	// Whatever called this may have moved every cell - a new cell size, a new height, a
-	// resized grid - so not one square is kept.
+	// resized grid - so not one piece or square is kept.
+	ResetPieces();
+	SyncPieces();
+
 	ResetSurfaceMarks();
 	SyncSurfaceMarks();
 
@@ -983,7 +1000,7 @@ void ARoomManager::RebuildVisuals()
 
 void ARoomManager::UpdateVisualsAfterPlacement()
 {
-	RebuildPlanes();
+	SyncPieces();
 	SyncSurfaceMarks();
 }
 
@@ -1013,104 +1030,66 @@ UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(
 	return CachedMaterial;
 }
 
-void ARoomManager::RebuildPlanes()
+void ARoomManager::SyncPieces()
 {
 	if (!FloorTilePlanes || !WallBeamPlanes || !WallPieces || !WallPostPieces || !SlabPieces || !BeamPieces)
 	{
 		return;
 	}
 
-	FloorTilePlanes->ClearInstances();
-	WallBeamPlanes->ClearInstances();
-	SlabPieces->ClearInstances();
-	BeamPieces->ClearInstances();
-	WallPieces->ClearInstances();
-	WallPostPieces->ClearInstances();
-
-	if (!bShowPlanes || Levels.IsEmpty())
-	{
-		return;
-	}
-
 	const int32 TileSize = FMath::Max(FloorTileSize, 1);
 	const double TileExtent = TileSize * CellSize;
+	const bool bDrawAny = bShowPlanes && !Levels.IsEmpty();
 
-	// Every batch below is gathered here and handed over in one call. AddInstance one at a
-	// time re-invalidates the component's bounds, re-tests navigation relevancy and broadcasts
-	// an index-update delegate on each instance; AddInstances does all of that once for the
-	// batch, which is the difference between a beat and a stall once a 512 grid fills up.
-	TArray<FTransform> Batch;
+	// Every piece that should be standing, each named by what it stands for. A kind that is
+	// switched off is simply left empty, which its layer reads as having been taken away.
+	TArray<FPlacedPiece> TilePlanes;
+	TArray<FPlacedPiece> BeamPlanes;
+	TArray<FPlacedPiece> SlabBoxes;
+	TArray<FPlacedPiece> BeamBoxes;
+	TArray<FPlacedPiece> WallBoxes;
+	TArray<FPlacedPiece> PostBoxes;
 
 	// The ground is notation: flat, weightless, a reading of where things may go.
-	if (PlaneMesh)
+	if (bDrawAny && PlaneMesh)
 	{
 		const double PlaneZ = GridBaseZ + PlaneZOffset;
 
 		// One plane per tile, covering the interior in a single piece - a tile is one thing
 		// that was placed, so it is drawn as one thing.
-		FloorTilePlanes->SetStaticMesh(PlaneMesh);
-		FloorTilePlanes->SetMaterial(0, ResolveTintedMaterial(
-			FloorTilePlaneMaterial, PlaneMaterial, PlaneColorParameterName, FloorTilePlaneColor));
-
 		const FVector TileScale(TileExtent / UnitPlaneSize, TileExtent / UnitPlaneSize, 1.0);
-
-		Batch.Reset(Levels[0].Tiles.Num());
 
 		for (const FIntPoint& TileMin : Levels[0].Tiles)
 		{
 			const FVector Corner = GetCellMinCorner(TileMin);
 			const FVector Center(Corner.X + 0.5 * TileExtent, Corner.Y + 0.5 * TileExtent, PlaneZ);
 
-			Batch.Emplace(FRotator::ZeroRotator, Center, TileScale);
+			TilePlanes.Add(FPlacedPiece{
+				MakeCellKey(0, CellToIndex(TileMin)), FTransform(FRotator::ZeroRotator, Center, TileScale) });
 		}
-
-		FloorTilePlanes->AddInstances(Batch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
 
 		// One plane per beam cell. Coplanar and edge-to-edge, so a run of them reads as a
 		// single continuous beam, while the per-cell split is what guarantees that no two
 		// beams - and no beam and corner - can ever overlap.
-		WallBeamPlanes->SetStaticMesh(PlaneMesh);
-		WallBeamPlanes->SetMaterial(0, ResolveTintedMaterial(
-			WallBeamPlaneMaterial, PlaneMaterial, PlaneColorParameterName, WallBeamPlaneColor));
-
 		const FVector BeamPlaneScale(CellSize / UnitPlaneSize, CellSize / UnitPlaneSize, 1.0);
-
-		Batch.Reset(Levels[0].BeamCells.Num());
 
 		for (const FIntPoint& BeamCell : Levels[0].BeamCells)
 		{
 			FVector Center = GetCellCenter(BeamCell);
 			Center.Z = PlaneZ;
 
-			Batch.Emplace(FRotator::ZeroRotator, Center, BeamPlaneScale);
+			BeamPlanes.Add(FPlacedPiece{
+				MakeCellKey(0, CellToIndex(BeamCell)), FTransform(FRotator::ZeroRotator, Center, BeamPlaneScale) });
 		}
-
-		WallBeamPlanes->AddInstances(Batch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
-	}
-
-	if (!WallMesh)
-	{
-		return;
 	}
 
 	// Everything above the ground is built rather than read: slabs and beams of one
 	// thickness, hanging under the surface they make, so a slab's top is the floor stood on.
-	if (SlabThickness > 0.0f)
+	if (bDrawAny && WallMesh && SlabThickness > 0.0f)
 	{
-		SlabPieces->SetStaticMesh(WallMesh);
-		SlabPieces->SetMaterial(0, ResolveTintedMaterial(
-			SlabPieceMaterial, WallMaterial, WallColorParameterName, SlabColor));
-
-		BeamPieces->SetStaticMesh(WallMesh);
-		BeamPieces->SetMaterial(0, ResolveTintedMaterial(
-			BeamPieceMaterial, WallMaterial, WallColorParameterName, BeamColor));
-
 		const double SlabScaleZ = SlabThickness / UnitCubeSize;
 		const FVector SlabScale(TileExtent / UnitCubeSize, TileExtent / UnitCubeSize, SlabScaleZ);
 		const FVector BeamScale(CellSize / UnitCubeSize, CellSize / UnitCubeSize, SlabScaleZ);
-
-		TArray<FTransform> BeamBatch;
-		Batch.Reset();
 
 		for (int32 LevelIndex = 1; LevelIndex < Levels.Num(); ++LevelIndex)
 		{
@@ -1121,7 +1100,8 @@ void ARoomManager::RebuildPlanes()
 				const FVector Corner = GetCellMinCorner(TileMin);
 				const FVector Center(Corner.X + 0.5 * TileExtent, Corner.Y + 0.5 * TileExtent, CenterZ);
 
-				Batch.Emplace(FRotator::ZeroRotator, Center, SlabScale);
+				SlabBoxes.Add(FPlacedPiece{
+					MakeCellKey(LevelIndex, CellToIndex(TileMin)), FTransform(FRotator::ZeroRotator, Center, SlabScale) });
 			}
 
 			// One box per beam cell, which covers both a tile's own rim and the beams a wall
@@ -1131,74 +1111,247 @@ void ARoomManager::RebuildPlanes()
 				FVector Center = GetCellCenter(BeamCell);
 				Center.Z = CenterZ;
 
-				BeamBatch.Emplace(FRotator::ZeroRotator, Center, BeamScale);
+				BeamBoxes.Add(FPlacedPiece{
+					MakeCellKey(LevelIndex, CellToIndex(BeamCell)), FTransform(FRotator::ZeroRotator, Center, BeamScale) });
 			}
 		}
-
-		SlabPieces->AddInstances(Batch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
-		BeamPieces->AddInstances(BeamBatch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
 	}
 
-	if (WallHeight <= 0.0f)
+	if (bDrawAny && WallMesh && WallHeight > 0.0f)
+	{
+		const double WallScaleZ = WallHeight / UnitCubeSize;
+		const FVector PostScale(CellSize / UnitCubeSize, CellSize / UnitCubeSize, WallScaleZ);
+
+		for (int32 LevelIndex = 0; LevelIndex < Levels.Num(); ++LevelIndex)
+		{
+			// A wall stands on the surface of its own level, whether that is the ground or a slab.
+			const double WallCenterZ = GetLevelBaseZ(LevelIndex) + 0.5 * WallHeight;
+
+			// One box per wall, spanning its whole run - a wall is one thing that was placed, so
+			// it is drawn as one thing, the way a tile is.
+			for (const FWallSegment& Wall : Levels[LevelIndex].Walls)
+			{
+				const FWallFootprint Footprint = ResolveWallFootprint(Wall.TileMin, TileSize, Wall.Side);
+
+				if (!IsValidCell(Footprint.RunMin) || !IsValidCell(Footprint.RunMax))
+				{
+					continue;
+				}
+
+				const FVector RunMin = GetCellMinCorner(Footprint.RunMin);
+				const FVector RunMax = GetCellMinCorner(Footprint.RunMax) + FVector(CellSize, CellSize, 0.0);
+
+				const FVector Center(0.5 * (RunMin.X + RunMax.X), 0.5 * (RunMin.Y + RunMax.Y), WallCenterZ);
+				const FVector Scale(
+					(RunMax.X - RunMin.X) / UnitCubeSize,
+					(RunMax.Y - RunMin.Y) / UnitCubeSize,
+					WallScaleZ);
+
+				WallBoxes.Add(FPlacedPiece{
+					MakeWallKey(LevelIndex, CellToIndex(Wall.TileMin), Wall.Side),
+					FTransform(FRotator::ZeroRotator, Center, Scale) });
+			}
+
+			// The posts are separate because they are shared: one stands in a corner however many
+			// walls meet there.
+			for (const FIntPoint& PostCell : Levels[LevelIndex].WallPostCells)
+			{
+				FVector Center = GetCellCenter(PostCell);
+				Center.Z = WallCenterZ;
+
+				PostBoxes.Add(FPlacedPiece{
+					MakeCellKey(LevelIndex, CellToIndex(PostCell)), FTransform(FRotator::ZeroRotator, Center, PostScale) });
+			}
+		}
+	}
+
+	SyncPieceLayer(FloorTilePlaneLayer, FloorTilePlanes, TilePlanes, PlaneMesh, ResolveTintedMaterial(
+		FloorTilePlaneMaterial, PlaneMaterial, PlaneColorParameterName, FloorTilePlaneColor));
+
+	SyncPieceLayer(WallBeamPlaneLayer, WallBeamPlanes, BeamPlanes, PlaneMesh, ResolveTintedMaterial(
+		WallBeamPlaneMaterial, PlaneMaterial, PlaneColorParameterName, WallBeamPlaneColor));
+
+	SyncPieceLayer(SlabLayer, SlabPieces, SlabBoxes, WallMesh, ResolveTintedMaterial(
+		SlabPieceMaterial, WallMaterial, WallColorParameterName, SlabColor));
+
+	SyncPieceLayer(BeamLayer, BeamPieces, BeamBoxes, WallMesh, ResolveTintedMaterial(
+		BeamPieceMaterial, WallMaterial, WallColorParameterName, BeamColor));
+
+	SyncPieceLayer(WallLayer, WallPieces, WallBoxes, WallMesh, ResolveTintedMaterial(
+		WallPieceMaterial, WallMaterial, WallColorParameterName, WallColor));
+
+	SyncPieceLayer(WallPostLayer, WallPostPieces, PostBoxes, WallMesh, ResolveTintedMaterial(
+		WallPostPieceMaterial, WallMaterial, WallColorParameterName, WallPostColor));
+}
+
+void ARoomManager::ResetPieces()
+{
+	ResetPieceLayer(FloorTilePlaneLayer, FloorTilePlanes);
+	ResetPieceLayer(WallBeamPlaneLayer, WallBeamPlanes);
+	ResetPieceLayer(SlabLayer, SlabPieces);
+	ResetPieceLayer(BeamLayer, BeamPieces);
+	ResetPieceLayer(WallLayer, WallPieces);
+	ResetPieceLayer(WallPostLayer, WallPostPieces);
+}
+
+void ARoomManager::SyncPieceLayer(
+	FRoomPieceLayer& Layer,
+	UInstancedStaticMeshComponent* FirstChunk,
+	const TConstArrayView<FPlacedPiece> Pieces,
+	UStaticMesh* Mesh,
+	UMaterialInterface* Material)
+{
+	if (!FirstChunk)
 	{
 		return;
 	}
 
-	WallPieces->SetStaticMesh(WallMesh);
-	WallPieces->SetMaterial(0, ResolveTintedMaterial(
-		WallPieceMaterial, WallMaterial, WallColorParameterName, WallColor));
+	// The record is neither saved nor duplicated, while the first chunk is both - so a loaded
+	// level or a PIE copy arrives with instances the record knows nothing about. A chunk can
+	// also be lost from under it. Either way the two no longer agree: start the layer over.
+	bool bChunksIntact = !Layer.Chunks.IsEmpty() && Layer.Chunks[0] == FirstChunk;
+	int32 DrawnPieces = 0;
 
-	WallPostPieces->SetStaticMesh(WallMesh);
-	WallPostPieces->SetMaterial(0, ResolveTintedMaterial(
-		WallPostPieceMaterial, WallMaterial, WallColorParameterName, WallPostColor));
-
-	const double WallScaleZ = WallHeight / UnitCubeSize;
-	const FVector PostScale(CellSize / UnitCubeSize, CellSize / UnitCubeSize, WallScaleZ);
-
-	TArray<FTransform> PostBatch;
-	Batch.Reset();
-
-	for (int32 LevelIndex = 0; LevelIndex < Levels.Num(); ++LevelIndex)
+	for (const UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
 	{
-		// A wall stands on the surface of its own level, whether that is the ground or a slab.
-		const double WallCenterZ = GetLevelBaseZ(LevelIndex) + 0.5 * WallHeight;
-
-		// One box per wall, spanning its whole run - a wall is one thing that was placed, so
-		// it is drawn as one thing, the way a tile is.
-		for (const FWallSegment& Wall : Levels[LevelIndex].Walls)
+		if (IsValid(Chunk))
 		{
-			const FWallFootprint Footprint = ResolveWallFootprint(Wall.TileMin, TileSize, Wall.Side);
+			DrawnPieces += Chunk->GetInstanceCount();
+		}
+		else
+		{
+			bChunksIntact = false;
+		}
+	}
 
-			if (!IsValidCell(Footprint.RunMin) || !IsValidCell(Footprint.RunMax))
+	if (!bChunksIntact || DrawnPieces != Layer.PieceStamps.Num())
+	{
+		ResetPieceLayer(Layer, FirstChunk);
+	}
+
+	for (UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
+	{
+		Chunk->SetStaticMesh(Mesh);
+		Chunk->SetMaterial(0, Material);
+	}
+
+	TArray<FTransform> NewPieces;
+
+	// Marks every piece still wanted and collects the ones not drawn yet. Returns false if a
+	// piece that was drawn is no longer wanted.
+	auto WalkPieces = [&Layer, &Pieces, &NewPieces]() -> bool
+	{
+		++Layer.SyncStamp;
+		int32 WantedPieces = 0;
+
+		for (const FPlacedPiece& Piece : Pieces)
+		{
+			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
+
+			// Counted once however often it is named, so the tally below stays honest.
+			if (Stamp == Layer.SyncStamp)
 			{
 				continue;
 			}
 
-			const FVector RunMin = GetCellMinCorner(Footprint.RunMin);
-			const FVector RunMax = GetCellMinCorner(Footprint.RunMax) + FVector(CellSize, CellSize, 0.0);
+			if (Stamp == 0)
+			{
+				NewPieces.Add(Piece.Transform);
+			}
 
-			const FVector Center(0.5 * (RunMin.X + RunMax.X), 0.5 * (RunMin.Y + RunMax.Y), WallCenterZ);
-			const FVector Scale(
-				(RunMax.X - RunMin.X) / UnitCubeSize,
-				(RunMax.Y - RunMin.Y) / UnitCubeSize,
-				WallScaleZ);
-
-			Batch.Emplace(FRotator::ZeroRotator, Center, Scale);
+			Stamp = Layer.SyncStamp;
+			++WantedPieces;
 		}
 
-		// The posts are separate because they are shared: one stands in a corner however many
-		// walls meet there.
-		for (const FIntPoint& PostCell : Levels[LevelIndex].WallPostCells)
-		{
-			FVector Center = GetCellCenter(PostCell);
-			Center.Z = WallCenterZ;
+		return WantedPieces == Layer.PieceStamps.Num();
+	};
 
-			PostBatch.Emplace(FRotator::ZeroRotator, Center, PostScale);
+	// Growth only ever adds pieces, so this fails only when something took the grid back - and
+	// then the whole layer is drawn again rather than picked apart.
+	if (!WalkPieces())
+	{
+		ResetPieceLayer(Layer, FirstChunk);
+		NewPieces.Reset();
+		WalkPieces();
+	}
+
+	// New pieces go into the chunk still being filled, and a fresh chunk is started once that
+	// one is full. Those are the only components whose instance count changes, so they are the
+	// only ones whose surface cache Lumen has to capture again.
+	for (int32 NextPiece = 0; NextPiece < NewPieces.Num();)
+	{
+		UInstancedStaticMeshComponent* OpenChunk = Layer.Chunks.Last();
+		int32 Room = PieceChunkCapacity - OpenChunk->GetInstanceCount();
+
+		if (Room <= 0)
+		{
+			OpenChunk = AddPieceChunk(Layer, FirstChunk, Mesh, Material);
+			Room = PieceChunkCapacity;
+		}
+
+		const int32 Count = FMath::Min(Room, NewPieces.Num() - NextPiece);
+
+		// One batch per chunk: one instance at a time would redo the component's bookkeeping
+		// for every instance.
+		OpenChunk->AddInstances(
+			TArray<FTransform>(NewPieces.GetData() + NextPiece, Count),
+			/*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+
+		NextPiece += Count;
+	}
+}
+
+void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk)
+{
+	for (UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
+	{
+		if (Chunk != FirstChunk && IsValid(Chunk))
+		{
+			Chunk->DestroyComponent();
 		}
 	}
 
-	WallPieces->AddInstances(Batch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
-	WallPostPieces->AddInstances(PostBatch, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+	Layer.Chunks.Reset();
+	Layer.PieceStamps.Reset();
+
+	if (FirstChunk)
+	{
+		if (FirstChunk->GetInstanceCount() > 0)
+		{
+			FirstChunk->ClearInstances();
+		}
+
+		Layer.Chunks.Add(FirstChunk);
+	}
+}
+
+UInstancedStaticMeshComponent* ARoomManager::AddPieceChunk(
+	FRoomPieceLayer& Layer,
+	UInstancedStaticMeshComponent* FirstChunk,
+	UStaticMesh* Mesh,
+	UMaterialInterface* Material)
+{
+	// Named after the first chunk, so the component list reads WallPieces, WallPieces_1, ...
+	const FName ChunkName =
+		MakeUniqueObjectName(this, UInstancedStaticMeshComponent::StaticClass(), FirstChunk->GetFName());
+
+	// Rebuilt from the levels whenever it is needed, so never saved, and never copied along
+	// with the actor - a PIE or pasted copy starts from its own first chunks and grows its own.
+	UInstancedStaticMeshComponent* Chunk = NewObject<UInstancedStaticMeshComponent>(
+		this, ChunkName, RF_Transient | RF_DuplicateTransient | RF_TextExportTransient);
+
+	// Whatever makes this kind of piece what it is comes from the first chunk, so the
+	// constructor stays the one place each kind is set up.
+	Chunk->SetMobility(FirstChunk->Mobility);
+	Chunk->SetCollisionEnabled(FirstChunk->GetCollisionEnabled());
+	Chunk->SetCastShadow(FirstChunk->CastShadow);
+	Chunk->SetStaticMesh(Mesh);
+	Chunk->SetMaterial(0, Material);
+	Chunk->SetupAttachment(SceneRoot);
+	Chunk->RegisterComponent();
+
+	Layer.Chunks.Add(Chunk);
+	return Chunk;
 }
 
 void ARoomManager::RebuildDebugGrid()
@@ -1429,7 +1582,7 @@ void ARoomManager::SyncSurfaceMarks()
 					return;
 				}
 
-				const uint64 Key = MakeSurfaceMarkKey(LevelIndex, Index);
+				const uint64 Key = MakeCellKey(LevelIndex, Index);
 				FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindOrAdd(Key);
 
 				// Counted once however often the lists name it, so the tally below stays honest.
