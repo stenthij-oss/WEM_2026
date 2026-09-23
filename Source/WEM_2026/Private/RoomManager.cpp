@@ -2,12 +2,14 @@
 
 #include "RoomManager.h"
 
+#include "Algo/BinarySearch.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "HAL/IConsoleManager.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "TimerManager.h"
@@ -52,6 +54,22 @@ namespace
 	 * one placement costs it. Smaller is cheaper per placement but means more components to draw.
 	 */
 	constexpr int32 PieceChunkCapacity = 128;
+
+	/**
+	 * Most squares one chunk of an overlay colour holds before a fresh chunk is started.
+	 *
+	 * The overlay is kept out of Lumen, so what a changed chunk costs is rebuilding its bounds and
+	 * render data - a pass over every instance it holds. Larger than the piece chunks, since a
+	 * platform brings well over a hundred squares and only nine pieces.
+	 */
+	constexpr int32 SurfaceMarkChunkCapacity = 4096;
+
+	TAutoConsoleVariable<int32> CVarRoomManagerVerifyEvery(
+		TEXT("wem.RoomManager.VerifyEvery"),
+		0,
+		TEXT("Every Nth placement, rebuilds ARoomManager's derived state and visuals from scratch and logs anything the\n")
+		TEXT("placements had built up differently. Costs a full rebuild each time, so leave it at 0 (off) outside of testing."),
+		ECVF_Default);
 
 	/**
 	 * Bits per coordinate in a packed key. Inside the cube a coordinate is never negative and
@@ -206,6 +224,51 @@ namespace
 		OutSlots[3] = MakePlatform(Edge.Node - AxisStep(AxisA, Pitch), AxisB);
 	}
 
+	/**
+	 * The edge whose run a cell lies on: a cell on exactly two lattice planes, which leaves one
+	 * axis it runs along. False for a node, an interior cell, or a cell off the lattice.
+	 */
+	bool GetRunEdge(const FIntVector& Cell, const int32 Pitch, FLatticeEdge& OutEdge)
+	{
+		int32 RunAxis = INDEX_NONE;
+
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			if (Cell[Axis] % Pitch != 0)
+			{
+				if (RunAxis != INDEX_NONE)
+				{
+					return false;
+				}
+
+				RunAxis = Axis;
+			}
+		}
+
+		if (RunAxis == INDEX_NONE)
+		{
+			return false;
+		}
+
+		OutEdge.Node = Cell;
+		OutEdge.Node[RunAxis] -= Cell[RunAxis] % Pitch;
+		OutEdge.Axis = RunAxis;
+		return true;
+	}
+
+	FORCEINLINE FGridSurfaceRef MakeSurfaceRef(const FIntVector& Cell, const EGridFace Face)
+	{
+		FGridSurfaceRef Surface;
+		Surface.Cell = Cell;
+		Surface.Face = Face;
+		return Surface;
+	}
+
+	FORCEINLINE int32 KindIndex(const EPlatformKind Kind)
+	{
+		return static_cast<int32>(Kind);
+	}
+
 	/** Calls Visit(Cell, bRim) for every cell of a platform: interior, edges and nodes alike. */
 	template <typename FunctorType>
 	void ForEachPlatformCell(const FGridPlatform& Platform, const int32 Pitch, FunctorType&& Visit)
@@ -264,6 +327,36 @@ namespace
 				Lines.Emplace(Corners[Corner], Corners[7 - Corner], Color, /*LifeTime=*/0.0f, Thickness, DepthPriority);
 			}
 		}
+	}
+
+	/** Puts a mesh and a material on every chunk. Both setters return at once when nothing changes. */
+	void ApplyMeshAndMaterial(
+		const TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
+		UStaticMesh* Mesh,
+		UMaterialInterface* Material)
+	{
+		for (UInstancedStaticMeshComponent* Chunk : Chunks)
+		{
+			if (IsValid(Chunk))
+			{
+				Chunk->SetStaticMesh(Mesh);
+				Chunk->SetMaterial(0, Material);
+			}
+		}
+	}
+
+	/** Edge length of one overlay square: a cell, less the inset on both sides. */
+	FORCEINLINE double GetSurfaceMarkSpan(const double CellSize)
+	{
+		return CellSize * (1.0 - 2.0 * SurfaceCellInsetFraction);
+	}
+
+	/** Scale that turns the engine's unit plane into one overlay square. */
+	FORCEINLINE FVector MakeSurfaceMarkScale(const double CellSize)
+	{
+		const double Span = GetSurfaceMarkSpan(CellSize);
+
+		return FVector(Span / UnitPlaneSize, Span / UnitPlaneSize, 1.0);
 	}
 }
 
@@ -757,21 +850,70 @@ void ARoomManager::GatherPlatformCandidates(const EPlatformKind Kind, TArray<FGr
 	});
 }
 
+void ARoomManager::EnsurePlatformCandidates()
+{
+	if (!bPlatformCandidatesStale)
+	{
+		return;
+	}
+
+	GatherPlatformCandidates(EPlatformKind::SurfaceHorizontal, PlatformCandidates[KindIndex(EPlatformKind::SurfaceHorizontal)]);
+	GatherPlatformCandidates(EPlatformKind::SurfaceVertical, PlatformCandidates[KindIndex(EPlatformKind::SurfaceVertical)]);
+
+	bPlatformCandidatesStale = false;
+}
+
+void ARoomManager::RefreshPlatformCandidate(const FGridPlatform& Slot)
+{
+	TArray<FGridPlatform>& Candidates = PlatformCandidates[KindIndex(Slot.GetKind())];
+
+	const uint64 Key = MakePlatformKey(Slot);
+	const int32 Index = Algo::LowerBoundBy(Candidates, Key, [](const FGridPlatform& Candidate)
+	{
+		return MakePlatformKey(Candidate);
+	});
+
+	const bool bListed = Candidates.IsValidIndex(Index) && MakePlatformKey(Candidates[Index]) == Key;
+	const bool bFree = CanPlacePlatform(Slot.MinNode, Slot.Normal);
+
+	// Inserted where it sorts, so the list stays in the key order a full gather would give it.
+	if (bFree && !bListed)
+	{
+		Candidates.Insert(Slot, Index);
+	}
+	else if (!bFree && bListed)
+	{
+		Candidates.RemoveAt(Index);
+	}
+}
+
 bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 {
-	TArray<FGridPlatform> Candidates;
-	GatherPlatformCandidates(Kind, Candidates);
+	EnsurePlatformCandidates();
+
+	const TArray<FGridPlatform>& Candidates = PlatformCandidates[KindIndex(Kind)];
 
 	if (Candidates.IsEmpty())
 	{
 		return false;
 	}
 
-	Platforms.Add(Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)]);
+	// Copied out, since taking the platform in changes the list it was drawn from.
+	const FGridPlatform Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
+	Platforms.Add(Platform);
 
-	RebuildPlatformState();
+	TArray<FGridSurfaceRef> ChangedSurfaces;
+	AddPlacedPlatform(Platform, ChangedSurfaces);
 	UpdateDebugReadouts();
-	UpdateVisualsAfterPlacement();
+	UpdateVisualsAfterPlacement(Platform, ChangedSurfaces);
+
+	const int32 VerifyEvery = CVarRoomManagerVerifyEvery.GetValueOnGameThread();
+
+	if (VerifyEvery > 0 && ++PlacementsSinceVerify >= VerifyEvery)
+	{
+		PlacementsSinceVerify = 0;
+		VerifyIncrementalState();
+	}
 
 	return true;
 }
@@ -878,12 +1020,13 @@ void ARoomManager::RebuildPlatformState()
 {
 	GridSize = ResolveGridSize();
 
-	const int32 Pitch = GetPitch();
-
 	BuiltPlatforms.Reset();
 	PlatformKeys.Reset();
 	RimCellNormals.Reset();
 	PromotedFaces.Reset();
+
+	// The candidates follow from everything below, so they are gathered afresh on the next draw.
+	bPlatformCandidatesStale = true;
 
 	// Only the platforms that fit the lattice as it stands now. One placed under a different
 	// platform size or a larger cube no longer does, and is left out rather than drawn across the
@@ -907,7 +1050,8 @@ void ARoomManager::RebuildPlatformState()
 		}
 	}
 
-	// This runs every beat, so the warning is only given when what it would say has changed.
+	// This runs on every edit and every check, so the warning is only given when what it would
+	// say has changed.
 	if (SkippedPlatforms != ReportedSkippedPlatforms)
 	{
 		ReportedSkippedPlatforms = SkippedPlatforms;
@@ -920,30 +1064,17 @@ void ARoomManager::RebuildPlatformState()
 		}
 	}
 
-	// Every rim cell, with the axes it faces along. A cell on an edge can be rim to platforms
-	// facing two ways, and a node to all three; each platform brings the pair of faces along its
-	// own normal, which is how a cell comes to carry surfaces along more than one axis.
 	for (const FGridPlatform& Platform : BuiltPlatforms)
 	{
-		const uint8 NormalBit = AxisBit(AxisIndex(Platform.Normal));
-
-		ForEachPlatformCell(Platform, Pitch, [this, NormalBit](const FIntVector& Cell, const bool bRim)
-		{
-			if (bRim)
-			{
-				RimCellNormals.FindOrAdd(MakeCellKey(Cell)) |= NormalBit;
-			}
-		});
+		RecordRimCells(Platform);
 	}
 
-	// A rim surface caught between two fields is no longer rim, so it joins them. It is judged
-	// within its own plane and on its own side: flanked on opposite sides, along either axis of
-	// that plane, by surfaces facing the same way that carry anything and are not built against.
-	// The outer rim can never satisfy this - there is always emptiness on one side of it - so a
-	// field opens up while staying enclosed. Promotions feed each other, since the node at the
-	// centre of a 2x2 only resolves once the seams around it have, so this runs to a fixpoint.
-	// The rule is monotone, which makes that fixpoint independent of the sweep order, and of the
-	// order the platforms were placed in.
+	// A rim surface caught between two fields is no longer rim, so it joins them (see
+	// IsFlankedByOpenFields). The outer rim can never satisfy this - there is always emptiness on
+	// one side of it - so a field opens up while staying enclosed. Promotions feed each other,
+	// since the node at the centre of a 2x2 only resolves once the seams around it have, so this
+	// runs to a fixpoint. The rule is monotone, which makes that fixpoint independent of the sweep
+	// order, and of the order the platforms were placed in.
 	//
 	// A surface already built against is never a candidate: the thing standing on it holds that
 	// side shut, which is the whole of what separates one room from the next. It holds at the
@@ -986,15 +1117,6 @@ void ARoomManager::RebuildPlatformState()
 		}
 	}
 
-	auto IsOpenAllObject = [this](const FIntVector& Neighbour, const EGridFace Side) -> bool
-	{
-		ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
-		bool bOccupied = false;
-		ResolveSurface(Neighbour, Side, Capacity, bOccupied);
-
-		return Capacity == ESurfaceCapacity::AllObject && !bOccupied;
-	};
-
 	bool bPromotedAny = true;
 	while (bPromotedAny)
 	{
@@ -1004,23 +1126,8 @@ void ARoomManager::RebuildPlatformState()
 		for (int32 PendingIndex = PendingSurfaces.Num() - 1; PendingIndex >= 0; --PendingIndex)
 		{
 			const FPendingSurface Pending = PendingSurfaces[PendingIndex];
-			const int32 NormalAxis = FaceAxis(Pending.Face);
 
-			bool bFlanked = false;
-
-			for (int32 InPlaneAxis = 0; InPlaneAxis < 3 && !bFlanked; ++InPlaneAxis)
-			{
-				if (InPlaneAxis == NormalAxis)
-				{
-					continue;
-				}
-
-				const FIntVector Across = AxisStep(InPlaneAxis);
-				bFlanked = IsOpenAllObject(Pending.Cell - Across, Pending.Face)
-					&& IsOpenAllObject(Pending.Cell + Across, Pending.Face);
-			}
-
-			if (bFlanked)
+			if (IsFlankedByOpenFields(Pending.Cell, Pending.Face))
 			{
 				PromotedFaces.Add(Pending.Key);
 				PendingSurfaces.RemoveAtSwap(PendingIndex, EAllowShrinking::No);
@@ -1044,6 +1151,342 @@ void ARoomManager::RebuildPlatformState()
 		{
 			++VerticalPlatformCount;
 		}
+	}
+}
+
+void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGridSurfaceRef>& OutChangedSurfaces)
+{
+	OutChangedSurfaces.Reset();
+
+	const uint64 PlatformKey = MakePlatformKey(Platform);
+
+	// Only ever handed a free slot, which is on the lattice and not yet built. Anything else is
+	// left to the wholesale rebuild, and the visuals are told to start over with it.
+	if (!ensure(IsPlatformOnGrid(Platform) && !PlatformKeys.Contains(PlatformKey)))
+	{
+		RebuildPlatformState();
+		bPiecesComplete = false;
+		bSurfaceMarksComplete = false;
+		return;
+	}
+
+	// Until the first platform stands the candidates are the first platform's own list, which
+	// nothing below would turn into the lists that follow it. Gathered afresh instead - from one
+	// platform, that is nothing.
+	if (BuiltPlatforms.IsEmpty())
+	{
+		bPlatformCandidatesStale = true;
+	}
+
+	BuiltPlatforms.Add(Platform);
+	PlatformKeys.Add(PlatformKey);
+	RecordRimCells(Platform);
+
+	++PlatformCount;
+
+	if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal)
+	{
+		++HorizontalPlatformCount;
+	}
+	else
+	{
+		++VerticalPlatformCount;
+	}
+
+	const int32 Pitch = GetPitch();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	const EGridFace FrontFace = MakeFace(NormalAxis, 1);
+	const EGridFace BackFace = MakeFace(NormalAxis, -1);
+
+	// Rim surfaces whose promotion has to be decided, in the order they come up. Grows as it is
+	// worked through, since every promotion can open the surfaces beside it.
+	TArray<FGridSurfaceRef> PromotionQueue;
+
+	ForEachPlatformCell(Platform, Pitch, [&](const FIntVector& Cell, const bool bRim)
+	{
+		// The platform's own two broad faces: new surfaces, or rim ones a neighbour already brought.
+		OutChangedSurfaces.Add(MakeSurfaceRef(Cell, FrontFace));
+		OutChangedSurfaces.Add(MakeSurfaceRef(Cell, BackFace));
+
+		// Every rim surface the platform brings is open to promotion. Its interior carries
+		// anything already, and a surface it opens beside can only be one of these rim ones, so
+		// they are all the promotion needs to start from.
+		if (bRim)
+		{
+			PromotionQueue.Add(MakeSurfaceRef(Cell, FrontFace));
+			PromotionQueue.Add(MakeSurfaceRef(Cell, BackFace));
+		}
+
+		// Every surface that looks into this cell is now built against.
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			for (const int32 Sign : { 1, -1 })
+			{
+				const FIntVector Neighbour = Cell + AxisStep(Axis, Sign);
+
+				bool bInterior = false;
+				if ((GetCellSurfaceAxes(Neighbour, bInterior) & AxisBit(Axis)) != 0)
+				{
+					OutChangedSurfaces.Add(MakeSurfaceRef(Neighbour, MakeFace(Axis, -Sign)));
+				}
+			}
+		}
+	});
+
+	// The same rule the rebuild sweeps to a fixpoint, worked outward from this platform instead.
+	// A surface once promoted stays promoted as the structure grows - that is what lets the
+	// promotions already standing be kept - so only a surface next to one that has just opened
+	// can newly qualify, and each promotion queues its neighbours in its own plane and side.
+	TArray<FGridSurfaceRef> PromotedSurfaces;
+
+	for (int32 QueueIndex = 0; QueueIndex < PromotionQueue.Num(); ++QueueIndex)
+	{
+		// Copied out, since queueing the neighbours can move the queue.
+		const FGridSurfaceRef Surface = PromotionQueue[QueueIndex];
+		const uint64 FaceKey = MakeFaceKey(Surface.Cell, Surface.Face);
+
+		if (PromotedFaces.Contains(FaceKey))
+		{
+			continue;
+		}
+
+		// Only an open rim surface is ever decided: an interior carries anything already, and a
+		// surface built against holds its side shut.
+		bool bInterior = false;
+		const uint8 SurfaceAxes = GetCellSurfaceAxes(Surface.Cell, bInterior);
+
+		if (bInterior
+			|| (SurfaceAxes & AxisBit(FaceAxis(Surface.Face))) == 0
+			|| IsSolidCell(Surface.Cell + FaceStep(Surface.Face))
+			|| !IsFlankedByOpenFields(Surface.Cell, Surface.Face))
+		{
+			continue;
+		}
+
+		PromotedFaces.Add(FaceKey);
+		PromotedSurfaces.Add(Surface);
+		OutChangedSurfaces.Add(Surface);
+
+		for (int32 InPlaneAxis = 0; InPlaneAxis < 3; ++InPlaneAxis)
+		{
+			if (InPlaneAxis != FaceAxis(Surface.Face))
+			{
+				PromotionQueue.Add(MakeSurfaceRef(Surface.Cell - AxisStep(InPlaneAxis), Surface.Face));
+				PromotionQueue.Add(MakeSurfaceRef(Surface.Cell + AxisStep(InPlaneAxis), Surface.Face));
+			}
+		}
+	}
+
+	if (bPlatformCandidatesStale)
+	{
+		return;
+	}
+
+	// A slot is judged by its own edges: which platforms stand around them, and what the runs
+	// along them still offer. So the only slots whose standing can have changed are the ones
+	// around this platform's edges - which it now stands on, or folds away from - and the ones
+	// around an edge whose run has just been promoted, which no longer offers a fold. Posts are
+	// never asked, so a promoted node changes nothing here.
+	TArray<FLatticeEdge> ChangedEdges;
+	TArray<uint64> ChangedEdgeKeys;
+
+	auto AddChangedEdge = [&ChangedEdges, &ChangedEdgeKeys](const FLatticeEdge& Edge)
+	{
+		const uint64 EdgeKey = MakeEdgeKey(Edge);
+
+		if (!ChangedEdgeKeys.Contains(EdgeKey))
+		{
+			ChangedEdgeKeys.Add(EdgeKey);
+			ChangedEdges.Add(Edge);
+		}
+	};
+
+	FLatticeEdge PlatformEdges[4];
+	GetPlatformEdges(Platform, Pitch, PlatformEdges);
+
+	for (const FLatticeEdge& Edge : PlatformEdges)
+	{
+		AddChangedEdge(Edge);
+	}
+
+	for (const FGridSurfaceRef& Surface : PromotedSurfaces)
+	{
+		FLatticeEdge Edge;
+		if (GetRunEdge(Surface.Cell, Pitch, Edge))
+		{
+			AddChangedEdge(Edge);
+		}
+	}
+
+	// This platform's own slot is among them, and drops out of the lists here too.
+	for (const FLatticeEdge& Edge : ChangedEdges)
+	{
+		FGridPlatform Slots[4];
+		GetEdgeSlots(Edge, Pitch, Slots);
+
+		for (const FGridPlatform& Slot : Slots)
+		{
+			RefreshPlatformCandidate(Slot);
+		}
+	}
+}
+
+void ARoomManager::RecordRimCells(const FGridPlatform& Platform)
+{
+	// A cell on an edge can be rim to platforms facing two ways, and a node to all three; each
+	// platform brings the pair of faces along its own normal, which is how a cell comes to carry
+	// surfaces along more than one axis.
+	const uint8 NormalBit = AxisBit(AxisIndex(Platform.Normal));
+
+	ForEachPlatformCell(Platform, GetPitch(), [this, NormalBit](const FIntVector& Cell, const bool bRim)
+	{
+		if (bRim)
+		{
+			RimCellNormals.FindOrAdd(MakeCellKey(Cell)) |= NormalBit;
+		}
+	});
+}
+
+bool ARoomManager::IsFlankedByOpenFields(const FIntVector& Cell, const EGridFace Face) const
+{
+	// Open all-object: carries anything and is not built against. Judged on the same side as the
+	// surface itself, so a wall divides only the side it stands on.
+	auto IsOpenAllObject = [this, Face](const FIntVector& Neighbour) -> bool
+	{
+		ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
+		bool bOccupied = false;
+		ResolveSurface(Neighbour, Face, Capacity, bOccupied);
+
+		return Capacity == ESurfaceCapacity::AllObject && !bOccupied;
+	};
+
+	const int32 NormalAxis = FaceAxis(Face);
+
+	for (int32 InPlaneAxis = 0; InPlaneAxis < 3; ++InPlaneAxis)
+	{
+		if (InPlaneAxis == NormalAxis)
+		{
+			continue;
+		}
+
+		const FIntVector Across = AxisStep(InPlaneAxis);
+
+		if (IsOpenAllObject(Cell - Across) && IsOpenAllObject(Cell + Across))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void ARoomManager::VerifyIncrementalState()
+{
+	// What the placements built up, one at a time.
+	const TSet<uint64> IncrementalPlatformKeys = PlatformKeys;
+	const TMap<uint64, uint8> IncrementalRimCellNormals = RimCellNormals;
+	const TSet<uint64> IncrementalPromotedFaces = PromotedFaces;
+	const bool bHadCandidates = !bPlatformCandidatesStale;
+
+	TArray<FGridPlatform> IncrementalCandidates[PlatformKindCount];
+	for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
+	{
+		IncrementalCandidates[Kind] = PlatformCandidates[Kind];
+	}
+
+	// And what the wholesale rebuild makes of the same list. That is kept either way: it is the
+	// reference, so a slip is reported once and not carried forward.
+	RebuildPlatformState();
+	EnsurePlatformCandidates();
+	const int32 RedrawnPieces = SyncPieces();
+	const int32 RedrawnMarks = SyncSurfaceMarks();
+
+	TArray<FString> Mismatches;
+
+	auto CompareKeySets = [&Mismatches](const TCHAR* Name, const TSet<uint64>& Incremental, const TSet<uint64>& Rebuilt)
+	{
+		int32 Missing = 0;
+		for (const uint64 Key : Rebuilt)
+		{
+			Missing += Incremental.Contains(Key) ? 0 : 1;
+		}
+
+		int32 Extra = 0;
+		for (const uint64 Key : Incremental)
+		{
+			Extra += Rebuilt.Contains(Key) ? 0 : 1;
+		}
+
+		if (Missing > 0 || Extra > 0)
+		{
+			Mismatches.Add(FString::Printf(TEXT("%s: %d missing, %d extra"), Name, Missing, Extra));
+		}
+	};
+
+	CompareKeySets(TEXT("platform keys"), IncrementalPlatformKeys, PlatformKeys);
+	CompareKeySets(TEXT("promoted surfaces"), IncrementalPromotedFaces, PromotedFaces);
+
+	int32 RimMismatches = FMath::Abs(IncrementalRimCellNormals.Num() - RimCellNormals.Num());
+	for (const TPair<uint64, uint8>& RimCell : RimCellNormals)
+	{
+		const uint8* IncrementalAxes = IncrementalRimCellNormals.Find(RimCell.Key);
+		RimMismatches += (IncrementalAxes && *IncrementalAxes == RimCell.Value) ? 0 : 1;
+	}
+
+	if (RimMismatches > 0)
+	{
+		Mismatches.Add(FString::Printf(TEXT("rim cells: %d differ"), RimMismatches));
+	}
+
+	// Compared in order, since the order is what the placement stream draws from.
+	if (bHadCandidates)
+	{
+		for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
+		{
+			const TArray<FGridPlatform>& Incremental = IncrementalCandidates[Kind];
+			const TArray<FGridPlatform>& Rebuilt = PlatformCandidates[Kind];
+
+			bool bSame = Incremental.Num() == Rebuilt.Num();
+			for (int32 Index = 0; bSame && Index < Rebuilt.Num(); ++Index)
+			{
+				bSame = MakePlatformKey(Incremental[Index]) == MakePlatformKey(Rebuilt[Index]);
+			}
+
+			if (!bSame)
+			{
+				Mismatches.Add(FString::Printf(TEXT("%s candidates: %d kept, %d rebuilt"),
+					Kind == KindIndex(EPlatformKind::SurfaceHorizontal) ? TEXT("horizontal") : TEXT("vertical"),
+					Incremental.Num(), Rebuilt.Num()));
+			}
+		}
+	}
+
+	if (RedrawnPieces > 0)
+	{
+		Mismatches.Add(FString::Printf(TEXT("pieces: %d missing"), RedrawnPieces));
+	}
+
+	if (RedrawnMarks > 0)
+	{
+		Mismatches.Add(FString::Printf(TEXT("overlay: %d squares missing or the wrong colour"), RedrawnMarks));
+	}
+
+	++VerifiedPlacements;
+
+	if (!Mismatches.IsEmpty())
+	{
+		++FailedVerifications;
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("RoomManager: at %d platform(s) the placements had drifted from a full rebuild (%s). Carrying on from the rebuild."),
+			PlatformCount, *FString::Join(Mismatches, TEXT("; ")));
+	}
+
+	if (VerifiedPlacements % 100 == 0)
+	{
+		UE_LOG(LogTemp, Log,
+			TEXT("RoomManager: %d placement(s) checked against a full rebuild, %d drifted. %d platform(s) standing."),
+			VerifiedPlacements, FailedVerifications, PlatformCount);
 	}
 }
 
@@ -1256,10 +1699,12 @@ void ARoomManager::RebuildVisuals()
 	RebuildDebugGrid();
 }
 
-void ARoomManager::UpdateVisualsAfterPlacement()
+void ARoomManager::UpdateVisualsAfterPlacement(
+	const FGridPlatform& Platform,
+	const TConstArrayView<FGridSurfaceRef> ChangedSurfaces)
 {
-	SyncPieces();
-	SyncSurfaceMarks();
+	AppendPlatformPieces(Platform);
+	UpdateSurfaceMarks(ChangedSurfaces);
 }
 
 UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(
@@ -1288,11 +1733,11 @@ UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(
 	return CachedMaterial;
 }
 
-void ARoomManager::SyncPieces()
+int32 ARoomManager::SyncPieces()
 {
 	if (!HorizontalInteriorPieces || !VerticalInteriorPieces || !EdgePieces || !NodePieces)
 	{
-		return;
+		return 0;
 	}
 
 	// Every piece that should be standing, each named by what it stands for. A kind that is
@@ -1302,70 +1747,150 @@ void ARoomManager::SyncPieces()
 	TArray<FPlacedPiece> EdgeBoxes;
 	TArray<FPlacedPiece> NodeBoxes;
 
-	if (bShowPieces && PieceMesh && !BuiltPlatforms.IsEmpty())
+	const bool bDrawPieces = bShowPieces && PieceMesh;
+
+	if (bDrawPieces)
 	{
-		const int32 Pitch = GetPitch();
-		const double RunExtent = static_cast<double>(Pitch - 1) * CellSize;
-
-		// Everything on the lattice is axis-aligned, so every piece is the unit cube scaled to
-		// the cells it fills, and none needs turning.
-		auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
-		{
-			return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
-		};
-
 		for (const FGridPlatform& Platform : BuiltPlatforms)
 		{
-			int32 U, V;
-			GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
-
-			// One box for the whole interior - a platform is one thing that was placed, so it is
-			// drawn as one thing.
-			FVector InteriorExtent(CellSize);
-			InteriorExtent[U] = RunExtent;
-			InteriorExtent[V] = RunExtent;
-
-			TArray<FPlacedPiece>& InteriorBoxes =
-				Platform.GetKind() == EPlatformKind::SurfaceHorizontal ? HorizontalInteriorBoxes : VerticalInteriorBoxes;
-
-			InteriorBoxes.Add(FPlacedPiece{
-				MakePlatformKey(Platform), MakeBox(Platform.MinNode + AxisStep(U) + AxisStep(V), InteriorExtent) });
-
-			// The rim is drawn per edge and per node, each named by what it is rather than by the
-			// platform that brought it. A neighbour sharing one names the same piece, so it is
-			// built once, and no two beams - nor a beam and a post - can ever overlap.
-			FLatticeEdge Edges[4];
-			GetPlatformEdges(Platform, Pitch, Edges);
-
-			for (const FLatticeEdge& Edge : Edges)
-			{
-				FVector EdgeExtent(CellSize);
-				EdgeExtent[Edge.Axis] = RunExtent;
-
-				EdgeBoxes.Add(FPlacedPiece{ MakeEdgeKey(Edge), MakeBox(Edge.Node + AxisStep(Edge.Axis), EdgeExtent) });
-			}
-
-			FIntVector Nodes[4];
-			GetPlatformNodes(Platform, Pitch, Nodes);
-
-			for (const FIntVector& Node : Nodes)
-			{
-				NodeBoxes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
-			}
+			GatherPlatformPieces(Platform, HorizontalInteriorBoxes, VerticalInteriorBoxes, EdgeBoxes, NodeBoxes);
 		}
 	}
 
-	SyncPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, HorizontalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
+	int32 AddedPieces = 0;
+
+	AddedPieces += SyncPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, HorizontalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
 		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
 
-	SyncPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces, VerticalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces, VerticalInteriorBoxes, PieceMesh, ResolveTintedMaterial(
 		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
 
-	SyncPieceLayer(EdgeLayer, EdgePieces, EdgeBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(EdgeLayer, EdgePieces, EdgeBoxes, PieceMesh, ResolveTintedMaterial(
 		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
 
-	SyncPieceLayer(NodeLayer, NodePieces, NodeBoxes, PieceMesh, ResolveTintedMaterial(
+	AddedPieces += SyncPieceLayer(NodeLayer, NodePieces, NodeBoxes, PieceMesh, ResolveTintedMaterial(
 		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
+
+	// Only a sync that built every platform can be added to one placement at a time.
+	bPiecesComplete = bDrawPieces;
+
+	return AddedPieces;
+}
+
+void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
+{
+	const bool bLayersIntact = IsPieceLayerIntact(HorizontalInteriorLayer, HorizontalInteriorPieces)
+		&& IsPieceLayerIntact(VerticalInteriorLayer, VerticalInteriorPieces)
+		&& IsPieceLayerIntact(EdgeLayer, EdgePieces)
+		&& IsPieceLayerIntact(NodeLayer, NodePieces);
+
+	// Anything but the plain case - pieces switched off, never built in full, or a layer out of
+	// step with its record - is left to the full sync.
+	if (!bPiecesComplete || !bShowPieces || !PieceMesh || !bLayersIntact)
+	{
+		SyncPieces();
+		return;
+	}
+
+	TArray<FPlacedPiece> HorizontalInteriorBoxes;
+	TArray<FPlacedPiece> VerticalInteriorBoxes;
+	TArray<FPlacedPiece> EdgeBoxes;
+	TArray<FPlacedPiece> NodeBoxes;
+	GatherPlatformPieces(Platform, HorizontalInteriorBoxes, VerticalInteriorBoxes, EdgeBoxes, NodeBoxes);
+
+	// An edge or a node a neighbour already built is skipped, so a shared piece is still built once.
+	auto AppendToLayer = [this](
+		FRoomPieceLayer& Layer,
+		UInstancedStaticMeshComponent* FirstChunk,
+		const TConstArrayView<FPlacedPiece> Pieces,
+		UMaterialInterface* Material)
+	{
+		ApplyMeshAndMaterial(Layer.Chunks, PieceMesh, Material);
+
+		TArray<FTransform> NewPieces;
+
+		for (const FPlacedPiece& Piece : Pieces)
+		{
+			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
+
+			// Any stamp but zero marks a piece as drawn, and the full sync that made this layer
+			// complete left SyncStamp above zero.
+			if (Stamp == 0)
+			{
+				Stamp = Layer.SyncStamp;
+				NewPieces.Add(Piece.Transform);
+			}
+		}
+
+		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
+	};
+
+	AppendToLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, HorizontalInteriorBoxes, ResolveTintedMaterial(
+		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
+
+	AppendToLayer(VerticalInteriorLayer, VerticalInteriorPieces, VerticalInteriorBoxes, ResolveTintedMaterial(
+		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
+
+	AppendToLayer(EdgeLayer, EdgePieces, EdgeBoxes, ResolveTintedMaterial(
+		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
+
+	AppendToLayer(NodeLayer, NodePieces, NodeBoxes, ResolveTintedMaterial(
+		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
+}
+
+void ARoomManager::GatherPlatformPieces(
+	const FGridPlatform& Platform,
+	TArray<FPlacedPiece>& OutHorizontalInteriors,
+	TArray<FPlacedPiece>& OutVerticalInteriors,
+	TArray<FPlacedPiece>& OutEdges,
+	TArray<FPlacedPiece>& OutNodes) const
+{
+	const int32 Pitch = GetPitch();
+	const double RunExtent = static_cast<double>(Pitch - 1) * CellSize;
+
+	// Everything on the lattice is axis-aligned, so every piece is the unit cube scaled to the
+	// cells it fills, and none needs turning.
+	auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
+	{
+		return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
+	};
+
+	int32 U, V;
+	GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+	// One box for the whole interior - a platform is one thing that was placed, so it is drawn
+	// as one thing.
+	FVector InteriorExtent(CellSize);
+	InteriorExtent[U] = RunExtent;
+	InteriorExtent[V] = RunExtent;
+
+	TArray<FPlacedPiece>& InteriorBoxes =
+		Platform.GetKind() == EPlatformKind::SurfaceHorizontal ? OutHorizontalInteriors : OutVerticalInteriors;
+
+	InteriorBoxes.Add(FPlacedPiece{
+		MakePlatformKey(Platform), MakeBox(Platform.MinNode + AxisStep(U) + AxisStep(V), InteriorExtent) });
+
+	// The rim is drawn per edge and per node, each named by what it is rather than by the
+	// platform that brought it. A neighbour sharing one names the same piece, so it is built
+	// once, and no two beams - nor a beam and a post - can ever overlap.
+	FLatticeEdge Edges[4];
+	GetPlatformEdges(Platform, Pitch, Edges);
+
+	for (const FLatticeEdge& Edge : Edges)
+	{
+		FVector EdgeExtent(CellSize);
+		EdgeExtent[Edge.Axis] = RunExtent;
+
+		OutEdges.Add(FPlacedPiece{ MakeEdgeKey(Edge), MakeBox(Edge.Node + AxisStep(Edge.Axis), EdgeExtent) });
+	}
+
+	FIntVector Nodes[4];
+	GetPlatformNodes(Platform, Pitch, Nodes);
+
+	for (const FIntVector& Node : Nodes)
+	{
+		OutNodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
+	}
 }
 
 void ARoomManager::ResetPieces()
@@ -1374,9 +1899,11 @@ void ARoomManager::ResetPieces()
 	ResetPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces);
 	ResetPieceLayer(EdgeLayer, EdgePieces);
 	ResetPieceLayer(NodeLayer, NodePieces);
+
+	bPiecesComplete = false;
 }
 
-void ARoomManager::SyncPieceLayer(
+int32 ARoomManager::SyncPieceLayer(
 	FRoomPieceLayer& Layer,
 	UInstancedStaticMeshComponent* FirstChunk,
 	const TConstArrayView<FPlacedPiece> Pieces,
@@ -1385,37 +1912,18 @@ void ARoomManager::SyncPieceLayer(
 {
 	if (!FirstChunk)
 	{
-		return;
+		return 0;
 	}
 
 	// The record is neither saved nor duplicated, while the first chunk is both - so a loaded
 	// level or a PIE copy arrives with instances the record knows nothing about. A chunk can
 	// also be lost from under it. Either way the two no longer agree: start the layer over.
-	bool bChunksIntact = !Layer.Chunks.IsEmpty() && Layer.Chunks[0] == FirstChunk;
-	int32 DrawnPieces = 0;
-
-	for (const UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
-	{
-		if (IsValid(Chunk))
-		{
-			DrawnPieces += Chunk->GetInstanceCount();
-		}
-		else
-		{
-			bChunksIntact = false;
-		}
-	}
-
-	if (!bChunksIntact || DrawnPieces != Layer.PieceStamps.Num())
+	if (!IsPieceLayerIntact(Layer, FirstChunk))
 	{
 		ResetPieceLayer(Layer, FirstChunk);
 	}
 
-	for (UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
-	{
-		Chunk->SetStaticMesh(Mesh);
-		Chunk->SetMaterial(0, Material);
-	}
+	ApplyMeshAndMaterial(Layer.Chunks, Mesh, Material);
 
 	TArray<FTransform> NewPieces;
 
@@ -1457,6 +1965,38 @@ void ARoomManager::SyncPieceLayer(
 		WalkPieces();
 	}
 
+	AddPiecesToLayer(Layer, FirstChunk, NewPieces);
+
+	return NewPieces.Num();
+}
+
+bool ARoomManager::IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInstancedStaticMeshComponent* FirstChunk) const
+{
+	if (!FirstChunk || Layer.Chunks.IsEmpty() || Layer.Chunks[0].Get() != FirstChunk)
+	{
+		return false;
+	}
+
+	int32 DrawnPieces = 0;
+
+	for (const UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
+	{
+		if (!IsValid(Chunk))
+		{
+			return false;
+		}
+
+		DrawnPieces += Chunk->GetInstanceCount();
+	}
+
+	return DrawnPieces == Layer.PieceStamps.Num();
+}
+
+void ARoomManager::AddPiecesToLayer(
+	FRoomPieceLayer& Layer,
+	UInstancedStaticMeshComponent* FirstChunk,
+	const TConstArrayView<FTransform> NewPieces)
+{
 	// New pieces go into the chunk still being filled, and a fresh chunk is started once that
 	// one is full. Those are the only components whose instance count changes, so they are the
 	// only ones whose surface cache Lumen has to capture again.
@@ -1467,7 +2007,7 @@ void ARoomManager::SyncPieceLayer(
 
 		if (Room <= 0)
 		{
-			OpenChunk = AddPieceChunk(Layer, FirstChunk, Mesh, Material);
+			OpenChunk = AddInstancedChunk(Layer.Chunks, FirstChunk);
 			Room = PieceChunkCapacity;
 		}
 
@@ -1485,7 +2025,15 @@ void ARoomManager::SyncPieceLayer(
 
 void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk)
 {
-	for (UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
+	ResetChunks(Layer.Chunks, FirstChunk);
+	Layer.PieceStamps.Reset();
+}
+
+void ARoomManager::ResetChunks(
+	TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
+	UInstancedStaticMeshComponent* FirstChunk)
+{
+	for (UInstancedStaticMeshComponent* Chunk : Chunks)
 	{
 		if (Chunk != FirstChunk && IsValid(Chunk))
 		{
@@ -1493,8 +2041,7 @@ void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshC
 		}
 	}
 
-	Layer.Chunks.Reset();
-	Layer.PieceStamps.Reset();
+	Chunks.Reset();
 
 	if (FirstChunk)
 	{
@@ -1503,15 +2050,13 @@ void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshC
 			FirstChunk->ClearInstances();
 		}
 
-		Layer.Chunks.Add(FirstChunk);
+		Chunks.Add(FirstChunk);
 	}
 }
 
-UInstancedStaticMeshComponent* ARoomManager::AddPieceChunk(
-	FRoomPieceLayer& Layer,
-	UInstancedStaticMeshComponent* FirstChunk,
-	UStaticMesh* Mesh,
-	UMaterialInterface* Material)
+UInstancedStaticMeshComponent* ARoomManager::AddInstancedChunk(
+	TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
+	UInstancedStaticMeshComponent* FirstChunk)
 {
 	// Named after the first chunk, so the component list reads EdgePieces, EdgePieces_1, ...
 	const FName ChunkName =
@@ -1522,17 +2067,20 @@ UInstancedStaticMeshComponent* ARoomManager::AddPieceChunk(
 	UInstancedStaticMeshComponent* Chunk = NewObject<UInstancedStaticMeshComponent>(
 		this, ChunkName, RF_Transient | RF_DuplicateTransient | RF_TextExportTransient);
 
-	// Whatever makes this kind of piece what it is comes from the first chunk, so the
+	// Whatever makes this kind of piece or square what it is comes from the first chunk, so the
 	// constructor stays the one place each kind is set up.
 	Chunk->SetMobility(FirstChunk->Mobility);
 	Chunk->SetCollisionEnabled(FirstChunk->GetCollisionEnabled());
 	Chunk->SetCastShadow(FirstChunk->CastShadow);
-	Chunk->SetStaticMesh(Mesh);
-	Chunk->SetMaterial(0, Material);
+	Chunk->bAffectDistanceFieldLighting = FirstChunk->bAffectDistanceFieldLighting;
+	Chunk->bAffectDynamicIndirectLighting = FirstChunk->bAffectDynamicIndirectLighting;
+	Chunk->SetVisibleInRayTracing(FirstChunk->bVisibleInRayTracing);
+	Chunk->SetStaticMesh(FirstChunk->GetStaticMesh());
+	Chunk->SetMaterial(0, FirstChunk->OverrideMaterials.IsValidIndex(0) ? FirstChunk->OverrideMaterials[0].Get() : nullptr);
 	Chunk->SetupAttachment(SceneRoot);
 	Chunk->RegisterComponent();
 
-	Layer.Chunks.Add(Chunk);
+	Chunks.Add(Chunk);
 	return Chunk;
 }
 
@@ -1608,7 +2156,7 @@ void ARoomManager::AppendLatticeLines(TArray<FBatchedLine>& Lines) const
 	}
 }
 
-UInstancedStaticMeshComponent* ARoomManager::GetSurfaceMarkLayer(const int32 Layer) const
+UInstancedStaticMeshComponent* ARoomManager::GetSurfaceMarkComponent(const int32 Layer) const
 {
 	switch (Layer)
 	{
@@ -1619,88 +2167,73 @@ UInstancedStaticMeshComponent* ARoomManager::GetSurfaceMarkLayer(const int32 Lay
 	}
 }
 
+FSurfaceMarkLayer& ARoomManager::GetSurfaceMarkChunks(const int32 Layer)
+{
+	switch (Layer)
+	{
+	case AllObjectMarkLayer: return AllObjectMarkChunks;
+	case WallMarkLayer: return WallMarkChunks;
+	default: return OccupiedMarkChunks;
+	}
+}
+
+const FSurfaceMarkLayer& ARoomManager::GetSurfaceMarkChunks(const int32 Layer) const
+{
+	return const_cast<ARoomManager*>(this)->GetSurfaceMarkChunks(Layer);
+}
+
 void ARoomManager::ResetSurfaceMarks()
 {
 	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
 	{
-		UInstancedStaticMeshComponent* Marks = GetSurfaceMarkLayer(Layer);
+		FSurfaceMarkLayer& Marks = GetSurfaceMarkChunks(Layer);
 
-		if (Marks && Marks->GetInstanceCount() > 0)
-		{
-			Marks->ClearInstances();
-		}
+		ResetChunks(Marks.Chunks, GetSurfaceMarkComponent(Layer));
 
-		SurfaceMarkInstanceKeys[Layer].Reset();
+		Marks.ChunkKeys.Reset();
+		Marks.ChunkKeys.SetNum(Marks.Chunks.Num());
 	}
 
 	SurfaceMarkSlots.Reset();
+	bSurfaceMarksComplete = false;
 }
 
-void ARoomManager::RemoveSurfaceMark(const int32 Layer, const int32 Instance)
+bool ARoomManager::CanDrawSurfaceMarks() const
 {
-	UInstancedStaticMeshComponent* Marks = GetSurfaceMarkLayer(Layer);
-
-	if (!Marks || !SurfaceMarkInstanceKeys[Layer].IsValidIndex(Instance))
-	{
-		return;
-	}
-
-	TArray<uint64>& Keys = SurfaceMarkInstanceKeys[Layer];
-	const int32 Last = Keys.Num() - 1;
-
-	// Only the last instance is ever removed, so no other square changes index and the record
-	// needs one fix-up at most: the last square is moved into the hole first. The component
-	// has a swap-removal of its own, but it is free to ignore being asked for it, which would
-	// leave this record guessing.
-	if (Instance != Last)
-	{
-		FTransform LastTransform;
-		Marks->GetInstanceTransform(Last, LastTransform, /*bWorldSpace=*/true);
-		Marks->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true);
-
-		Keys[Instance] = Keys[Last];
-		SurfaceMarkSlots.FindChecked(Keys[Instance]).Instance = Instance;
-	}
-
-	Marks->RemoveInstance(Last);
-	Keys.Pop(EAllowShrinking::No);
+	return bShowSurfaces && PlaneMesh && !BuiltPlatforms.IsEmpty() && GetSurfaceMarkSpan(CellSize) > 0.0;
 }
 
-void ARoomManager::SyncSurfaceMarks()
+bool ARoomManager::AreSurfaceMarksIntact() const
 {
-	UInstancedStaticMeshComponent* const MarkLayers[SurfaceMarkLayerCount] =
-		{ AllObjectSurfaceMarks, WallSurfaceMarks, OccupiedSurfaceMarks };
-
-	for (const UInstancedStaticMeshComponent* Marks : MarkLayers)
-	{
-		if (!Marks)
-		{
-			return;
-		}
-	}
-
-	// Each surface is drawn as its own inset square, so a run of them reads as a row of tiles
-	// rather than one unbroken sheet of colour.
-	const double Inset = CellSize * SurfaceCellInsetFraction;
-	const double Span = CellSize - 2.0 * Inset;
-
-	if (!bShowSurfaces || !PlaneMesh || BuiltPlatforms.IsEmpty() || Span <= 0.0)
-	{
-		ResetSurfaceMarks();
-		return;
-	}
-
-	// The record is neither saved nor duplicated with the components, so a loaded level or a
-	// PIE copy arrives with squares it knows nothing about. Start clean rather than add to them.
 	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
 	{
-		if (MarkLayers[Layer]->GetInstanceCount() != SurfaceMarkInstanceKeys[Layer].Num())
+		const UInstancedStaticMeshComponent* FirstChunk = GetSurfaceMarkComponent(Layer);
+		const FSurfaceMarkLayer& Marks = GetSurfaceMarkChunks(Layer);
+
+		if (!FirstChunk
+			|| Marks.Chunks.IsEmpty()
+			|| Marks.Chunks[0].Get() != FirstChunk
+			|| Marks.ChunkKeys.Num() != Marks.Chunks.Num())
 		{
-			ResetSurfaceMarks();
-			break;
+			return false;
+		}
+
+		for (int32 ChunkIndex = 0; ChunkIndex < Marks.Chunks.Num(); ++ChunkIndex)
+		{
+			const UInstancedStaticMeshComponent* Chunk = Marks.Chunks[ChunkIndex];
+
+			if (!IsValid(Chunk) || Chunk->GetInstanceCount() != Marks.ChunkKeys[ChunkIndex].Num())
+			{
+				return false;
+			}
 		}
 	}
 
+	return true;
+}
+
+void ARoomManager::RefreshSurfaceMarkMaterials()
+{
 	const FColor LayerColors[SurfaceMarkLayerCount] =
 		{ AllObjectSurfaceColor, WallSurfaceColor, OccupiedSurfaceColor };
 
@@ -1709,72 +2242,177 @@ void ARoomManager::SyncSurfaceMarks()
 
 	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
 	{
-		MarkLayers[Layer]->SetStaticMesh(PlaneMesh);
-		MarkLayers[Layer]->SetMaterial(0, ResolveTintedMaterial(
-			*LayerMaterials[Layer], PlaneMaterial, PlaneColorParameterName, FLinearColor(LayerColors[Layer])));
+		UMaterialInterface* Material = ResolveTintedMaterial(
+			*LayerMaterials[Layer], PlaneMaterial, PlaneColorParameterName, FLinearColor(LayerColors[Layer]));
+
+		ApplyMeshAndMaterial(GetSurfaceMarkChunks(Layer).Chunks, PlaneMesh, Material);
+	}
+}
+
+void ARoomManager::RemoveSurfaceMark(const int32 Layer, const int32 Chunk, const int32 Instance)
+{
+	FSurfaceMarkLayer& Marks = GetSurfaceMarkChunks(Layer);
+
+	if (!Marks.Chunks.IsValidIndex(Chunk)
+		|| !Marks.ChunkKeys.IsValidIndex(Chunk)
+		|| !Marks.ChunkKeys[Chunk].IsValidIndex(Instance))
+	{
+		return;
 	}
 
-	const FVector MarkScale(Span / UnitPlaneSize, Span / UnitPlaneSize, 1.0);
-	const int32 Pitch = GetPitch();
+	UInstancedStaticMeshComponent* Component = Marks.Chunks[Chunk];
+	TArray<uint64>& Keys = Marks.ChunkKeys[Chunk];
+	const int32 Last = Keys.Num() - 1;
 
-	TArray<FTransform> NewMarks[SurfaceMarkLayerCount];
-	TArray<uint64> NewMarkKeys[SurfaceMarkLayerCount];
+	// Only the chunk's last instance is ever removed, so no other square changes index and the
+	// record needs one fix-up at most: the last square is moved into the hole first. The
+	// component has a swap-removal of its own, but it is free to ignore being asked for it,
+	// which would leave this record guessing.
+	if (Instance != Last)
+	{
+		FTransform LastTransform;
+		Component->GetInstanceTransform(Last, LastTransform, /*bWorldSpace=*/true);
+		Component->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true);
+
+		Keys[Instance] = Keys[Last];
+		SurfaceMarkSlots.FindChecked(Keys[Instance]).Instance = Instance;
+	}
+
+	Component->RemoveInstance(Last);
+	Keys.Pop(EAllowShrinking::No);
+}
+
+bool ARoomManager::SyncSurfaceMark(
+	const FIntVector& Cell,
+	const EGridFace Face,
+	const uint64 Key,
+	FSurfaceMarkSlot& Slot,
+	FPendingSurfaceMarks& Pending)
+{
+	ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
+	bool bOccupied = false;
+	ResolveSurface(Cell, Face, Capacity, bOccupied);
+
+	// Occupancy is drawn instead of the capacity, since what a surface is free to take is the
+	// more useful reading and a built-against surface has stopped offering it.
+	const int32 Layer = bOccupied
+		? OccupiedMarkLayer
+		: (Capacity == ESurfaceCapacity::AllObject ? AllObjectMarkLayer : WallMarkLayer);
+
+	if (Slot.Layer == Layer)
+	{
+		return false;
+	}
+
+	if (Slot.Instance != INDEX_NONE)
+	{
+		RemoveSurfaceMark(Slot.Layer, Slot.Chunk, Slot.Instance);
+	}
+
+	Slot.Layer = Layer;
+	Slot.Chunk = INDEX_NONE;
+	Slot.Instance = INDEX_NONE;
+
+	// Lying on the face, turned to look out along its normal, and stood off it a little so it
+	// never z-fights the box it marks.
+	const FTransform FaceTransform = GetSurfaceWorldTransform(Cell, Face);
+	const FVector Outward(FaceStep(Face));
+
+	Pending.Transforms[Layer].Emplace(
+		FaceTransform.GetRotation(), FaceTransform.GetLocation() + Outward * SurfaceOverlayBias, Pending.Scale);
+	Pending.Keys[Layer].Add(Key);
+
+	return true;
+}
+
+void ARoomManager::AddPendingSurfaceMarks(const FPendingSurfaceMarks& Pending)
+{
+	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	{
+		const TArray<FTransform>& Transforms = Pending.Transforms[Layer];
+		const TArray<uint64>& Keys = Pending.Keys[Layer];
+
+		FSurfaceMarkLayer& Marks = GetSurfaceMarkChunks(Layer);
+		UInstancedStaticMeshComponent* FirstChunk = GetSurfaceMarkComponent(Layer);
+
+		// New squares go into the last chunk, and a fresh one is started once that is full.
+		for (int32 NextMark = 0; NextMark < Transforms.Num();)
+		{
+			int32 ChunkIndex = Marks.Chunks.Num() - 1;
+			int32 Room = SurfaceMarkChunkCapacity - Marks.ChunkKeys[ChunkIndex].Num();
+
+			if (Room <= 0)
+			{
+				AddInstancedChunk(Marks.Chunks, FirstChunk);
+				Marks.ChunkKeys.AddDefaulted();
+
+				++ChunkIndex;
+				Room = SurfaceMarkChunkCapacity;
+			}
+
+			const int32 Count = FMath::Min(Room, Transforms.Num() - NextMark);
+			TArray<uint64>& ChunkKeys = Marks.ChunkKeys[ChunkIndex];
+			const int32 FirstInstance = ChunkKeys.Num();
+
+			// One batch per chunk, for the same reason the pieces go in that way.
+			Marks.Chunks[ChunkIndex]->AddInstances(
+				TArray<FTransform>(Transforms.GetData() + NextMark, Count),
+				/*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+
+			for (int32 Offset = 0; Offset < Count; ++Offset)
+			{
+				const uint64 Key = Keys[NextMark + Offset];
+
+				FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindChecked(Key);
+				Slot.Chunk = ChunkIndex;
+				Slot.Instance = FirstInstance + Offset;
+
+				ChunkKeys.Add(Key);
+			}
+
+			NextMark += Count;
+		}
+	}
+}
+
+int32 ARoomManager::SyncSurfaceMarks()
+{
+	if (!AllObjectSurfaceMarks || !WallSurfaceMarks || !OccupiedSurfaceMarks)
+	{
+		return 0;
+	}
+
+	if (!CanDrawSurfaceMarks())
+	{
+		ResetSurfaceMarks();
+		return 0;
+	}
+
+	// The record is neither saved nor duplicated with the chunks, so a loaded level or a PIE
+	// copy arrives with squares it knows nothing about. Start clean rather than add to them.
+	if (!AreSurfaceMarksIntact())
+	{
+		ResetSurfaceMarks();
+	}
+
+	RefreshSurfaceMarkMaterials();
+
+	const int32 Pitch = GetPitch();
+	const FVector MarkScale = MakeSurfaceMarkScale(CellSize);
+
+	FPendingSurfaceMarks Pending;
+	Pending.Scale = MarkScale;
+
+	int32 ChangedMarks = 0;
 
 	// One pass over every surface. A square already the right colour is left alone; one whose
 	// surface has changed - a seam promoted into floorspace, a wall folded off it - moves to the
 	// right colour; a surface that has appeared since the last pass gets a new square. Returns
-	// false if the record holds a surface the pass no longer found.
-	auto WalkSurfaces = [&]() -> bool
+	// how many surfaces the record holds that the pass no longer found.
+	auto WalkSurfaces = [&]() -> int32
 	{
 		++SurfaceMarkSyncStamp;
 		int32 FoundSurfaces = 0;
-
-		auto SyncSurface = [&](const FIntVector& Cell, const EGridFace Face)
-		{
-			const uint64 Key = MakeFaceKey(Cell, Face);
-			FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindOrAdd(Key);
-
-			// Counted once however often the platforms name it, so the tally below stays honest.
-			if (Slot.SeenStamp == SurfaceMarkSyncStamp)
-			{
-				return;
-			}
-
-			Slot.SeenStamp = SurfaceMarkSyncStamp;
-			++FoundSurfaces;
-
-			ESurfaceCapacity Capacity = ESurfaceCapacity::Empty;
-			bool bOccupied = false;
-			ResolveSurface(Cell, Face, Capacity, bOccupied);
-
-			// Occupancy is drawn instead of the capacity, since what a surface is free to take is
-			// the more useful reading and a built-against surface has stopped offering it.
-			const int32 Layer = bOccupied
-				? OccupiedMarkLayer
-				: (Capacity == ESurfaceCapacity::AllObject ? AllObjectMarkLayer : WallMarkLayer);
-
-			if (Slot.Layer == Layer)
-			{
-				return;
-			}
-
-			if (Slot.Layer != INDEX_NONE)
-			{
-				RemoveSurfaceMark(Slot.Layer, Slot.Instance);
-			}
-
-			Slot.Layer = Layer;
-			Slot.Instance = INDEX_NONE;
-
-			// Lying on the face, turned to look out along its normal, and stood off it a little
-			// so it never z-fights the box it marks.
-			const FTransform FaceTransform = GetSurfaceWorldTransform(Cell, Face);
-			const FVector Outward(FaceStep(Face));
-
-			NewMarks[Layer].Emplace(
-				FaceTransform.GetRotation(), FaceTransform.GetLocation() + Outward * SurfaceOverlayBias, MarkScale);
-			NewMarkKeys[Layer].Add(Key);
-		};
 
 		// Every surface is one of the two broad faces of a platform's cell, so walking the
 		// platforms finds every one of them - without asking the cube's millions of cells, nearly
@@ -1782,52 +2420,80 @@ void ARoomManager::SyncSurfaceMarks()
 		for (const FGridPlatform& Platform : BuiltPlatforms)
 		{
 			const int32 NormalAxis = AxisIndex(Platform.Normal);
-			const EGridFace FrontFace = MakeFace(NormalAxis, 1);
-			const EGridFace BackFace = MakeFace(NormalAxis, -1);
+			const EGridFace PlatformFaces[2] = { MakeFace(NormalAxis, 1), MakeFace(NormalAxis, -1) };
 
-			ForEachPlatformCell(Platform, Pitch, [&SyncSurface, FrontFace, BackFace](const FIntVector& Cell, bool)
+			ForEachPlatformCell(Platform, Pitch, [&](const FIntVector& Cell, bool)
 			{
-				SyncSurface(Cell, FrontFace);
-				SyncSurface(Cell, BackFace);
+				for (const EGridFace Face : PlatformFaces)
+				{
+					const uint64 Key = MakeFaceKey(Cell, Face);
+					FSurfaceMarkSlot& Slot = SurfaceMarkSlots.FindOrAdd(Key);
+
+					// Counted once however often the platforms name it, so the tally stays honest.
+					if (Slot.SeenStamp == SurfaceMarkSyncStamp)
+					{
+						continue;
+					}
+
+					Slot.SeenStamp = SurfaceMarkSyncStamp;
+					++FoundSurfaces;
+
+					if (SyncSurfaceMark(Cell, Face, Key, Slot, Pending))
+					{
+						++ChangedMarks;
+					}
+				}
 			});
 		}
 
-		return FoundSurfaces == SurfaceMarkSlots.Num();
+		return SurfaceMarkSlots.Num() - FoundSurfaces;
 	};
 
 	// Placement only ever adds, so a surface once found stays a surface and a square never has
 	// to be taken away. If that stops holding the tally will not match: redraw from scratch.
-	if (!WalkSurfaces())
+	const int32 StaleSurfaces = WalkSurfaces();
+
+	if (StaleSurfaces > 0)
 	{
+		ChangedMarks += StaleSurfaces;
+
 		ResetSurfaceMarks();
 
-		for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
-		{
-			NewMarks[Layer].Reset();
-			NewMarkKeys[Layer].Reset();
-		}
+		Pending = FPendingSurfaceMarks();
+		Pending.Scale = MarkScale;
 
 		WalkSurfaces();
 	}
 
-	// Each colour's new squares go in as one batch, for the same reason the pieces do.
-	for (int32 Layer = 0; Layer < SurfaceMarkLayerCount; ++Layer)
+	AddPendingSurfaceMarks(Pending);
+
+	// Every surface now has its square, so placements may add to the overlay from here.
+	bSurfaceMarksComplete = true;
+
+	return ChangedMarks;
+}
+
+void ARoomManager::UpdateSurfaceMarks(const TConstArrayView<FGridSurfaceRef> Surfaces)
+{
+	// Anything but the plain case - the overlay switched off, never drawn in full, or out of step
+	// with its record - is left to the full sync.
+	if (!bSurfaceMarksComplete || !CanDrawSurfaceMarks() || !AreSurfaceMarksIntact())
 	{
-		if (NewMarks[Layer].IsEmpty())
-		{
-			continue;
-		}
-
-		TArray<uint64>& Keys = SurfaceMarkInstanceKeys[Layer];
-		const int32 FirstInstance = Keys.Num();
-
-		MarkLayers[Layer]->AddInstances(NewMarks[Layer], /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
-
-		for (int32 Offset = 0; Offset < NewMarkKeys[Layer].Num(); ++Offset)
-		{
-			SurfaceMarkSlots.FindChecked(NewMarkKeys[Layer][Offset]).Instance = FirstInstance + Offset;
-		}
-
-		Keys.Append(NewMarkKeys[Layer]);
+		SyncSurfaceMarks();
+		return;
 	}
+
+	RefreshSurfaceMarkMaterials();
+
+	FPendingSurfaceMarks Pending;
+	Pending.Scale = MakeSurfaceMarkScale(CellSize);
+
+	// A surface can be named more than once; after the first it is already the right colour.
+	for (const FGridSurfaceRef& Surface : Surfaces)
+	{
+		const uint64 Key = MakeFaceKey(Surface.Cell, Surface.Face);
+		SyncSurfaceMark(Surface.Cell, Surface.Face, Key, SurfaceMarkSlots.FindOrAdd(Key), Pending);
+	}
+
+	AddPendingSurfaceMarks(Pending);
 }

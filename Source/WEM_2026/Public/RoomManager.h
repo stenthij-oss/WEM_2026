@@ -143,6 +143,30 @@ struct FRoomPieceLayer
 };
 
 /**
+ * One colour of the surface overlay, spread over chunks the way FRoomPieceLayer spreads the pieces.
+ *
+ * Changing how many instances a component holds rebuilds its bounds and render data across every
+ * instance it has. With a colour in one component, each placement did that to tens of thousands
+ * of squares; in chunks it only touches the chunks a placement adds to or takes a square out of.
+ */
+USTRUCT()
+struct FSurfaceMarkLayer
+{
+	GENERATED_BODY()
+
+	/**
+	 * Oldest first. New squares only ever go into the last; a square that changes colour leaves a
+	 * hole in whichever chunk held it, filled from that chunk's own last square. The first is the
+	 * actor's own component for this colour; the rest are made at runtime and never saved.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UInstancedStaticMeshComponent>> Chunks;
+
+	/** Per chunk, the key of the surface each instance stands for, in instance order. */
+	TArray<TArray<uint64>> ChunkKeys;
+};
+
+/**
  * Directs the simulation's grid: a cube of cells, and the structure that grows through it one
  * platform at a time.
  *
@@ -224,6 +248,13 @@ struct FRoomPieceLayer
  * Platforms is the whole of the saved state. Everything else is rebuilt wholesale from it, and
  * the promotion rule is order-independent, so the same set of platforms always yields the same
  * surfaces whatever order they were placed in.
+ *
+ * A placement does not rebuild, though - that grows with the structure and soon costs more than a
+ * frame. Growth only ever adds, and a surface only ever moves from wall to all-object or to
+ * occupied, never back, so a placement takes in just the platform it adds: what that platform
+ * touches, and whatever promotions spread out from there. The wholesale rebuild is kept for
+ * loading, editing and the wem.RoomManager.VerifyEvery check, which holds the two against each
+ * other.
  */
 UCLASS()
 class WEM_2026_API ARoomManager : public AActor
@@ -378,8 +409,8 @@ public:
 	 * pieces cannot, since a promoted beam is still a beam - so it reads on top of them rather
 	 * than instead of them, and both are on by default.
 	 *
-	 * The squares are instanced and only the surfaces a placement changed are touched, so the
-	 * overlay costs little however far the structure has grown.
+	 * The squares are instanced in chunks, and a placement only touches the surfaces it changed
+	 * and the chunks holding them, so the overlay costs little however far the structure has grown.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Debug")
 	bool bShowSurfaces = true;
@@ -543,8 +574,8 @@ public:
 
 	/**
 	 * One beat of growth: rolls which kind to try first, places one platform - the other kind
-	 * if the first has nowhere to go - and rebuilds everything derived. The platform is drawn
-	 * from the placement stream out of every free slot across the whole structure at once.
+	 * if the first has nowhere to go - and brings everything derived up to date. The platform is
+	 * drawn from the placement stream out of every free slot across the whole structure at once.
 	 * Returns false when neither kind fits anywhere.
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
@@ -565,13 +596,19 @@ protected:
 	//~ End AActor Interface
 
 private:
-	/** How many colours the surface overlay has: all-object, wall, and occupied. One component each. */
+	/** How many colours the surface overlay has: all-object, wall, and occupied. A chunked layer each. */
 	static constexpr int32 SurfaceMarkLayerCount = 3;
 
-	/** Where one surface's overlay square stands: which colour's component, and which instance of it. */
+	/** How many kinds of platform there are, which is how many candidate lists are kept. */
+	static constexpr int32 PlatformKindCount = 2;
+
+	/** Where one surface's overlay square stands: which colour, which of its chunks, and which instance there. */
 	struct FSurfaceMarkSlot
 	{
 		int32 Layer = INDEX_NONE;
+
+		/** INDEX_NONE, like Instance, while the square is still waiting to be added. */
+		int32 Chunk = INDEX_NONE;
 
 		/** INDEX_NONE while the square is still waiting to be added. */
 		int32 Instance = INDEX_NONE;
@@ -580,14 +617,25 @@ private:
 		uint32 SeenStamp = 0;
 	};
 
+	/** Squares waiting to be added, per colour, gathered over one sync and added a batch per chunk. */
+	struct FPendingSurfaceMarks
+	{
+		/** Every square is the same size: one cell, less the inset. */
+		FVector Scale = FVector::OneVector;
+
+		TArray<FTransform> Transforms[SurfaceMarkLayerCount];
+		TArray<uint64> Keys[SurfaceMarkLayerCount];
+	};
+
 	/** Every visual from scratch: the pieces, the overlay and the debug lattice. */
 	void RebuildVisuals();
 
 	/**
 	 * What has to follow one placement. A placement only ever adds to the structure, so the
-	 * lattice stays as it is and the pieces and overlay take just what changed.
+	 * lattice stays as it is, the pieces take just the new platform's, and the overlay just the
+	 * surfaces the placement changed.
 	 */
-	void UpdateVisualsAfterPlacement();
+	void UpdateVisualsAfterPlacement(const FGridPlatform& Platform, TConstArrayView<FGridSurfaceRef> ChangedSurfaces);
 
 	/** Flushes and redraws the debug lattice. Owned batcher, so no other system's lines are touched. */
 	void RebuildDebugGrid();
@@ -595,13 +643,45 @@ private:
 	/** Drops every overlay square and the record of them, so the next sync draws the lot. */
 	void ResetSurfaceMarks();
 
-	/** Brings the overlay in line with the surfaces, adding, recolouring or dropping only what differs. */
-	void SyncSurfaceMarks();
+	/**
+	 * Brings the overlay in line with every surface, adding, recolouring or dropping only what
+	 * differs. Walks the whole structure. Returns how many squares it had to add or recolour.
+	 */
+	int32 SyncSurfaceMarks();
 
-	/** Takes one square out of a colour's component without moving any square but the last. */
-	void RemoveSurfaceMark(int32 Layer, int32 Instance);
+	/**
+	 * Brings just these surfaces' squares in line - the ones a placement changed. Falls back on
+	 * the full sync whenever the overlay is not already complete and in step with its record.
+	 */
+	void UpdateSurfaceMarks(TConstArrayView<FGridSurfaceRef> Surfaces);
 
-	UInstancedStaticMeshComponent* GetSurfaceMarkLayer(int32 Layer) const;
+	/** Whether there is anything for the overlay to draw, and anything to draw it with. */
+	bool CanDrawSurfaceMarks() const;
+
+	/** Whether every colour's chunks still match the record of them. A loaded level or a PIE copy does not. */
+	bool AreSurfaceMarksIntact() const;
+
+	/**
+	 * Resolves one surface and moves its square to the colour it should be, queueing a new square
+	 * in Pending when it needs one. Returns true when the square had to be added or recoloured.
+	 */
+	bool SyncSurfaceMark(const FIntVector& Cell, EGridFace Face, uint64 Key, FSurfaceMarkSlot& Slot, FPendingSurfaceMarks& Pending);
+
+	/** Adds the queued squares, filling each colour's last chunk and starting a new one whenever that is full. */
+	void AddPendingSurfaceMarks(const FPendingSurfaceMarks& Pending);
+
+	/** Re-tints the overlay's materials and puts the plane and its colour on every chunk. */
+	void RefreshSurfaceMarkMaterials();
+
+	/** Takes one square out of its chunk without moving any square but that chunk's last. */
+	void RemoveSurfaceMark(int32 Layer, int32 Chunk, int32 Instance);
+
+	/** A colour's first chunk: the actor's own component for it. */
+	UInstancedStaticMeshComponent* GetSurfaceMarkComponent(int32 Layer) const;
+
+	/** A colour's chunks and the record of what each holds. */
+	FSurfaceMarkLayer& GetSurfaceMarkChunks(int32 Layer);
+	const FSurfaceMarkLayer& GetSurfaceMarkChunks(int32 Layer) const;
 
 	/** One piece as its layer sees it: what it stands for, and where it goes. */
 	struct FPlacedPiece
@@ -612,34 +692,59 @@ private:
 
 	/**
 	 * Brings the built geometry in line with the platforms - one box per interior, per edge and
-	 * per node - adding only what is new.
+	 * per node - adding only what is new. Walks the whole structure. Returns how many pieces it
+	 * had to add.
 	 */
-	void SyncPieces();
+	int32 SyncPieces();
+
+	/**
+	 * Adds one new platform's pieces, skipping any edge or node a neighbour already built. Falls
+	 * back on the full sync whenever the pieces are not already complete and in step.
+	 */
+	void AppendPlatformPieces(const FGridPlatform& Platform);
+
+	/** One platform's pieces, appended to the list for each kind. */
+	void GatherPlatformPieces(
+		const FGridPlatform& Platform,
+		TArray<FPlacedPiece>& OutHorizontalInteriors,
+		TArray<FPlacedPiece>& OutVerticalInteriors,
+		TArray<FPlacedPiece>& OutEdges,
+		TArray<FPlacedPiece>& OutNodes) const;
 
 	/** Drops every piece of every kind, so the next sync builds the lot. */
 	void ResetPieces();
 
 	/**
-	 * Adds the pieces a layer has not drawn yet, filling its open chunk and starting a new one
-	 * whenever that is full. If a piece it did draw is missing from Pieces, the layer is rebuilt
-	 * from scratch instead - growth never takes a piece away, so that only follows a reset.
+	 * Adds the pieces a layer has not drawn yet. If a piece it did draw is missing from Pieces,
+	 * the layer is rebuilt from scratch instead - growth never takes a piece away, so that only
+	 * follows a reset. Returns how many pieces it added.
 	 */
-	void SyncPieceLayer(
+	int32 SyncPieceLayer(
 		FRoomPieceLayer& Layer,
 		UInstancedStaticMeshComponent* FirstChunk,
 		TConstArrayView<FPlacedPiece> Pieces,
 		UStaticMesh* Mesh,
 		UMaterialInterface* Material);
 
+	/** Whether a layer's chunks still hold exactly the pieces its record says they do. */
+	bool IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInstancedStaticMeshComponent* FirstChunk) const;
+
+	/** Adds pieces to a layer, filling its open chunk and starting a new one whenever that is full. */
+	void AddPiecesToLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, TConstArrayView<FTransform> NewPieces);
+
 	/** Empties a layer back to its first chunk, cleared. */
 	void ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk);
 
-	/** Starts a new chunk for a layer, set up like its first. */
-	UInstancedStaticMeshComponent* AddPieceChunk(
-		FRoomPieceLayer& Layer,
-		UInstancedStaticMeshComponent* FirstChunk,
-		UStaticMesh* Mesh,
-		UMaterialInterface* Material);
+	/** Destroys every chunk but the first, clears that, and leaves it as the only one. */
+	void ResetChunks(TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks, UInstancedStaticMeshComponent* FirstChunk);
+
+	/**
+	 * Starts a new chunk and appends it to Chunks. Set up like the first - mesh and material
+	 * included - so the first has to be brought up to date before this is called.
+	 */
+	UInstancedStaticMeshComponent* AddInstancedChunk(
+		TArray<TObjectPtr<UInstancedStaticMeshComponent>>& Chunks,
+		UInstancedStaticMeshComponent* FirstChunk);
 
 	/**
 	 * Dynamic instance of a base material tinted to Color, made once and re-tinted after that.
@@ -669,8 +774,27 @@ private:
 	/** Whether a platform sits on the lattice with its whole footprint inside the cube. */
 	bool IsPlatformOnGrid(const FGridPlatform& Platform) const;
 
-	/** Rebuilds everything derived from Platforms. Wholesale, so it cannot drift out of step. */
+	/**
+	 * Rebuilds everything derived from Platforms. Wholesale, so it cannot drift out of step -
+	 * which is also what makes it the reference AddPlacedPlatform is checked against.
+	 */
 	void RebuildPlatformState();
+
+	/**
+	 * Takes one newly placed platform into the derived state without rebuilding it: its slot and
+	 * rim, the surfaces it builds against, and the promotions that spread out from it. Collects
+	 * every surface whose capacity or occupancy may have changed, for the overlay.
+	 */
+	void AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGridSurfaceRef>& OutChangedSurfaces);
+
+	/** Records a platform's rim cells, each with the axis the platform faces along. */
+	void RecordRimCells(const FGridPlatform& Platform);
+
+	/**
+	 * The promotion rule: flanked, within its own plane and on its own side, by open all-object
+	 * surfaces on opposite sides along either axis of that plane.
+	 */
+	bool IsFlankedByOpenFields(const FIntVector& Cell, EGridFace Face) const;
 
 	/**
 	 * The axes along which a cell carries broad faces, one bit each, or zero when nothing is
@@ -687,11 +811,23 @@ private:
 	/** Every lattice position the first platform could take. */
 	void GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const;
 
-	/** Every free slot of one kind around the structure, in key order. */
+	/** Every free slot of one kind around the structure, in key order. Walks the whole structure. */
 	void GatherPlatformCandidates(EPlatformKind Kind, TArray<FGridPlatform>& OutCandidates) const;
+
+	/** Gathers both candidate lists afresh if a rebuild has left them stale. */
+	void EnsurePlatformCandidates();
+
+	/** Re-judges one slot, adding it to or dropping it from its kind's candidates to match. */
+	void RefreshPlatformCandidate(const FGridPlatform& Slot);
 
 	/** Draws one platform of a kind from the placement stream and places it. False when that kind has nowhere to go. */
 	bool PlacePlatformOfKind(EPlatformKind Kind);
+
+	/**
+	 * Rebuilds the derived state and the visuals from scratch and reports anything the placements
+	 * had built up differently. Driven by wem.RoomManager.VerifyEvery; the rebuild is kept either way.
+	 */
+	void VerifyIncrementalState();
 
 	/** The placement beat. Stops its own timer once the structure has no room left. */
 	void AdvancePlacement();
@@ -728,7 +864,8 @@ private:
 	 * Everything derived from Platforms. None of it is reflected, so none of it is saved or
 	 * copied with the actor - a loaded level or a PIE copy arrives with the list alone and
 	 * rebuilds the rest. All of it is sparse: keyed by packed cell coordinates, and holding only
-	 * what cannot be worked out from a coordinate on the spot.
+	 * what cannot be worked out from a coordinate on the spot. RebuildPlatformState makes it from
+	 * scratch; AddPlacedPlatform keeps it up to date one placement at a time.
 	 */
 
 	/** The platforms that fit the lattice as it stands, each once, in list order. */
@@ -746,21 +883,54 @@ private:
 	/** Rim surfaces promoted to all-object, keyed by cell and face. */
 	TSet<uint64> PromotedFaces;
 
+	/**
+	 * Every free slot, per kind (indexed by EPlatformKind), in ascending key order - the order
+	 * the placement stream draws from. Kept up to date placement by placement: only slots around an
+	 * edge that a placement touched or opened can have changed, so only those are judged again.
+	 */
+	TArray<FGridPlatform> PlatformCandidates[PlatformKindCount];
+
+	/** Set by every rebuild, and by the first placement; the next draw then gathers the lists afresh. */
+	bool bPlatformCandidatesStale = true;
+
 	/** Platforms in the list that the last rebuild left out, so the warning is given once rather than every beat. */
 	int32 ReportedSkippedPlatforms = 0;
 
+	/** Placements since wem.RoomManager.VerifyEvery last checked one, and the tally of those checks. */
+	int32 PlacementsSinceVerify = 0;
+	int32 VerifiedPlacements = 0;
+	int32 FailedVerifications = 0;
+
 	/**
-	 * Every surface the overlay has drawn, keyed by cell and face. Mirrors the mark components
-	 * and is neither saved nor duplicated with them, so a sync that finds the two out of step
-	 * starts again from scratch rather than trusting it.
+	 * Every surface the overlay has drawn, keyed by cell and face. Mirrors the mark chunks and is
+	 * neither saved nor duplicated with them, so a sync that finds the two out of step starts
+	 * again from scratch rather than trusting it.
 	 */
 	TMap<uint64, FSurfaceMarkSlot> SurfaceMarkSlots;
 
-	/** Per colour, the key of the surface each instance stands for, in instance order. */
-	TArray<uint64> SurfaceMarkInstanceKeys[SurfaceMarkLayerCount];
-
 	/** Bumped once per sync, to tell the surfaces it found from ones it did not. */
 	uint32 SurfaceMarkSyncStamp = 0;
+
+	/**
+	 * Whether the last full sync drew every surface, so a placement may add to it. False after
+	 * a reset or while the overlay is off; the next update then takes the full sync instead.
+	 */
+	bool bSurfaceMarksComplete = false;
+
+	/** Whether the last full sync built every platform's pieces, so a placement may add to them. */
+	bool bPiecesComplete = false;
+
+	/** The overlay's green squares. Starts from AllObjectSurfaceMarks. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FSurfaceMarkLayer AllObjectMarkChunks;
+
+	/** The overlay's purple squares. Starts from WallSurfaceMarks. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FSurfaceMarkLayer WallMarkChunks;
+
+	/** The overlay's white squares. Starts from OccupiedSurfaceMarks. */
+	UPROPERTY(Transient, DuplicateTransient)
+	FSurfaceMarkLayer OccupiedMarkChunks;
 
 	/** Interiors of horizontal platforms. Starts from HorizontalInteriorPieces. */
 	UPROPERTY(Transient, DuplicateTransient)
@@ -791,8 +961,9 @@ private:
 	 * those arrays - so with this actor selected during a run the panel rebuilt thousands of rows
 	 * a beat. BlueprintReadOnly keeps them reachable from Blueprint and MCP.
 	 *
-	 * The four piece components are each only the first chunk of their kind (see FRoomPieceLayer).
-	 * Their settings - shadows, collision, mobility - are copied onto every chunk made after them.
+	 * Each of these is only the first chunk of its kind (see FRoomPieceLayer and FSurfaceMarkLayer).
+	 * Their settings - shadows, collision, mobility, lighting - are copied onto every chunk made
+	 * after them.
 	 */
 
 	/**
