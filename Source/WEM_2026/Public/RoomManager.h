@@ -614,6 +614,7 @@ public:
 	 * Whether a platform could be placed: at its min node, facing along its axis, laid from its
 	 * tile the way round it says.
 	 *
+	 * Its tile has to allow that orientation - horizontal or vertical - at all.
 	 * It has to sit on the lattice with its whole footprint inside the cube, taking no module
 	 * face already taken, with nothing built across its interior and no other interior under its
 	 * rim, and share at least one module edge with a platform already placed. It has to lie flush
@@ -866,6 +867,13 @@ private:
 	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well.
 	 */
 	bool IsSpaceFree(const FGridPlatform& Platform) const;
+
+	/**
+	 * CanPlacePlatform less the question of whether its tile may be laid that way round at all.
+	 * The candidate lists are kept by this, and a tile's orientation is only asked when a beat
+	 * draws from them, so it can be changed during a run and take effect on the next beat.
+	 */
+	bool IsPlacementOpen(const FGridPlatform& Platform) const;
 
 	/**
 	 * Whether a platform lies flush with a neighbour it shares rim with, along the axis of the

@@ -837,6 +837,13 @@ int32 ARoomManager::GetPlatformCount() const
 
 bool ARoomManager::CanPlacePlatform(const FGridPlatform& Platform) const
 {
+	return Platform.Tile
+		&& Platform.Tile->AllowsOrientation(Platform.GetKind() == EPlatformKind::SurfaceVertical)
+		&& IsPlacementOpen(Platform);
+}
+
+bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
+{
 	// On the lattice, laid from a usable tile, with the whole footprint - interior, rim and far
 	// nodes - inside the cube. That alone keeps anything from going below the ground layer.
 	if (!IsPlatformOnGrid(Platform))
@@ -944,7 +951,8 @@ void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandi
 {
 	OutCandidates.Reset();
 
-	if (!IsTileUsable(FirstTile))
+	// The first platform is always laid flat, so a first tile kept to walls starts nothing.
+	if (!IsTileUsable(FirstTile) || !FirstTile->AllowsOrientation(/*bVertical=*/false))
 	{
 		return;
 	}
@@ -1026,7 +1034,7 @@ void ARoomManager::GatherPlatformCandidates()
 				bool bAlreadyConsidered = false;
 				Considered[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyConsidered);
 
-				if (!bAlreadyConsidered && CanPlacePlatform(Candidate))
+				if (!bAlreadyConsidered && IsPlacementOpen(Candidate))
 				{
 					TileCandidates[TileIndex].ByKind[KindIndex(Candidate.GetKind())].Add(Candidate);
 				}
@@ -1082,7 +1090,7 @@ bool ARoomManager::RefreshPlatformCandidate(
 		return false;
 	}
 
-	const bool bFree = CanPlacePlatform(Candidate);
+	const bool bFree = IsPlacementOpen(Candidate);
 
 	// Inserted where it sorts, so the list stays in the key order a full gather would give it.
 	if (bFree && !bListed)
@@ -1125,10 +1133,13 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		EnsurePlatformCandidates();
 
 		// The tile is rolled only among those with somewhere to go, so a tile with no room left
-		// never costs the beat while another has some.
+		// never costs the beat while another has some. A tile kept to the other orientation has
+		// nowhere to go either; that is asked here rather than when the lists are kept, so a
+		// change to it takes effect on the very next beat.
 		auto GetDrawWeight = [Kind](const FTileCandidates& Candidates) -> float
 		{
-			return Candidates.ByKind[KindIndex(Kind)].IsEmpty() ? 0.0f : FMath::Max(Candidates.Tile->Weight, 0.0f);
+			const bool bAllowed = Candidates.Tile->AllowsOrientation(Kind == EPlatformKind::SurfaceVertical);
+			return !bAllowed || Candidates.ByKind[KindIndex(Kind)].IsEmpty() ? 0.0f : FMath::Max(Candidates.Tile->Weight, 0.0f);
 		};
 
 		float TotalWeight = 0.0f;
@@ -1429,6 +1440,11 @@ void ARoomManager::ResolveUsableTiles()
 	{
 		Problems.Add(FString::Printf(TEXT("FirstTile '%s' (%d x %d) is not a whole number of %d-cell modules along both sides, so nothing grows"),
 			*FirstTile->GetName(), FirstTile->Width, FirstTile->Length, Module));
+	}
+	else if (!FirstTile->AllowsOrientation(/*bVertical=*/false))
+	{
+		Problems.Add(FString::Printf(TEXT("FirstTile '%s' is kept to vertical, but the first platform is always laid horizontal, so nothing grows"),
+			*FirstTile->GetName()));
 	}
 
 	// This runs on every edit and every check, so the warning is only given when what it would
