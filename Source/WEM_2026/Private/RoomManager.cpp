@@ -68,6 +68,14 @@ namespace
 	 */
 	constexpr int32 SurfaceMarkChunkCapacity = 4096;
 
+	/**
+	 * How many placements' worth of changed surfaces are kept for GatherSurfaceChangesSince: once
+	 * twice this many are held, the older half is let go. A reader that falls further behind than
+	 * that - one beat of the object placer at its slowest interval, many times over - walks the
+	 * whole structure instead.
+	 */
+	constexpr int32 SurfaceJournalPlacements = 1024;
+
 	TAutoConsoleVariable<int32> CVarRoomManagerVerifyEvery(
 		TEXT("wem.RoomManager.VerifyEvery"),
 		0,
@@ -268,6 +276,79 @@ namespace
 		OutEdge.Node[RunAxis] -= Cell[RunAxis] % Module;
 		OutEdge.Axis = RunAxis;
 		return true;
+	}
+
+	/** The first lattice line at or above a coordinate. Never below zero, where the lattice starts. */
+	FORCEINLINE int32 FirstNodeAtOrAbove(const int32 Coordinate, const int32 Module)
+	{
+		return Coordinate <= 0 ? 0 : ((Coordinate + Module - 1) / Module) * Module;
+	}
+
+	/**
+	 * Calls VisitFace(MinNode, NormalAxis), VisitEdge(Edge) and VisitNode(Node) for every lattice
+	 * piece an inclusive box of cells cuts. A module face is cut when the box reaches into its
+	 * inside - the cells between its edges - on its own plane; a module edge when the box holds its
+	 * line and reaches into its run between the nodes; a node when the box holds it. An edge lies in
+	 * two lattice planes, and may be visited from both.
+	 */
+	template <typename FaceFunctorType, typename EdgeFunctorType, typename NodeFunctorType>
+	void ForEachObstaclePiece(
+		const FIntVector& Min,
+		const FIntVector& Max,
+		const int32 Module,
+		FaceFunctorType&& VisitFace,
+		EdgeFunctorType&& VisitEdge,
+		NodeFunctorType&& VisitNode)
+	{
+		for (int32 Z = FirstNodeAtOrAbove(Min.Z, Module); Z <= Max.Z; Z += Module)
+		{
+			for (int32 Y = FirstNodeAtOrAbove(Min.Y, Module); Y <= Max.Y; Y += Module)
+			{
+				for (int32 X = FirstNodeAtOrAbove(Min.X, Module); X <= Max.X; X += Module)
+				{
+					VisitNode(FIntVector(X, Y, Z));
+				}
+			}
+		}
+
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			int32 U, V;
+			GetInPlaneAxes(Axis, U, V);
+
+			// A run or an inside starting at a node reaches Module - 1 cells past it, so a node that
+			// far short of the box still has cells in it.
+			const int32 FirstU = FirstNodeAtOrAbove(Min[U] - Module + 1, Module);
+			const int32 FirstV = FirstNodeAtOrAbove(Min[V] - Module + 1, Module);
+
+			for (int32 Plane = FirstNodeAtOrAbove(Min[Axis], Module); Plane <= Max[Axis]; Plane += Module)
+			{
+				for (int32 NodeV = FirstV; NodeV <= Max[V] - 1; NodeV += Module)
+				{
+					for (int32 NodeU = FirstU; NodeU <= Max[U] - 1; NodeU += Module)
+					{
+						VisitFace(AxisStep(Axis, Plane) + AxisStep(U, NodeU) + AxisStep(V, NodeV), Axis);
+					}
+				}
+
+				// Edges along U lie on the lines across V that the box holds, and the other way round.
+				for (int32 LineV = FirstNodeAtOrAbove(Min[V], Module); LineV <= Max[V]; LineV += Module)
+				{
+					for (int32 NodeU = FirstU; NodeU <= Max[U] - 1; NodeU += Module)
+					{
+						VisitEdge(FLatticeEdge{ AxisStep(Axis, Plane) + AxisStep(U, NodeU) + AxisStep(V, LineV), U });
+					}
+				}
+
+				for (int32 LineU = FirstNodeAtOrAbove(Min[U], Module); LineU <= Max[U]; LineU += Module)
+				{
+					for (int32 NodeV = FirstV; NodeV <= Max[V] - 1; NodeV += Module)
+					{
+						VisitEdge(FLatticeEdge{ AxisStep(Axis, Plane) + AxisStep(U, LineU) + AxisStep(V, NodeV), V });
+					}
+				}
+			}
+		}
 	}
 
 	FORCEINLINE FGridSurfaceRef MakeSurfaceRef(const FIntVector& Cell, const EGridFace Face)
@@ -536,6 +617,10 @@ void ARoomManager::OnConstruction(const FTransform& Transform)
 	// One height sample for the whole cube, resolved before anything asks for a cell position.
 	GridBaseZ = ResolveGridBaseZ();
 
+	// Whatever stood on the structure before this may no longer stand on anything - the cells may
+	// all have moved - so it goes, and nothing it held back holds growth back any more.
+	BeginNewGeneration();
+
 	// Everything derived is rebuilt from the list, so resizing the cube, changing the module or
 	// swapping a tile re-resolves it from scratch.
 	RebuildPlatformState();
@@ -570,6 +655,7 @@ void ARoomManager::BeginPlay()
 	else
 	{
 		ResetPlacementStream();
+		BeginNewGeneration();
 
 		// The derived state is never saved or copied, so a PIE copy arrives with the platform
 		// list and nothing worked out from it. Work it out before the first beat reads it.
@@ -1142,6 +1228,7 @@ void ARoomManager::ClearPlatforms()
 	Platforms.Reset();
 
 	ResetPlacementStream();
+	BeginNewGeneration();
 
 	RebuildPlatformState();
 	UpdateDebugReadouts();
@@ -1292,6 +1379,35 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 		}
 	});
 
+	if (!bFree || (ObstacleFaces.IsEmpty() && ObstacleEdges.IsEmpty() && ObstacleNodes.IsEmpty()))
+	{
+		return bFree;
+	}
+
+	// Every cell a platform covers is the inside of one of its module faces, the run of one of its
+	// module edges, or one of its nodes, so asking those pieces asks every cell - without comparing
+	// boxes, however many obstacles stand.
+	ForEachModuleFace(Platform, SpanU, SpanV, Module, [&](const FIntVector& FaceMinNode)
+	{
+		bFree = bFree && !ObstacleFaces.Contains(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+	});
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
+	{
+		bFree = bFree && !ObstacleEdges.Contains(MakeEdgeKey(Edge));
+	});
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	for (int32 StepV = 0; bFree && StepV <= SpanV; StepV += Module)
+	{
+		for (int32 StepU = 0; bFree && StepU <= SpanU; StepU += Module)
+		{
+			bFree = !ObstacleNodes.Contains(MakeCellKey(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV)));
+		}
+	}
+
 	return bFree;
 }
 
@@ -1389,6 +1505,16 @@ void ARoomManager::RebuildPlatformState()
 {
 	// The tiles first, since which of them fit the lattice decides which platforms do.
 	ResolveUsableTiles();
+
+	// And the obstacles, which every placement below is held against as well.
+	RebuildObstacleKeys();
+
+	++StructureRevision;
+
+	// Nothing before this can be followed on from: whoever reads the record walks it all again.
+	SurfaceJournal.Reset();
+	SurfaceJournalStarts.Reset();
+	SurfaceJournalRevision = StructureRevision;
 
 	BuiltPlatforms.Reset();
 	ModuleFaceOwners.Reset();
@@ -1540,6 +1666,7 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 
 	RecordPlatform(Platform);
 
+	++StructureRevision;
 	++PlatformCount;
 
 	if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal)
@@ -1637,6 +1764,8 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 			}
 		}
 	}
+
+	JournalSurfaceChanges(OutChangedSurfaces);
 
 	if (bPlatformCandidatesStale)
 	{
@@ -1739,6 +1868,60 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 	});
 }
 
+void ARoomManager::JournalSurfaceChanges(const TConstArrayView<FGridSurfaceRef> Surfaces)
+{
+	// A revision the record does not lead straight on to leaves a gap no reader could see across,
+	// so it starts over from here.
+	if (StructureRevision != SurfaceJournalRevision + SurfaceJournalStarts.Num() + 1)
+	{
+		SurfaceJournal.Reset();
+		SurfaceJournalStarts.Reset();
+		SurfaceJournalRevision = StructureRevision;
+		return;
+	}
+
+	// Let go of the older half once it is full, so the record stays the size of the last few
+	// thousand placements however long growth runs.
+	if (SurfaceJournalStarts.Num() >= 2 * SurfaceJournalPlacements)
+	{
+		const int32 Dropped = SurfaceJournalStarts[SurfaceJournalPlacements];
+
+		SurfaceJournal.RemoveAt(0, Dropped, EAllowShrinking::No);
+		SurfaceJournalStarts.RemoveAt(0, SurfaceJournalPlacements, EAllowShrinking::No);
+		SurfaceJournalRevision += SurfaceJournalPlacements;
+
+		for (int32& Start : SurfaceJournalStarts)
+		{
+			Start -= Dropped;
+		}
+	}
+
+	SurfaceJournalStarts.Add(SurfaceJournal.Num());
+	SurfaceJournal.Append(Surfaces.GetData(), Surfaces.Num());
+}
+
+bool ARoomManager::GatherSurfaceChangesSince(const int32 FromRevision, TArray<FGridSurfaceRef>& OutSurfaces) const
+{
+	OutSurfaces.Reset();
+
+	// Run I is revision SurfaceJournalRevision + I + 1's, so the record reaches back to
+	// SurfaceJournalRevision and, when it is whole, forward to the revision standing now.
+	if (FromRevision < SurfaceJournalRevision
+		|| FromRevision > StructureRevision
+		|| StructureRevision != SurfaceJournalRevision + SurfaceJournalStarts.Num())
+	{
+		return false;
+	}
+
+	if (FromRevision < StructureRevision)
+	{
+		const int32 First = SurfaceJournalStarts[FromRevision - SurfaceJournalRevision];
+		OutSurfaces.Append(SurfaceJournal.GetData() + First, SurfaceJournal.Num() - First);
+	}
+
+	return true;
+}
+
 bool ARoomManager::IsFlankedByOpenFields(const FIntVector& Cell, const EGridFace Face) const
 {
 	// Open all-object: carries anything and is not built against. Judged on the same side as the
@@ -1779,8 +1962,17 @@ void ARoomManager::VerifyIncrementalState()
 	const TMap<uint64, uint8> IncrementalEdgeUses = ModuleEdgeUses;
 	const TMap<uint64, uint8> IncrementalRimCellNormals = RimCellNormals;
 	const TSet<uint64> IncrementalPromotedFaces = PromotedFaces;
+	const TSet<uint64> IncrementalObstacleFaces = ObstacleFaces;
+	const TSet<uint64> IncrementalObstacleEdges = ObstacleEdges;
+	const TSet<uint64> IncrementalObstacleNodes = ObstacleNodes;
 	const bool bHadCandidates = !bPlatformCandidatesStale;
 	const TArray<FTileCandidates> IncrementalCandidates = TileCandidates;
+	const int32 IncrementalStructureRevision = StructureRevision;
+
+	// The record of changed surfaces belongs with the revision, and goes back with it below.
+	TArray<FGridSurfaceRef> IncrementalJournal = MoveTemp(SurfaceJournal);
+	TArray<int32> IncrementalJournalStarts = MoveTemp(SurfaceJournalStarts);
+	const int32 IncrementalJournalRevision = SurfaceJournalRevision;
 
 	// And what the wholesale rebuild makes of the same list. That is kept either way: it is the
 	// reference, so a slip is reported once and not carried forward.
@@ -1831,6 +2023,9 @@ void ARoomManager::VerifyIncrementalState()
 	CompareMaps(TEXT("module edges"), IncrementalEdgeUses, ModuleEdgeUses);
 	CompareMaps(TEXT("rim cells"), IncrementalRimCellNormals, RimCellNormals);
 	CompareKeySets(TEXT("promoted surfaces"), IncrementalPromotedFaces, PromotedFaces);
+	CompareKeySets(TEXT("obstacle faces"), IncrementalObstacleFaces, ObstacleFaces);
+	CompareKeySets(TEXT("obstacle edges"), IncrementalObstacleEdges, ObstacleEdges);
+	CompareKeySets(TEXT("obstacle nodes"), IncrementalObstacleNodes, ObstacleNodes);
 
 	// Compared in order, since the order is what the placement stream draws from.
 	if (bHadCandidates)
@@ -1880,7 +2075,17 @@ void ARoomManager::VerifyIncrementalState()
 
 	++VerifiedPlacements;
 
-	if (!Mismatches.IsEmpty())
+	// A check that found nothing changed nothing, so it leaves the revision where it was. Bumping it
+	// would have whatever keeps work against the revision - the object placer's record of what
+	// cannot be placed - redo that work, and draw differently for it, only because the check ran.
+	if (Mismatches.IsEmpty())
+	{
+		StructureRevision = IncrementalStructureRevision;
+		SurfaceJournal = MoveTemp(IncrementalJournal);
+		SurfaceJournalStarts = MoveTemp(IncrementalJournalStarts);
+		SurfaceJournalRevision = IncrementalJournalRevision;
+	}
+	else
 	{
 		++FailedVerifications;
 
@@ -2022,6 +2227,187 @@ bool ARoomManager::IsSolidCell(const FIntVector& Cell) const
 	int32 InteriorOwner = INDEX_NONE;
 
 	return GetCellSurfaceAxes(Cell, InteriorOwner) != 0;
+}
+
+bool ARoomManager::IsCellSolid(const FIntVector& Cell) const
+{
+	return IsSolidCell(Cell);
+}
+
+int32 ARoomManager::AddObstacle(const FIntVector& MinCell, const FIntVector& MaxCell)
+{
+	FGridObstacle Obstacle;
+	Obstacle.Handle = NextObstacleHandle++;
+	Obstacle.MinCell = FIntVector(FMath::Min(MinCell.X, MaxCell.X), FMath::Min(MinCell.Y, MaxCell.Y), FMath::Min(MinCell.Z, MaxCell.Z));
+	Obstacle.MaxCell = FIntVector(FMath::Max(MinCell.X, MaxCell.X), FMath::Max(MinCell.Y, MaxCell.Y), FMath::Max(MinCell.Z, MaxCell.Z));
+	Obstacles.Add(Obstacle);
+
+	const int32 Module = GetModule();
+
+	// An obstacle only ever takes room away, so no placement comes free and only listed ones can
+	// drop out. Those are exactly the ones taking in a piece it cuts: a cut edge itself, one of the
+	// four edges around a cut face - a placement covering the face takes in all four - or one of the
+	// edges meeting at a cut node, since a placement covering the node takes in some of them.
+	TArray<FLatticeEdge> AffectedEdges;
+	TSet<uint64> AffectedEdgeKeys;
+
+	auto AddAffectedEdge = [&AffectedEdges, &AffectedEdgeKeys](const FLatticeEdge& Edge)
+	{
+		bool bAlreadyAdded = false;
+		AffectedEdgeKeys.Add(MakeEdgeKey(Edge), &bAlreadyAdded);
+
+		if (!bAlreadyAdded)
+		{
+			AffectedEdges.Add(Edge);
+		}
+	};
+
+	ForEachObstaclePiece(Obstacle.MinCell, Obstacle.MaxCell, Module,
+		[&](const FIntVector& FaceMinNode, const int32 NormalAxis)
+		{
+			ObstacleFaces.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+
+			int32 U, V;
+			GetInPlaneAxes(NormalAxis, U, V);
+
+			AddAffectedEdge(FLatticeEdge{ FaceMinNode, U });
+			AddAffectedEdge(FLatticeEdge{ FaceMinNode + AxisStep(V, Module), U });
+			AddAffectedEdge(FLatticeEdge{ FaceMinNode, V });
+			AddAffectedEdge(FLatticeEdge{ FaceMinNode + AxisStep(U, Module), V });
+		},
+		[&](const FLatticeEdge& Edge)
+		{
+			ObstacleEdges.Add(MakeEdgeKey(Edge));
+			AddAffectedEdge(Edge);
+		},
+		[&](const FIntVector& Node)
+		{
+			ObstacleNodes.Add(MakeCellKey(Node));
+
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				AddAffectedEdge(FLatticeEdge{ Node, Axis });
+				AddAffectedEdge(FLatticeEdge{ Node - AxisStep(Axis, Module), Axis });
+			}
+		});
+
+	// Lists that are going to be gathered afresh anyway hold nothing worth refreshing.
+	if (bPlatformCandidatesStale || TileCandidates.Num() != UsableTiles.Num())
+	{
+		return Obstacle.Handle;
+	}
+
+	TArray<TSet<uint64>> Judged;
+	Judged.SetNum(TileCandidates.Num());
+
+	for (const FLatticeEdge& Edge : AffectedEdges)
+	{
+		ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/false,
+			[&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
+		{
+			bool bAlreadyJudged = false;
+			Judged[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyJudged);
+
+			if (!bAlreadyJudged)
+			{
+				RefreshPlatformCandidate(TileIndex, Candidate, /*bMayHaveComeFree=*/false);
+			}
+		});
+	}
+
+	return Obstacle.Handle;
+}
+
+void ARoomManager::RemoveObstacle(const int32 Handle)
+{
+	if (Obstacles.RemoveAll([Handle](const FGridObstacle& Obstacle) { return Obstacle.Handle == Handle; }) == 0)
+	{
+		return;
+	}
+
+	// Taking an obstacle away gives room back, which the incremental refresh is not built for - it
+	// only follows room being taken. The lists are gathered afresh on the next draw instead.
+	RebuildObstacleKeys();
+	bPlatformCandidatesStale = true;
+}
+
+void ARoomManager::ClearObstacles()
+{
+	if (Obstacles.IsEmpty())
+	{
+		return;
+	}
+
+	Obstacles.Reset();
+	RebuildObstacleKeys();
+	bPlatformCandidatesStale = true;
+}
+
+void ARoomManager::RebuildObstacleKeys()
+{
+	ObstacleFaces.Reset();
+	ObstacleEdges.Reset();
+	ObstacleNodes.Reset();
+
+	const int32 Module = GetModule();
+
+	for (const FGridObstacle& Obstacle : Obstacles)
+	{
+		ForEachObstaclePiece(Obstacle.MinCell, Obstacle.MaxCell, Module,
+			[this](const FIntVector& FaceMinNode, const int32 NormalAxis) { ObstacleFaces.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis)); },
+			[this](const FLatticeEdge& Edge) { ObstacleEdges.Add(MakeEdgeKey(Edge)); },
+			[this](const FIntVector& Node) { ObstacleNodes.Add(MakeCellKey(Node)); });
+	}
+}
+
+void ARoomManager::BeginNewGeneration()
+{
+	Obstacles.Reset();
+	ObstacleFaces.Reset();
+	ObstacleEdges.Reset();
+	ObstacleNodes.Reset();
+
+	++RebuildGeneration;
+}
+
+void ARoomManager::GetObstaclePieceBounds(const FIntVector& MinCell, const FIntVector& MaxCell, TArray<FBox>& OutPieces) const
+{
+	OutPieces.Reset();
+
+	const int32 Module = GetModule();
+	const FIntVector Min(FMath::Min(MinCell.X, MaxCell.X), FMath::Min(MinCell.Y, MaxCell.Y), FMath::Min(MinCell.Z, MaxCell.Z));
+	const FIntVector Max(FMath::Max(MinCell.X, MaxCell.X), FMath::Max(MinCell.Y, MaxCell.Y), FMath::Max(MinCell.Z, MaxCell.Z));
+
+	// An edge can be visited from both planes it lies in; it is drawn once.
+	TSet<uint64> DrawnEdges;
+
+	auto AddCells = [this, &OutPieces](const FIntVector& FirstCell, const FIntVector& CellExtent)
+	{
+		const FVector Corner = GetCellMinCorner(FirstCell);
+		OutPieces.Add(FBox(Corner, Corner + FVector(CellExtent) * CellSize));
+	};
+
+	ForEachObstaclePiece(Min, Max, Module,
+		[&](const FIntVector& FaceMinNode, const int32 NormalAxis)
+		{
+			int32 U, V;
+			GetInPlaneAxes(NormalAxis, U, V);
+			AddCells(FaceMinNode + AxisStep(U) + AxisStep(V), FIntVector(1) + AxisStep(U, Module - 2) + AxisStep(V, Module - 2));
+		},
+		[&](const FLatticeEdge& Edge)
+		{
+			bool bAlreadyDrawn = false;
+			DrawnEdges.Add(MakeEdgeKey(Edge), &bAlreadyDrawn);
+
+			if (!bAlreadyDrawn)
+			{
+				AddCells(Edge.Node + AxisStep(Edge.Axis), FIntVector(1) + AxisStep(Edge.Axis, Module - 2));
+			}
+		},
+		[&](const FIntVector& Node)
+		{
+			AddCells(Node, FIntVector(1));
+		});
 }
 
 void ARoomManager::ResolveSurface(

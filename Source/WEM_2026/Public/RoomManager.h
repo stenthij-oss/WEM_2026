@@ -123,6 +123,26 @@ struct FGridSurfaceRef
 };
 
 /**
+ * A box of cells growth may not build through - held for something else standing there, such as
+ * a placed object. Inclusive at both corners.
+ */
+USTRUCT(BlueprintType)
+struct FGridObstacle
+{
+	GENERATED_BODY()
+
+	/** What AddObstacle returned for it, and what RemoveObstacle takes back. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Obstacle")
+	int32 Handle = 0;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Obstacle")
+	FIntVector MinCell = FIntVector::ZeroValue;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Obstacle")
+	FIntVector MaxCell = FIntVector::ZeroValue;
+};
+
+/**
  * One kind of built piece - horizontal interior, vertical interior, a tile's own mesh, edge,
  * node - spread over a run of small instanced components, "chunks", filled one at a time.
  *
@@ -292,6 +312,15 @@ struct FSurfaceMarkLayer
  * touches, and whatever promotions spread out from there. The wholesale rebuild is kept for
  * loading, editing and the wem.RoomManager.VerifyEvery check, which holds the two against each
  * other.
+ *
+ * Obstacles
+ * ---------
+ * Something else can hold a box of cells against growth - a placed object, standing in the air
+ * off a segment. Growth never deletes what stands in its way; it simply does not build there. A
+ * platform only ever covers lattice cells, and those come in three kinds of piece: the inside of
+ * a module face, the run of a module edge, and a node. So a box is turned once, as it is added,
+ * into the keys of the pieces it cuts, and a placement is refused if it takes in any of them -
+ * the same few lookups however many obstacles stand.
  */
 UCLASS()
 class WEM_2026_API ARoomManager : public AActor
@@ -399,6 +428,13 @@ public:
 	/** Of those, the surface_vertical ones. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Platforms")
 	int32 VerticalPlatformCount = 0;
+
+	/**
+	 * Every box held against growth, in the order they were added. Kept out of the Details panel for
+	 * the same reason Platforms is. Transient: what holds them - placed objects - is not saved either.
+	 */
+	UPROPERTY(BlueprintReadOnly, Transient, Category = "Grid|Obstacles")
+	TArray<FGridObstacle> Obstacles;
 
 	/** Master toggle for the built geometry: every interior, edge and node. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
@@ -606,6 +642,56 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
 	void GatherSurfaces(ESurfaceCapacity Filter, bool bIncludeOccupied, TArray<FGridSurfaceRef>& OutSurfaces) const;
 
+	/** Whether any platform covers this cell, rim or interior. */
+	UFUNCTION(BlueprintPure, Category = "Grid|Surfaces")
+	bool IsCellSolid(const FIntVector& Cell) const;
+
+	/**
+	 * Changes with every placement and every rebuild, so whatever is worked out from the structure
+	 * can be kept until it does. Obstacles leave it alone: they change no surface.
+	 */
+	int32 GetStructureRevision() const
+	{
+		return StructureRevision;
+	}
+
+	/**
+	 * Every surface the placements since FromRevision may have changed - laid, built against, or
+	 * promoted to carry anything - in the order they changed, so what is worked out from the
+	 * structure can follow it a placement at a time instead of walking all of it again. False when
+	 * that cannot be told: the structure was rebuilt since, or it was too long ago to be kept.
+	 */
+	bool GatherSurfaceChangesSince(int32 FromRevision, TArray<FGridSurfaceRef>& OutSurfaces) const;
+
+	/**
+	 * Changes whenever the platform list is replaced or cleared - which also clears the obstacles -
+	 * so anything standing on the old structure knows to go.
+	 */
+	int32 GetRebuildGeneration() const
+	{
+		return RebuildGeneration;
+	}
+
+	/**
+	 * Reserves an inclusive box of cells against growth: no platform will be placed that covers any
+	 * of them. Returns a handle for RemoveObstacle.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Grid|Obstacles")
+	int32 AddObstacle(const FIntVector& MinCell, const FIntVector& MaxCell);
+
+	/** Gives an obstacle's cells back to growth. */
+	UFUNCTION(BlueprintCallable, Category = "Grid|Obstacles")
+	void RemoveObstacle(int32 Handle);
+
+	UFUNCTION(BlueprintCallable, Category = "Grid|Obstacles")
+	void ClearObstacles();
+
+	/**
+	 * The lattice pieces an obstacle box would cut, as world boxes: the insides of module faces,
+	 * the runs of module edges, and nodes. For drawing what an obstacle holds back.
+	 */
+	void GetObstaclePieceBounds(const FIntVector& MinCell, const FIntVector& MaxCell, TArray<FBox>& OutPieces) const;
+
 	/** Number of platforms standing in the cube. */
 	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
 	int32 GetPlatformCount() const;
@@ -617,7 +703,8 @@ public:
 	 * Its tile has to allow that orientation - horizontal or vertical - at all.
 	 * It has to sit on the lattice with its whole footprint inside the cube, taking no module
 	 * face already taken, with nothing built across its interior and no other interior under its
-	 * rim, and share at least one module edge with a platform already placed. It has to lie flush
+	 * rim, running through no obstacle, and share at least one module edge with a platform already
+	 * placed. It has to lie flush
 	 * with every platform it shares an edge with, in its plane or across it. For every platform
 	 * it would fold off - one it shares an edge with but faces across - every cell of each shared
 	 * edge's run must still offer a free wall surface on the side it would fold toward. Before
@@ -651,6 +738,9 @@ protected:
 	//~ End AActor Interface
 
 private:
+	/** Lets the automation tests read the candidate lists and the drift tally. */
+	friend struct FRoomManagerTestAccess;
+
 	/** How many colours the surface overlay has: all-object, wall, and occupied. A chunked layer each. */
 	static constexpr int32 SurfaceMarkLayerCount = 3;
 
@@ -863,7 +953,8 @@ private:
 	/**
 	 * Whether a platform on the grid would stand on nothing already built but rim it can share:
 	 * none of its module faces taken, nothing built along any module edge across its interior,
-	 * and no other platform's interior along the module edges around it. The half of
+	 * and no other platform's interior along the module edges around it. Nor may any of its
+	 * pieces - module faces, module edges and nodes, rim or interior - cut an obstacle. The half of
 	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well.
 	 */
 	bool IsSpaceFree(const FGridPlatform& Platform) const;
@@ -885,6 +976,15 @@ private:
 	/** Brings the usable tiles and the warnings about the rest up to date with Tiles, FirstTile and the module. */
 	void ResolveUsableTiles();
 
+	/** Works out the pieces every obstacle cuts afresh from Obstacles. */
+	void RebuildObstacleKeys();
+
+	/**
+	 * Drops every obstacle and counts a new generation: the platform list has just been replaced or
+	 * cleared, and whatever stood on the old structure stood on nothing that is still there.
+	 */
+	void BeginNewGeneration();
+
 	/**
 	 * Rebuilds everything derived from Platforms. Wholesale, so it cannot drift out of step -
 	 * which is also what makes it the reference AddPlacedPlatform is checked against.
@@ -894,9 +994,13 @@ private:
 	/**
 	 * Takes one newly placed platform into the derived state without rebuilding it: its module
 	 * faces, edges and rim, the surfaces it builds against, and the promotions that spread out
-	 * from it. Collects every surface whose capacity or occupancy may have changed, for the overlay.
+	 * from it. Collects every surface whose capacity or occupancy may have changed, for the overlay,
+	 * and records them for GatherSurfaceChangesSince.
 	 */
 	void AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGridSurfaceRef>& OutChangedSurfaces);
+
+	/** Records the surfaces the placement that made the current revision may have changed. */
+	void JournalSurfaceChanges(TConstArrayView<FGridSurfaceRef> Surfaces);
 
 	/**
 	 * Adds a platform to BuiltPlatforms and records what it takes in: its module faces, its
@@ -1037,6 +1141,30 @@ private:
 
 	/** Rim surfaces promoted to all-object, keyed by cell and face. */
 	TSet<uint64> PromotedFaces;
+
+	/**
+	 * The pieces of the lattice the obstacles cut, keyed as ModuleFaceOwners, ModuleEdgeUses and
+	 * the node cells are: module faces by min node and normal, module edges by node and axis,
+	 * nodes by cell. A placement taking in any of them is refused.
+	 */
+	TSet<uint64> ObstacleFaces;
+	TSet<uint64> ObstacleEdges;
+	TSet<uint64> ObstacleNodes;
+
+	/** The handle the next obstacle gets. Never reused within a run, so a stale handle removes nothing. */
+	int32 NextObstacleHandle = 1;
+
+	int32 StructureRevision = 0;
+	int32 RebuildGeneration = 0;
+
+	/**
+	 * The surfaces each recent placement may have changed, run after run, oldest first, and where
+	 * each run starts: run I is revision SurfaceJournalRevision + I + 1's. Only the last few
+	 * thousand placements are kept, and a rebuild starts the record over.
+	 */
+	TArray<FGridSurfaceRef> SurfaceJournal;
+	TArray<int32> SurfaceJournalStarts;
+	int32 SurfaceJournalRevision = 0;
 
 	/** The tiles growth draws from: Tiles, less empty entries, repeats, and any that do not fit the lattice. */
 	TArray<TObjectPtr<UPlatformTileData>> UsableTiles;
