@@ -11,5 +11,6 @@ public class WEM_2026EditorTarget : TargetRules
 		DefaultBuildSettings = BuildSettingsVersion.V7;
 		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_8;
 		ExtraModuleNames.Add("WEM_2026");
+		ExtraModuleNames.Add("WEM_2026Editor");
 	}
 }
