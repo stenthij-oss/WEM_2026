@@ -13,7 +13,12 @@ public class WEM_2026Editor : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"AssetRegistry",
+			"AssetTools",
 			"InputCore",
+			"InterchangeCore",
+			"InterchangeEngine",
+			"InterchangePipelines",
+			"Json",
 			"MeshDescription",
 			"MessageLog",
 			"PropertyEditor",

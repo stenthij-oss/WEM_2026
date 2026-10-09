@@ -7,10 +7,11 @@
 #include "PlacementGeometryCustomization.h"
 #include "PlacementTypes.h"
 #include "PropertyEditorModule.h"
+#include "StructureImporter.h"
 
 #define LOCTEXT_NAMESPACE "WEM_2026Editor"
 
-/** Editor-only tooling for WEM_2026: the placement catalog builder and the views of its data. */
+/** Editor-only tooling for WEM_2026: the placement catalog builder and the views of its data, and the structure importer. */
 class FWEM_2026EditorModule : public IModuleInterface
 {
 public:
@@ -24,6 +25,9 @@ public:
 		Options.bShowPages = true;
 		Options.bAllowClear = true;
 		MessageLogModule.RegisterLogListing(UPlacementCatalogBuilder::MessageLogName, LOCTEXT("PlacementCatalogLog", "Placement Catalog"), Options);
+
+		// And so does the structure importer.
+		MessageLogModule.RegisterLogListing(UStructureImporter::MessageLogName, LOCTEXT("StructureImportLog", "Structure Import"), Options);
 
 		// A footprint view wherever a mesh's placement geometry is shown.
 		FPropertyEditorModule& PropertyModule = FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
@@ -39,6 +43,7 @@ public:
 		{
 			FMessageLogModule& MessageLogModule = FModuleManager::GetModuleChecked<FMessageLogModule>("MessageLog");
 			MessageLogModule.UnregisterLogListing(UPlacementCatalogBuilder::MessageLogName);
+			MessageLogModule.UnregisterLogListing(UStructureImporter::MessageLogName);
 		}
 
 		if (FModuleManager::Get().IsModuleLoaded("PropertyEditor") && UObjectInitialized())

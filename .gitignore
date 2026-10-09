@@ -25,3 +25,6 @@ Saved/
 Desktop.ini
 .DS_Store
 Thumbs.db
+
+# Python bytecode, left by Blender running the structure scripts
+__pycache__/
