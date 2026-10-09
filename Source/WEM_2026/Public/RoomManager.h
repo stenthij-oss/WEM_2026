@@ -317,6 +317,18 @@ struct FSurfaceMarkLayer
  * nothing solid, no part in promotion. Only module edges are blocked, never nodes, so a panel
  * joining beside a wall that is not load-bearing can still share the post at its top corner.
  *
+ * A fence is a two-sided structure that carries on as a run of copies of itself. When a platform is
+ * filled with one, each end of it with room beyond is drawn for (FenceContinueChance), and an end
+ * that carries on waits in a queue. While anything waits, a beat places the next panel of the
+ * oldest waiting end instead of drawing a platform: the same fence on the same tile laid the same
+ * way round, straight on in the same plane - along the ground on a wall, along the fence's width
+ * across a floor - or, for a wall, round the beam at its end onto a wall facing the other way
+ * (FenceTurnChance). A panel that stands on something or hangs from it is preferred, so a parapet
+ * follows its roof's edge round a corner. An end that has reached a panel of its own fence - a run
+ * closing round a roof, or meeting another of the same fence - is closed. A platform a normal beat
+ * happens to lay on a waiting spot, laid as the run is, carries the run on. A fence that is not
+ * load-bearing may carry on across the edge its own run blocked.
+ *
  * Surfaces
  * --------
  * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
@@ -470,6 +482,20 @@ public:
 	/** How long a streak has to be to carry on with MaxContinueChance. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "2"))
 	int32 StreakForMaxChance = 4;
+
+	/**
+	 * The chance each end of a fence panel, with room beyond it, carries its run on by another panel.
+	 * Each end goes on for a run of panels of its own, on average p / (1 - p) of them.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float FenceContinueChance = 0.8f;
+
+	/**
+	 * The chance a wall fence that could both go straight on and turn the corner turns, split evenly
+	 * between the ways it could turn. Where it can only turn, it turns.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float FenceTurnChance = 0.25f;
 
 	/**
 	 * How large a patch of one category the average face sits in: the patches' sizes, each weighted
@@ -662,6 +688,10 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	FString DebugProbeCategories;
 
+	/** Whether that structure is a fence, and its platform a panel of a run. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	bool bDebugProbeInFenceRun = false;
+
 	/** True when the coordinate addresses a cell inside the cube. */
 	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
 	bool IsValidCell(const FIntVector& Cell) const;
@@ -791,12 +821,13 @@ public:
 	 * One beat of growth: rolls which kind to try first, then which tile, places one platform -
 	 * the other kind if the first has nowhere to go - and brings everything derived up to date.
 	 * The platform is drawn from the placement stream out of every free placement of that tile
-	 * across the whole structure at once. Returns false when neither kind fits anywhere.
+	 * across the whole structure at once. While a fence run waits to grow, the beat places its next
+	 * panel instead. Returns false when nothing fits anywhere.
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
 	bool PlaceNextPlatform();
 
-	/** Drops every platform and re-seeds the placement stream. Back to an empty cube. */
+	/** Drops every platform and every fence end waiting to grow, and re-seeds the streams. Back to an empty cube. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
 	void ClearPlatforms();
 
@@ -1216,6 +1247,72 @@ private:
 	bool PlacePlatformOfKind(EPlatformKind Kind);
 
 	/**
+	 * Takes a platform, fill and all, into the structure: the list, everything derived, the visuals,
+	 * and when it is a fence panel the ends its run may carry on from. JoinedSide is the end of a
+	 * panel that carries on a run, which is no end of it; zero for a panel starting one.
+	 */
+	void PlacePlatform(const FGridPlatform& Platform, int32 JoinedSide);
+
+	/** One end of a fence run waiting to grow: the panel it belongs to, fill and all, and which end of it. */
+	struct FFenceEnd
+	{
+		FGridPlatform Panel;
+
+		/** -1 for the end at the panel's min node along its run, +1 for the far end. */
+		int32 Side = 0;
+	};
+
+	/** Whether a platform is filled with a fence: a two-sided fence structure on both faces. */
+	static bool IsFencePanel(const FGridPlatform& Platform);
+
+	/** The in-plane axis a fence panel's run goes along: along the ground up a wall, along the fence's width across a floor. */
+	int32 GetRunAxis(const FGridPlatform& Panel) const;
+
+	/**
+	 * Whether Panel carries Previous's run on straight: the same fence, tile and way round, in the
+	 * same plane, beside it along the run. Asks nothing but the two platforms, so the rebuild answers
+	 * it as the placement did.
+	 */
+	bool IsRunContinuation(const FGridPlatform& Panel, const FGridPlatform& Previous) const;
+
+	/**
+	 * Where a run could carry on from one end: straight on, and for a wall round the beam at the end
+	 * either way. Each is filled with the run's fence.
+	 */
+	void GatherFenceContinuations(const FFenceEnd& End, FGridPlatform& OutStraight, TArray<FGridPlatform, TInlineAllocator<2>>& OutTurns) const;
+
+	/**
+	 * Whether a run has met itself at an end: one of the end's continuations already stands, a panel
+	 * of the same fence laid the same way. Such an end is closed rather than carried on elsewhere.
+	 */
+	bool IsFenceEndClosed(const FGridPlatform& Straight, TConstArrayView<FGridPlatform> Turns) const;
+
+	/** The end of a continuation of End that meets End: the side of it lying on End's beam. */
+	int32 GetJoinedSide(const FFenceEnd& End, const FGridPlatform& Continuation) const;
+
+	/**
+	 * Whether a platform stands on something: a wall when every module edge along its bottom, or
+	 * every one along its top, is used already - hanging counts. Floors and ceilings always do.
+	 */
+	bool StandsOnSomething(const FGridPlatform& Platform) const;
+
+	/**
+	 * For each end of a newly placed fence panel with room left beyond it, draws whether its run
+	 * carries on, and queues the end if so.
+	 */
+	void QueueFenceEnds(const FGridPlatform& Panel, int32 JoinedSide);
+
+	/** A fence beat: places the next panel of the oldest waiting end that still has somewhere to go. False when none has. */
+	bool PlaceFencePanel();
+
+	/**
+	 * Whether a platform a normal beat is about to place lands on a waiting end's continuation, laid
+	 * as its run is. If so it carries the run on: it is filled with the fence and the end is taken
+	 * off the queue.
+	 */
+	bool TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoinedSide);
+
+	/**
 	 * Rebuilds the derived state and the visuals from scratch and reports anything the placements
 	 * had built up differently. Driven by wem.RoomManager.VerifyEvery; the rebuild is kept either way.
 	 */
@@ -1436,6 +1533,12 @@ private:
 	 * drawn as they would be with no structures at all.
 	 */
 	FRandomStream StructureStream;
+
+	/**
+	 * Fence ends waiting to grow, oldest first. Beat state, like the streams: never saved, kept by a
+	 * rebuild, emptied by ClearPlatforms. Each is judged again when it is used.
+	 */
+	TArray<FFenceEnd> FenceQueue;
 
 	FTimerHandle PlacementTimerHandle;
 

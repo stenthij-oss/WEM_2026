@@ -433,8 +433,25 @@ bool FStructureFillVerifyLongTest::RunTest(const FString& Parameters)
 
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
-	const TArray<TObjectPtr<UPlatformStructureData>> Structures = MakeMixed(Rooted);
+	// Everything at once: two- and one-sided fills, categories, structures that are not load-bearing,
+	// and fences on walls and floors.
+	TArray<TObjectPtr<UPlatformStructureData>> Structures = MakeMixed(Rooted);
 	AddCategories(Structures, Rooted);
+
+	UPlatformStructureData* LightSlab = MakeStructure(TEXT("TestLightSlab"), 16, 16, AllTypes, true, /*bMayLieSideways=*/true);
+	UPlatformStructureData* Railing = MakeStructure(TEXT("TestRailing"), 8, 8, EStructureType::Wall, true);
+	UPlatformStructureData* Parapet = MakeStructure(TEXT("TestParapet"), 16, 8, EStructureType::Wall, true);
+	UPlatformStructureData* Boardwalk = MakeStructure(TEXT("TestBoardwalk"), 16, 16, EStructureType::Ground | EStructureType::Ceiling, true);
+	LightSlab->bLoadBearing = false;
+	LightSlab->Weight = 0.3f;
+	Railing->bFence = true;
+	Parapet->bFence = true;
+	Parapet->bLoadBearing = false;
+	Boardwalk->bFence = true;
+	Boardwalk->bLoadBearing = false;
+	Structures.Append({ LightSlab, Railing, Parapet, Boardwalk });
+	Rooted.Append({ LightSlab, Railing, Parapet, Boardwalk });
+
 	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
 	Manager->bShowPieces = true;
 	Manager->GridSize = 257;

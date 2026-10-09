@@ -108,6 +108,18 @@ struct FRoomManagerTestAccess
 		return Sorted;
 	}
 
+	/** Places a platform as it is, fill and all, the way a beat does once it has drawn one - fence ends included. */
+	static void Place(ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		Manager.PlacePlatform(Platform, 0);
+	}
+
+	/** How many fence ends wait to grow. */
+	static int32 GetWaitingFenceEnds(const ARoomManager& Manager)
+	{
+		return Manager.FenceQueue.Num();
+	}
+
 	/** A face's streak in a category, or zero when its structure does not carry it. */
 	static int32 GetStreak(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign, const UStructureCategory* Category)
 	{

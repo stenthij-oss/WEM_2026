@@ -1246,13 +1246,22 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		}
 	}
 
-	// The fill is drawn with the platform, before it is taken in, since what fills a face decides what
-	// that face carries. The platform that starts growth holds up everything that grows off it.
-	if (!DrawFill(Platform, /*bLoadBearingOnly=*/BuiltPlatforms.IsEmpty()))
+	// A platform landing where a fence run waits to carry on, laid as the run is, carries it on.
+	// Anything else is filled as drawn, with the platform and before it is taken in, since what fills a
+	// face decides what that face carries. The platform that starts growth holds up all the rest.
+	int32 JoinedSide = 0;
+
+	if (!TakeWaitingFenceSpot(Platform, JoinedSide) && !DrawFill(Platform, /*bLoadBearingOnly=*/BuiltPlatforms.IsEmpty()))
 	{
 		return false;
 	}
 
+	PlacePlatform(Platform, JoinedSide);
+	return true;
+}
+
+void ARoomManager::PlacePlatform(const FGridPlatform& Platform, const int32 JoinedSide)
+{
 	Platforms.Add(Platform);
 
 	TArray<FGridSurfaceRef> ChangedSurfaces;
@@ -1268,11 +1277,334 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		VerifyIncrementalState();
 	}
 
-	return true;
+	// Taken in first, so the room each end has left is judged with this panel standing.
+	if (IsFencePanel(Platform))
+	{
+		QueueFenceEnds(Platform, JoinedSide);
+	}
+}
+
+bool ARoomManager::IsFencePanel(const FGridPlatform& Platform)
+{
+	const UPlatformStructureData* Fence = Platform.PositiveStructure;
+
+	return Fence && Fence == Platform.NegativeStructure && Fence->bFence && Fence->bTwoSided;
+}
+
+int32 ARoomManager::GetRunAxis(const FGridPlatform& Panel) const
+{
+	const int32 NormalAxis = AxisIndex(Panel.Normal);
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// Up a wall the run keeps to the ground, whichever way the fence is laid.
+	if (Panel.GetKind() == EPlatformKind::SurfaceVertical)
+	{
+		return U;
+	}
+
+	// Across a floor it goes the way the fence's width does: along the first axis as authored, the
+	// second when the fence is turned to fit.
+	int32 SpanU, SpanV;
+	GetPlatformSpans(Panel, SpanU, SpanV);
+
+	bool bTurned = false;
+	if (const UPlatformStructureData* Fence = Panel.PositiveStructure)
+	{
+		WEMStructures::FitsShape(Fence->Width, Fence->Length, Fence->bMayLieSideways, NormalAxis, SpanU, SpanV, bTurned);
+	}
+
+	return bTurned ? V : U;
+}
+
+bool ARoomManager::IsRunContinuation(const FGridPlatform& Panel, const FGridPlatform& Previous) const
+{
+	if (!IsFencePanel(Panel) || !IsFencePanel(Previous)
+		|| Panel.PositiveStructure != Previous.PositiveStructure
+		|| Panel.Tile != Previous.Tile
+		|| Panel.bTurned != Previous.bTurned
+		|| Panel.Normal != Previous.Normal)
+	{
+		return false;
+	}
+
+	const int32 NormalAxis = AxisIndex(Panel.Normal);
+	int32 SpanU, SpanV;
+
+	if (Panel.MinNode[NormalAxis] != Previous.MinNode[NormalAxis] || !GetPlatformSpans(Panel, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	const int32 RunAxis = GetRunAxis(Panel);
+	const int32 AcrossAxis = RunAxis == U ? V : U;
+	const int32 RunSpan = RunAxis == U ? SpanU : SpanV;
+
+	return Panel.MinNode[AcrossAxis] == Previous.MinNode[AcrossAxis]
+		&& FMath::Abs(Panel.MinNode[RunAxis] - Previous.MinNode[RunAxis]) == RunSpan;
+}
+
+void ARoomManager::GatherFenceContinuations(
+	const FFenceEnd& End,
+	FGridPlatform& OutStraight,
+	TArray<FGridPlatform, TInlineAllocator<2>>& OutTurns) const
+{
+	const FGridPlatform& Panel = End.Panel;
+	const int32 NormalAxis = AxisIndex(Panel.Normal);
+
+	int32 SpanU, SpanV, U, V;
+	GetPlatformSpans(Panel, SpanU, SpanV);
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	const int32 RunAxis = GetRunAxis(Panel);
+	const int32 RunSpan = RunAxis == U ? SpanU : SpanV;
+
+	// Straight on: the same panel, a span further along the run.
+	OutStraight = Panel;
+	OutStraight.MinNode[RunAxis] += End.Side * RunSpan;
+
+	OutTurns.Reset();
+
+	if (Panel.GetKind() != EPlatformKind::SurfaceVertical)
+	{
+		return;
+	}
+
+	// Round the corner: a wall facing along the run, standing in the plane of the beam at this end and
+	// reaching away from this wall's plane, either way. Its first axis is this wall's normal, so laid
+	// from the same tile the same way round it has the same shape, and the fence fills it as it fills
+	// this one.
+	const int32 EndCoordinate = Panel.MinNode[RunAxis] + (End.Side > 0 ? RunSpan : 0);
+
+	for (const int32 Away : { 1, -1 })
+	{
+		FGridPlatform& Turn = OutTurns.Add_GetRef(Panel);
+		Turn.Normal = static_cast<EGridAxis>(RunAxis);
+		Turn.MinNode[RunAxis] = EndCoordinate;
+		Turn.MinNode[NormalAxis] = Away > 0 ? Panel.MinNode[NormalAxis] : Panel.MinNode[NormalAxis] - SpanU;
+	}
+}
+
+bool ARoomManager::IsFenceEndClosed(const FGridPlatform& Straight, const TConstArrayView<FGridPlatform> Turns) const
+{
+	auto IsStanding = [this](const FGridPlatform& Spot)
+	{
+		const int32* Owner = ModuleFaceOwners.Find(MakePlatformKey(Spot));
+
+		if (!Owner)
+		{
+			return false;
+		}
+
+		const FGridPlatform& Standing = BuiltPlatforms[*Owner];
+
+		return Standing.MinNode == Spot.MinNode && Standing.Normal == Spot.Normal && Standing.Tile == Spot.Tile
+			&& Standing.bTurned == Spot.bTurned && IsFencePanel(Standing) && Standing.PositiveStructure == Spot.PositiveStructure;
+	};
+
+	return IsStanding(Straight) || Turns.ContainsByPredicate(IsStanding);
+}
+
+int32 ARoomManager::GetJoinedSide(const FFenceEnd& End, const FGridPlatform& Continuation) const
+{
+	// Straight on, the end facing back meets it.
+	if (Continuation.Normal == End.Panel.Normal)
+	{
+		return -End.Side;
+	}
+
+	// Round a corner, the continuation's run goes along the first panel's normal, and the end of it
+	// in the first panel's plane is the one at the beam.
+	const int32 FirstNormal = AxisIndex(End.Panel.Normal);
+	return Continuation.MinNode[FirstNormal] == End.Panel.MinNode[FirstNormal] ? -1 : 1;
+}
+
+bool ARoomManager::StandsOnSomething(const FGridPlatform& Platform) const
+{
+	if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal)
+	{
+		return true;
+	}
+
+	int32 SpanU, SpanV, U, V;
+	GetPlatformSpans(Platform, SpanU, SpanV);
+	GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+	// Up a wall the second axis is up, so its rim along the first runs along its bottom and its top.
+	bool bBottomUsed = true;
+	bool bTopUsed = true;
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, GetModule(), [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (!bRim || Edge.Axis != U)
+		{
+			return;
+		}
+
+		const bool bUsed = ModuleEdgeUses.Contains(MakeEdgeKey(Edge));
+		bool& bSideUsed = Edge.Node[V] == Platform.MinNode[V] ? bBottomUsed : bTopUsed;
+		bSideUsed = bSideUsed && bUsed;
+	});
+
+	return bBottomUsed || bTopUsed;
+}
+
+void ARoomManager::QueueFenceEnds(const FGridPlatform& Panel, const int32 JoinedSide)
+{
+	for (const int32 Side : { -1, 1 })
+	{
+		if (Side == JoinedSide)
+		{
+			continue;
+		}
+
+		const FFenceEnd End{ Panel, Side };
+
+		FGridPlatform Straight;
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		GatherFenceContinuations(End, Straight, Turns);
+
+		// Only an end with a free spot beyond it is drawn for; one already closed off is no end of a run,
+		// and nor is one that has met its own fence.
+		bool bHasRoom = IsPlatformOnGrid(Straight) && IsSpaceFree(Straight);
+
+		for (const FGridPlatform& Turn : Turns)
+		{
+			bHasRoom = bHasRoom || (IsPlatformOnGrid(Turn) && IsSpaceFree(Turn));
+		}
+
+		bHasRoom = bHasRoom && !IsFenceEndClosed(Straight, Turns);
+
+		if (bHasRoom && StructureStream.FRand() < FenceContinueChance)
+		{
+			FenceQueue.Add(End);
+		}
+	}
+}
+
+bool ARoomManager::PlaceFencePanel()
+{
+	while (!FenceQueue.IsEmpty())
+	{
+		const FFenceEnd End = FenceQueue[0];
+		FenceQueue.RemoveAt(0, EAllowShrinking::No);
+
+		// A run of a fence no longer among the structures stops where it is.
+		if (!UsableStructures.Contains(End.Panel.PositiveStructure))
+		{
+			continue;
+		}
+
+		FGridPlatform Straight;
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		GatherFenceContinuations(End, Straight, Turns);
+
+		// A run that has met its own fence here since the end was queued - closing round a roof, or
+		// meeting another run of it - stops rather than heading off somewhere else.
+		if (IsFenceEndClosed(Straight, Turns))
+		{
+			continue;
+		}
+
+		// Only the spots still free, and legal to place on now.
+		bool bStraight = CanPlacePlatform(Straight);
+		Turns.RemoveAll([this](const FGridPlatform& Turn) { return !CanPlacePlatform(Turn); });
+
+		// Where any of them stands on something - a floor's edge under it, a ceiling's above it - only
+		// those are kept, so a parapet follows its roof's edge round a corner rather than running off
+		// into the air.
+		const bool bStraightStands = bStraight && StandsOnSomething(Straight);
+		const bool bTurnStands = Turns.ContainsByPredicate([this](const FGridPlatform& Turn) { return StandsOnSomething(Turn); });
+
+		if (bStraightStands || bTurnStands)
+		{
+			bStraight = bStraightStands;
+			Turns.RemoveAll([this](const FGridPlatform& Turn) { return !StandsOnSomething(Turn); });
+		}
+
+		if (!bStraight && Turns.IsEmpty())
+		{
+			continue;
+		}
+
+		// Straight on when nothing else is left, round a corner when only that is, and where both are,
+		// round a corner with FenceTurnChance, split evenly between the ways left.
+		FGridPlatform Panel = Straight;
+
+		if (!bStraight)
+		{
+			Panel = Turns[Turns.Num() > 1 ? StructureStream.RandRange(0, Turns.Num() - 1) : 0];
+		}
+		else if (!Turns.IsEmpty())
+		{
+			const float Roll = StructureStream.FRand();
+
+			if (Roll < FenceTurnChance)
+			{
+				Panel = Turns[FMath::Min(FMath::FloorToInt32(Roll / FenceTurnChance * Turns.Num()), Turns.Num() - 1)];
+			}
+		}
+
+		PlacePlatform(Panel, GetJoinedSide(End, Panel));
+		return true;
+	}
+
+	return false;
+}
+
+bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoinedSide)
+{
+	OutJoinedSide = 0;
+
+	for (int32 Index = 0; Index < FenceQueue.Num(); ++Index)
+	{
+		const FFenceEnd& End = FenceQueue[Index];
+
+		if (End.Panel.Tile != Platform.Tile || End.Panel.bTurned != Platform.bTurned || !UsableStructures.Contains(End.Panel.PositiveStructure))
+		{
+			continue;
+		}
+
+		FGridPlatform Straight;
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		GatherFenceContinuations(End, Straight, Turns);
+
+		auto IsSpot = [&Platform](const FGridPlatform& Spot)
+		{
+			return Spot.MinNode == Platform.MinNode && Spot.Normal == Platform.Normal;
+		};
+
+		const FGridPlatform* Spot = IsSpot(Straight) ? &Straight : Turns.FindByPredicate(IsSpot);
+
+		// Laid there, it would have to be a legal next panel, fence and all.
+		if (!Spot || !CanPlacePlatform(*Spot))
+		{
+			continue;
+		}
+
+		Platform.PositiveStructure = Spot->PositiveStructure;
+		Platform.NegativeStructure = Spot->NegativeStructure;
+		OutJoinedSide = GetJoinedSide(End, *Spot);
+
+		FenceQueue.RemoveAt(Index);
+		return true;
+	}
+
+	return false;
 }
 
 bool ARoomManager::PlaceNextPlatform()
 {
+	// A fence run waiting to grow takes the beat before anything else, a panel a beat.
+	if (PlaceFencePanel())
+	{
+		return true;
+	}
+
 	// The roll only decides which kind is tried first. When the chosen kind has nowhere to go
 	// the other one takes the beat, so the opening beat lays the first platform however it
 	// falls, and a beat is lost only when neither kind can be placed.
@@ -1287,6 +1619,7 @@ bool ARoomManager::PlaceNextPlatform()
 void ARoomManager::ClearPlatforms()
 {
 	Platforms.Reset();
+	FenceQueue.Reset();
 
 	ResetPlacementStream();
 	BeginNewGeneration();
@@ -1445,12 +1778,21 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 		}
 	});
 
-	// An edge a platform that is not load-bearing has blocked holds nothing further, rim or interior.
+	// An edge a platform that is not load-bearing has blocked holds nothing further, rim or interior -
+	// except the next panel of a fence run the blocking panel belongs to, which carries on across it.
 	if (bFree && !BlockedEdges.IsEmpty())
 	{
 		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
 		{
-			bFree = bFree && !BlockedEdges.Contains(MakeEdgeKey(Edge));
+			if (!bFree)
+			{
+				return;
+			}
+
+			if (const int32* Blocker = BlockedEdges.Find(MakeEdgeKey(Edge)))
+			{
+				bFree = IsRunContinuation(Platform, BuiltPlatforms[*Blocker]);
+			}
 		});
 	}
 
@@ -3096,6 +3438,7 @@ void ARoomManager::UpdateDebugReadouts()
 	bDebugProbeSurfaceOccupied = false;
 	DebugProbeStructure = nullptr;
 	DebugProbeCategories.Reset();
+	bDebugProbeInFenceRun = false;
 
 	if (CellSize <= 0.0f)
 	{
@@ -3188,6 +3531,7 @@ void ARoomManager::UpdateDebugReadouts()
 	const FFaceFill& Fill = FaceFills[FaceIndex];
 	const FGridPlatform& OwnerPlatform = BuiltPlatforms[InteriorOwner];
 	DebugProbeStructure = FaceSign(DebugProbeSurface.Face) > 0 ? OwnerPlatform.PositiveStructure : OwnerPlatform.NegativeStructure;
+	bDebugProbeInFenceRun = IsFencePanel(OwnerPlatform);
 
 	TArray<FString> Streaks;
 	for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)
