@@ -1226,22 +1226,33 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		}
 
 		const TArray<FGridPlatform>& Candidates = TileCandidates[ChosenTile].ByKind[KindIndex(Kind)];
+		const UPlatformTileData* Tile = TileCandidates[ChosenTile].Tile;
 
-		// Drawn by place among the fillable ones, which are all of them unless a way round has no
-		// fill. Copied out, since taking the platform in changes the list it was drawn from.
-		const int32 Fillable = Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
+		// Drawn by place among the fillable ones. Copied out, since taking the platform in changes the
+		// list it was drawn from. Where every way the tile is listed can be filled - nearly always - every
+		// placement is fillable, and the draw is the same without counting them.
+		const uint8 ListedWays = Tile->bCanTurn && Tile->Width != Tile->Length ? (AsLaidWay | TurnedWay) : AsLaidWay;
+
+		if ((GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays)
 		{
-			return IsFillable(ChosenTile, Candidate);
-		});
-
-		int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
-
-		for (const FGridPlatform& Candidate : Candidates)
+			Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
+		}
+		else
 		{
-			if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
+			const int32 Fillable = Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
 			{
-				Platform = Candidate;
-				break;
+				return IsFillable(ChosenTile, Candidate);
+			});
+
+			int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
+
+			for (const FGridPlatform& Candidate : Candidates)
+			{
+				if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
+				{
+					Platform = Candidate;
+					break;
+				}
 			}
 		}
 	}

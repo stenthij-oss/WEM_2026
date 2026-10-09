@@ -64,6 +64,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Meshes", meta = (ClampMin = "0"))
 	int32 NaniteTriangleThreshold = 10000;
 
+	/** Imports every structure again on the next import, changed or not, and then turns itself off. */
+	UPROPERTY(EditAnywhere, Category = "Sources")
+	bool bReimportAll = false;
+
 	/** What the last import did, structure by structure. */
 	UPROPERTY(VisibleAnywhere, Category = "Report", meta = (MultiLine = "true"))
 	FString LastReport;
@@ -105,11 +109,18 @@ private:
 	/** The structure asset of that name, made in Folder when there is none yet. */
 	UPlatformStructureData* FindOrCreateStructure(const FString& Folder, const FString& AssetName, bool& bOutCreated) const;
 
-	/** Gives material slots named after a material in MaterialFolder that material. */
+	/**
+	 * Gives material slots named after a material in MaterialFolder that material, and lets every
+	 * material of the project's own on the mesh be drawn instanced.
+	 */
 	void MapMaterials(UStaticMesh& Mesh, FImportResult& Result) const;
 
-	/** Adds structures to every room manager in the open level that does not list them yet, as one undoable step. Returns how many room managers took them. */
-	int32 AddToRoomManagers(TConstArrayView<UPlatformStructureData*> NewStructures) const;
+	/**
+	 * Adds structures to every room manager in the open level that does not list them yet, as one
+	 * undoable step, and rebuilds those - or all of them, when asked, so they draw meshes imported
+	 * again. Returns how many room managers took new structures.
+	 */
+	int32 AddToRoomManagers(TConstArrayView<UPlatformStructureData*> NewStructures, bool bRebuildAll) const;
 
 	/** Writes CategoryListFile. Returns how many categories it lists, or INDEX_NONE when it could not be written. */
 	int32 WriteCategoryListFile(FString& OutPath) const;

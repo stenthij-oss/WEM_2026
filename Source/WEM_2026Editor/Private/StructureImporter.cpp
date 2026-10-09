@@ -14,11 +14,14 @@
 #include "HAL/FileManager.h"
 #include "IAssetTools.h"
 #include "InterchangeGenericAssetsPipeline.h"
+#include "InterchangeGenericMaterialPipeline.h"
 #include "InterchangeManager.h"
 #include "Logging/MessageLog.h"
 #include "Logging/TokenizedMessage.h"
+#include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
+#include "ObjectTools.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
@@ -86,9 +89,12 @@ namespace StructureImporterPrivate
 	}
 
 	/**
-	 * The engine's own glTF pipelines, as an import would use them, except that everything lands
-	 * straight in the destination folder: the defaults put each file's assets in a folder named after
-	 * it, and a folder per asset type below that.
+	 * The engine's own pipeline for glTF assets, as an import would use it, except that everything
+	 * lands straight in the destination folder - the defaults put each file's assets in a folder named
+	 * after it, and a folder per asset type below that - and materials come in as materials of the
+	 * project's own. The engine's glTF pipeline is left out: it makes instances of glTF parent materials
+	 * in the engine's content, which may not be drawn instanced, and the room manager draws every
+	 * structure instanced.
 	 */
 	UInterchangePipelineStackOverride* MakePipelineStack()
 	{
@@ -101,15 +107,13 @@ namespace StructureImporterPrivate
 		{
 			Assets->bSceneNameSubFolder = false;
 			Assets->bAssetTypeSubFolders = false;
+
+			if (Assets->MaterialPipeline)
+			{
+				Assets->MaterialPipeline->MaterialImport = EInterchangeMaterialImportOption::ImportAsMaterials;
+			}
+
 			Stack->AddPipeline(Assets);
-		}
-
-		const UInterchangePipelineBase* DefaultGLTF = LoadObject<UInterchangePipelineBase>(
-			nullptr, TEXT("/Interchange/Pipelines/DefaultGLTFPipeline.DefaultGLTFPipeline"));
-
-		if (DefaultGLTF)
-		{
-			Stack->AddPipeline(DuplicateObject(DefaultGLTF, GetTransientPackage()));
 		}
 
 		return Stack;
@@ -195,7 +199,15 @@ void UStructureImporter::Import()
 		}
 	}
 
-	const int32 RoomManagers = AddToRoomManagers(NewStructures);
+	// Any structure brought in again has a new mesh, which the room managers draw only once they rebuild.
+	const bool bAnyUpdated = Results.Num() - NewStructures.Num() - Unchanged - Failed > 0;
+	const int32 RoomManagers = AddToRoomManagers(NewStructures, bAnyUpdated);
+
+	if (bReimportAll)
+	{
+		Modify();
+		bReimportAll = false;
+	}
 
 	const FString Summary = FString::Printf(
 		TEXT("%d settings file(s) in %s: %d new, %d updated, %d unchanged, %d failed. New structures added to %d room manager(s)."),
@@ -340,11 +352,19 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 	const FString Hash = WEMStructureImport::HashFiles({ MeshFile, SettingsPath });
 	UPlatformStructureData* Previous = Existing.IsValid() ? Cast<UPlatformStructureData>(Existing.GetAsset()) : nullptr;
 
-	if (Previous && Previous->Mesh && !Hash.IsEmpty() && Previous->ImportHash == Hash)
+	if (Previous && Previous->Mesh && !Hash.IsEmpty() && Previous->ImportHash == Hash && !bReimportAll)
 	{
 		Result.Structure = Previous;
 		Result.Outcome = TEXT("unchanged");
 		return;
+	}
+
+	// A changed structure comes in afresh rather than as a re-import over its old mesh: a re-import only
+	// looks for the materials the mesh had, so new or changed ones would never come in. Nothing but
+	// the structure asset holds the mesh, and that is pointed at the new one below.
+	if (UStaticMesh* OldMesh = Previous ? LoadObject<UStaticMesh>(nullptr, *MakeObjectPath(Folder, MeshName), nullptr, LOAD_NoWarn | LOAD_Quiet) : nullptr)
+	{
+		ObjectTools::ForceDeleteObjects({ OldMesh }, /*ShowConfirmation=*/false);
 	}
 
 	UAssetImportTask* Task = NewObject<UAssetImportTask>();
@@ -509,6 +529,25 @@ void UStructureImporter::MapMaterials(UStaticMesh& Mesh, FImportResult& Result) 
 			Mesh.SetMaterial(Slot, Material);
 			Result.Notes.Add(FString::Printf(TEXT("slot %s takes %s"), *SlotName, *Material->GetPathName()));
 		}
+
+		// The room manager draws every structure instanced, which a material has to allow, or the
+		// default material is drawn in its place. A material of the project's own is given that; one
+		// from elsewhere cannot be changed here, so it is reported.
+		UMaterial* Base = Mesh.GetMaterial(Slot) ? Mesh.GetMaterial(Slot)->GetMaterial() : nullptr;
+
+		if (Base && !Base->GetUsageByFlag(MATUSAGE_InstancedStaticMeshes))
+		{
+			if (Base->GetPackage()->GetName().StartsWith(TEXT("/Game/")))
+			{
+				Base->SetMaterialUsage(MATUSAGE_InstancedStaticMeshes);
+				Base->MarkPackageDirty();
+			}
+			else
+			{
+				Result.Notes.Add(FString::Printf(TEXT("slot %s's material %s may not be drawn instanced, so the room manager draws the default material there; give the slot a material of the project's"),
+					*SlotName, *Base->GetPathName()));
+			}
+		}
 	}
 }
 
@@ -533,11 +572,11 @@ UPlatformStructureData* UStructureImporter::FindOrCreateStructure(const FString&
 	return Created;
 }
 
-int32 UStructureImporter::AddToRoomManagers(const TConstArrayView<UPlatformStructureData*> NewStructures) const
+int32 UStructureImporter::AddToRoomManagers(const TConstArrayView<UPlatformStructureData*> NewStructures, const bool bRebuildAll) const
 {
 	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
 
-	if (!World || NewStructures.IsEmpty())
+	if (!World || (NewStructures.IsEmpty() && !bRebuildAll))
 	{
 		return 0;
 	}
@@ -565,12 +604,13 @@ int32 UStructureImporter::AddToRoomManagers(const TConstArrayView<UPlatformStruc
 			}
 		}
 
-		if (bModified)
+		if (bModified || bRebuildAll)
 		{
 			// Taken in as an edit in the Details panel would be: the room manager rebuilds from its list.
 			Manager->PostEditChange();
-			++Changed;
 		}
+
+		Changed += bModified ? 1 : 0;
 	}
 
 	return Changed;

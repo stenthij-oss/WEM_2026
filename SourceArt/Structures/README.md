@@ -111,6 +111,11 @@ first. Or name the material slot after an Unreal material and put that material 
 `/Game/Structures/Materials`: the importer gives the slot that material instead of the imported one.
 Materials of the same name in one size folder are shared, so give different materials different names.
 
+The room manager draws structures instanced, which a material has to allow. The importer turns that
+on for every material in the project a structure uses; a material from outside the project (an
+engine or plugin material) cannot be changed, and the report says so - the default checker is drawn
+in its place.
+
 ## In this folder
 
 - `wem_structures.py`: the add-on.
