@@ -1445,6 +1445,15 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 		}
 	});
 
+	// An edge a platform that is not load-bearing has blocked holds nothing further, rim or interior.
+	if (bFree && !BlockedEdges.IsEmpty())
+	{
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
+		{
+			bFree = bFree && !BlockedEdges.Contains(MakeEdgeKey(Edge));
+		});
+	}
+
 	if (!bFree || (ObstacleFaces.IsEmpty() && ObstacleEdges.IsEmpty() && ObstacleNodes.IsEmpty()))
 	{
 		return bFree;
@@ -2053,6 +2062,8 @@ void ARoomManager::RebuildPlatformState()
 	ModuleEdgeUses.Reset();
 	RimCellNormals.Reset();
 	PromotedFaces.Reset();
+	RimEdgeUsers.Reset();
+	BlockedEdges.Reset();
 	FaceFills.Reset();
 	PatchParents.Reset();
 	PatchSizes.Reset();
@@ -2386,9 +2397,36 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 		ModuleFaceOwners.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis), PlatformIndex);
 	});
 
-	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [this](const FLatticeEdge& Edge, const bool bRim)
+	// A platform that is not load-bearing blocks beams of its rim as it is taken in: a wall the ones
+	// along its top, the far side of its second axis, which is up; a floor or ceiling every one no
+	// platform used before it, which leaves the ones it grew from open.
+	const bool bBlocks = !IsLoadBearing(Platform);
+	const bool bVertical = Platform.GetKind() == EPlatformKind::SurfaceVertical;
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
-		ModuleEdgeUses.FindOrAdd(MakeEdgeKey(Edge)) |= bRim ? RimEdgeUse : InteriorEdgeUse;
+		const uint64 EdgeKey = MakeEdgeKey(Edge);
+
+		if (bRim && bBlocks)
+		{
+			const bool bTop = Edge.Axis == U && Edge.Node[V] == Platform.MinNode[V] + SpanV;
+			const bool bFree = !ModuleEdgeUses.Contains(EdgeKey);
+
+			if (bVertical ? bTop : bFree)
+			{
+				BlockedEdges.FindOrAdd(EdgeKey, PlatformIndex);
+			}
+		}
+
+		ModuleEdgeUses.FindOrAdd(EdgeKey) |= bRim ? RimEdgeUse : InteriorEdgeUse;
+
+		if (bRim)
+		{
+			++RimEdgeUsers.FindOrAdd(EdgeKey);
+		}
 	});
 
 	// A cell of rim can be rim to platforms facing two ways, and a node to all three; each
@@ -2501,6 +2539,8 @@ void ARoomManager::VerifyIncrementalState()
 	const TMap<uint64, int32> IncrementalFaceOwners = ModuleFaceOwners;
 	const TMap<uint64, uint8> IncrementalEdgeUses = ModuleEdgeUses;
 	const TMap<uint64, uint8> IncrementalRimCellNormals = RimCellNormals;
+	const TMap<uint64, int32> IncrementalRimEdgeUsers = RimEdgeUsers;
+	const TMap<uint64, int32> IncrementalBlockedEdges = BlockedEdges;
 	const TSet<uint64> IncrementalPromotedFaces = PromotedFaces;
 	const TSet<uint64> IncrementalObstacleFaces = ObstacleFaces;
 	const TSet<uint64> IncrementalObstacleEdges = ObstacleEdges;
@@ -2564,6 +2604,8 @@ void ARoomManager::VerifyIncrementalState()
 	CompareMaps(TEXT("module faces"), IncrementalFaceOwners, ModuleFaceOwners);
 	CompareMaps(TEXT("module edges"), IncrementalEdgeUses, ModuleEdgeUses);
 	CompareMaps(TEXT("rim cells"), IncrementalRimCellNormals, RimCellNormals);
+	CompareMaps(TEXT("rim edge users"), IncrementalRimEdgeUsers, RimEdgeUsers);
+	CompareMaps(TEXT("blocked edges"), IncrementalBlockedEdges, BlockedEdges);
 	CompareKeySets(TEXT("promoted surfaces"), IncrementalPromotedFaces, PromotedFaces);
 	CompareKeySets(TEXT("obstacle faces"), IncrementalObstacleFaces, ObstacleFaces);
 	CompareKeySets(TEXT("obstacle edges"), IncrementalObstacleEdges, ObstacleEdges);
@@ -2699,12 +2741,13 @@ uint8 ARoomManager::GetCellSurfaceAxes(const FIntVector& Cell, int32& OutInterio
 		return 0;
 	}
 
-	// Rim can have been brought by any of several platforms, so it is recorded.
+	// Rim can have been brought by any of several platforms, so it is recorded. A beam or post every
+	// platform around it has blocked is not built, and is nothing at all.
 	if (LatticePlaneCount >= 2)
 	{
 		if (const uint8* RimAxes = RimCellNormals.Find(MakeCellKey(Cell)))
 		{
-			return *RimAxes;
+			return BlockedEdges.IsEmpty() || IsRimCellBuilt(Cell, LatticePlaneCount) ? *RimAxes : 0;
 		}
 	}
 
@@ -2778,6 +2821,45 @@ bool ARoomManager::IsFaceBlocked(const FGridPlatform& Platform, const EGridFace 
 	const UPlatformStructureData* Structure = FaceSign(Face) > 0 ? Platform.PositiveStructure : Platform.NegativeStructure;
 
 	return Structure && !Structure->bHoldsItems;
+}
+
+bool ARoomManager::IsLoadBearing(const FGridPlatform& Platform)
+{
+	return (!Platform.PositiveStructure || Platform.PositiveStructure->bLoadBearing)
+		&& (!Platform.NegativeStructure || Platform.NegativeStructure->bLoadBearing);
+}
+
+bool ARoomManager::IsEdgeBuilt(const uint64 EdgeKey) const
+{
+	// The platform that blocked an edge uses it too, so it is built only where another uses it as well.
+	return RimEdgeUsers.FindRef(EdgeKey) > (BlockedEdges.Contains(EdgeKey) ? 1 : 0);
+}
+
+bool ARoomManager::IsNodeBuilt(const FIntVector& Node) const
+{
+	const int32 Module = GetModule();
+
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		// The beams that end here: the one starting at it along each axis, and the one ending at it.
+		if (IsEdgeBuilt(MakeEdgeKey(FLatticeEdge{ Node, Axis })) || IsEdgeBuilt(MakeEdgeKey(FLatticeEdge{ Node - AxisStep(Axis, Module), Axis })))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ARoomManager::IsRimCellBuilt(const FIntVector& Cell, const int32 LatticePlaneCount) const
+{
+	if (LatticePlaneCount >= 3)
+	{
+		return IsNodeBuilt(Cell);
+	}
+
+	FLatticeEdge Edge;
+	return GetRunEdge(Cell, GetModule(), Edge) && IsEdgeBuilt(MakeEdgeKey(Edge));
 }
 
 bool ARoomManager::IsSolidCell(const FIntVector& Cell) const
@@ -3372,9 +3454,10 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 	// and a post, can ever overlap.
 	const double RunExtent = static_cast<double>(Module - 1) * CellSize;
 
+	// A beam every platform around it has blocked is not built, nor a post no built beam ends at.
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
-		if (!bRim)
+		if (!bRim || !IsEdgeBuilt(MakeEdgeKey(Edge)))
 		{
 			return;
 		}
@@ -3387,7 +3470,10 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 
 	ForEachRimNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
 	{
-		OutPieces.Nodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
+		if (IsNodeBuilt(Node))
+		{
+			OutPieces.Nodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
+		}
 	});
 }
 

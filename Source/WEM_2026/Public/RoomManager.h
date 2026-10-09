@@ -309,6 +309,14 @@ struct FSurfaceMarkLayer
  * lacks the category breaks the chain. The longer the streak, the likelier it carries on
  * (ContinueChance, rising to MaxContinueChance at StreakForMaxChance).
  *
+ * A platform filled with anything not load-bearing blocks some of its beams: a wall the ones along
+ * its top, so nothing is built onto it while more panels can still join beside it, and a floor or
+ * ceiling every beam of its rim no platform used before it. No later platform takes in a blocked
+ * module edge. A beam is built only where some platform using it has not blocked it, and a post
+ * only where a built beam ends; a beam or post that is not built is not there at all - no surface,
+ * nothing solid, no part in promotion. Only module edges are blocked, never nodes, so a panel
+ * joining beside a wall that is not load-bearing can still share the post at its top corner.
+ *
  * Surfaces
  * --------
  * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
@@ -1017,7 +1025,8 @@ private:
 	 * Whether a platform on the grid would stand on nothing already built but rim it can share:
 	 * none of its module faces taken, nothing built along any module edge across its interior,
 	 * and no other platform's interior along the module edges around it. Nor may any of its
-	 * pieces - module faces, module edges and nodes, rim or interior - cut an obstacle. The half of
+	 * pieces - module faces, module edges and nodes, rim or interior - cut an obstacle, nor any of
+	 * its module edges be one a platform that is not load-bearing has blocked. The half of
 	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well.
 	 */
 	bool IsSpaceFree(const FGridPlatform& Platform) const;
@@ -1166,6 +1175,18 @@ private:
 	/** Whether any platform covers this cell. */
 	bool IsSolidCell(const FIntVector& Cell) const;
 
+	/** Whether every structure filling a platform is load-bearing. One with none is: it was placed before structures were. */
+	static bool IsLoadBearing(const FGridPlatform& Platform);
+
+	/** Whether a module edge of rim is built as a beam: more platforms run around it than have blocked it. */
+	bool IsEdgeBuilt(uint64 EdgeKey) const;
+
+	/** Whether a lattice node is built as a post: a built beam ends at it. */
+	bool IsNodeBuilt(const FIntVector& Node) const;
+
+	/** Whether a cell of rim - on a module edge's run, or a node - is built. */
+	bool IsRimCellBuilt(const FIntVector& Cell, int32 LatticePlaneCount) const;
+
 	/** What one face carries and whether it is built against, resolved together. */
 	void ResolveSurface(const FIntVector& Cell, EGridFace Face, ESurfaceCapacity& OutCapacity, bool& bOutOccupied) const;
 
@@ -1275,6 +1296,14 @@ private:
 	TSet<uint64> ObstacleFaces;
 	TSet<uint64> ObstacleEdges;
 	TSet<uint64> ObstacleNodes;
+
+	/**
+	 * How many platforms run around each module edge as rim, and the edges a platform that is not
+	 * load-bearing has blocked, each with the first platform to block it - an index into
+	 * BuiltPlatforms. A beam is built where more platforms use it than block it.
+	 */
+	TMap<uint64, int32> RimEdgeUsers;
+	TMap<uint64, int32> BlockedEdges;
 
 	/** The handle the next obstacle gets. Never reused within a run, so a stale handle removes nothing. */
 	int32 NextObstacleHandle = 1;
