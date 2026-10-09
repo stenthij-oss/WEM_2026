@@ -15,6 +15,7 @@ class UMaterialInstanceDynamic;
 class UMaterialInterface;
 class UPlatformStructureData;
 class UPlatformTileData;
+class UStructureCategory;
 class UStaticMesh;
 
 /** Defined in Components/LineBatchComponent.h; only the drawing code in the .cpp needs it. */
@@ -299,6 +300,15 @@ struct FSurfaceMarkLayer
  * no structures could fill completely, laid a given way, is not laid that way, and the platform
  * that starts growth is always filled with load-bearing structures.
  *
+ * A face is pulled toward the categories of the faces beside it, so like grows beside like. Faces
+ * meet around the module edges platforms share: walking round such an edge, each platform met
+ * there meets the next on the side that faces it - two floors side by side top to top and
+ * underside to underside, a floor and the wall standing on it top to inner face and underside to
+ * outer face. A filled face keeps a streak per category of its structure: one more than the
+ * longest streak of that category among the faces beside it when it was filled, so a face that
+ * lacks the category breaks the chain. The longer the streak, the likelier it carries on
+ * (ContinueChance, rising to MaxContinueChance at StreakForMaxChance).
+ *
  * Surfaces
  * --------
  * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
@@ -436,6 +446,30 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures")
 	TArray<TObjectPtr<UPlatformStructureData>> Structures;
+
+	/**
+	 * The chance that a face beside a filled one carries on a category that face began: its streak
+	 * is one, it has no filled neighbour of that category. Each neighbour with a category the face
+	 * could take offers its strongest chance, and the face is pulled when any offer is taken.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ContinueChance = 0.35f;
+
+	/** The chance a streak carries on once it is StreakForMaxChance long. It rises evenly from ContinueChance to here. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MaxContinueChance = 0.70f;
+
+	/** How long a streak has to be to carry on with MaxContinueChance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "2"))
+	int32 StreakForMaxChance = 4;
+
+	/**
+	 * How large a patch of one category the average face sits in: the patches' sizes, each weighted
+	 * by itself. A patch is the faces carrying a category that each joined another carrying it
+	 * beside them; a face of two categories counts in a patch of each. Readout only.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Structures")
+	double CategoryPatchSize = 0.0;
 
 	/**
 	 * Every platform placed, in the order it was placed. This list alone is the simulation's
@@ -611,6 +645,14 @@ public:
 	/** Whether that surface has been built against. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	bool bDebugProbeSurfaceOccupied = false;
+
+	/** The structure filling that surface's face, when the surface lies across a platform's opening. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	TObjectPtr<UPlatformStructureData> DebugProbeStructure;
+
+	/** Its categories, each with its streak on that face. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	FString DebugProbeCategories;
 
 	/** True when the coordinate addresses a cell inside the cube. */
 	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
@@ -1036,8 +1078,34 @@ private:
 	 */
 	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
 
-	/** Draws one of the options by weight from the structure stream. Null when there are none. */
-	UPlatformStructureData* DrawStructure(TConstArrayView<UPlatformStructureData*> Options);
+	/**
+	 * Draws one of the options for one face of a platform about to be placed, from the structure
+	 * stream, pulled toward the categories of the faces beside it (see WEMStructures::DrawWithPull).
+	 * Null when there are none.
+	 */
+	UPlatformStructureData* DrawStructure(TConstArrayView<UPlatformStructureData*> Options, const FGridPlatform& Platform, int32 FaceSign);
+
+	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
+	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
+
+	/**
+	 * The faces beside one face of a platform, as indices into FaceFills: around every module edge of
+	 * its rim another platform shares, the faces it meets walking round the edge. The platform is
+	 * BuiltPlatforms[PlatformIndex], or the one about to be placed there.
+	 */
+	void GatherFaceNeighbours(const FGridPlatform& Platform, int32 PlatformIndex, int32 FaceSign, TArray<int32, TInlineAllocator<16>>& OutNeighbours) const;
+
+	/** Records the fill of a platform just added to BuiltPlatforms: its faces' categories, streaks and patches. */
+	void RecordFill(int32 PlatformIndex);
+
+	/** The patch a (face, category) node belongs to, by its root node. */
+	int32 FindPatch(int32 Node);
+
+	/** Joins the patches of two nodes. */
+	void JoinPatches(int32 First, int32 Second);
+
+	/** Per node, the lowest node in its patch: the same for the same patches, however they were joined. */
+	TArray<int32> GetPatchLabels();
 
 	/** Works out the pieces every obstacle cuts afresh from Obstacles. */
 	void RebuildObstacleKeys();
@@ -1234,6 +1302,35 @@ private:
 
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
+
+	/**
+	 * The categories the usable structures carry, each with a dense index of its own, and by index.
+	 * Numbered afresh by every rebuild; the categories are held by the structures.
+	 */
+	TMap<const UStructureCategory*, int32> CategoryIndices;
+	TArray<const UStructureCategory*> CategoriesByIndex;
+
+	/** One face's fill, as the category pull sees it. */
+	struct FFaceFill
+	{
+		const UPlatformStructureData* Structure = nullptr;
+
+		/** The category indices its structure carries, each once, and parallel to them its streak and patch node in each. */
+		TArray<int32, TInlineAllocator<4>> Categories;
+		TArray<int32, TInlineAllocator<4>> Streaks;
+		TArray<int32, TInlineAllocator<4>> PatchNodes;
+	};
+
+	/** Two per platform in BuiltPlatforms, its positive face and then its negative one. */
+	TArray<FFaceFill> FaceFills;
+
+	/**
+	 * The category patches as a union-find over (face, category) nodes: each node's parent, each
+	 * root's size, and the sum of every patch's size squared, from which CategoryPatchSize follows.
+	 */
+	TArray<int32> PatchParents;
+	TArray<int32> PatchSizes;
+	int64 PatchSizeSquares = 0;
 
 	/** The shortest side of any usable tile: the narrowest step between two flush platforms that growth could still fill. */
 	int32 SmallestTileSide = 0;

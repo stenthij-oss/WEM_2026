@@ -8,6 +8,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/AutomationTest.h"
 #include "RoomManagerTestHelpers.h"
+#include "StructureCategory.h"
 #include "StructurePlacement.h"
 
 namespace StructureFillTestsPrivate
@@ -101,6 +102,33 @@ namespace StructureFillTestsPrivate
 	{
 		return FString::Printf(TEXT("%s facing %d, %d x %d%s"), *Platform.MinNode.ToString(), static_cast<int32>(Platform.Normal),
 			Platform.Tile->Width, Platform.Tile->Length, Platform.bTurned ? TEXT(" turned") : TEXT(""));
+	}
+
+	/**
+	 * Gives the structures categories from three, in turn, and every third one a second, so the
+	 * category pull, its streaks and its patches all come into play.
+	 */
+	void AddCategories(TConstArrayView<TObjectPtr<UPlatformStructureData>> Structures, TArray<UObject*>& OutRooted)
+	{
+		UStructureCategory* Categories[3];
+
+		for (int32 Index = 0; Index < 3; ++Index)
+		{
+			Categories[Index] = NewObject<UStructureCategory>(GetTransientPackage(),
+				MakeUniqueObjectName(GetTransientPackage(), UStructureCategory::StaticClass(), TEXT("TestCategory")));
+			Categories[Index]->AddToRoot();
+			OutRooted.Add(Categories[Index]);
+		}
+
+		for (int32 Index = 0; Index < Structures.Num(); ++Index)
+		{
+			Structures[Index]->Categories = { Categories[Index % 3] };
+
+			if (Index % 3 == 0)
+			{
+				Structures[Index]->Categories.Add(Categories[(Index + 1) % 3]);
+			}
+		}
 	}
 
 	/** Grows Beats beats and returns how many platforms stand. */
@@ -382,13 +410,16 @@ bool FStructureFillVerifyTest::RunTest(const FString& Parameters)
 
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
-	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, MakeOneSided(Rooted, /*bCeilingHoldsItems=*/false));
+	const TArray<TObjectPtr<UPlatformStructureData>> Structures = MakeOneSided(Rooted, /*bCeilingHoldsItems=*/false);
+	AddCategories(Structures, Rooted);
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
 
 	// The pieces on as well, so the structures' layers are held to a full rebuild too.
 	Manager->bShowPieces = true;
 	Manager->ClearPlatforms();
 
 	TestEqual(TEXT("Every placement matches a full rebuild"), GrowVerified(*this, *Manager, 200), 0);
+	TestTrue(TEXT("Categories gathered into patches"), Manager->CategoryPatchSize > 1.0);
 
 	ReleaseRooted(Rooted);
 	return true;
@@ -402,7 +433,9 @@ bool FStructureFillVerifyLongTest::RunTest(const FString& Parameters)
 
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
-	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, MakeMixed(Rooted));
+	const TArray<TObjectPtr<UPlatformStructureData>> Structures = MakeMixed(Rooted);
+	AddCategories(Structures, Rooted);
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
 	Manager->bShowPieces = true;
 	Manager->GridSize = 257;
 	Manager->ClearPlatforms();

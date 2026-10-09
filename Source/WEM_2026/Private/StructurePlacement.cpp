@@ -89,6 +89,51 @@ bool WEMStructures::FitsFace(
 	return FitsShape(Structure.Width, Structure.Length, Structure.bMayLieSideways, NormalAxis, SpanFirst, SpanSecond, bOutTurned);
 }
 
+namespace
+{
+	/** Draws an index by weight. Returns INDEX_NONE when no weight is above zero. */
+	template <typename WeightFunctorType>
+	int32 DrawByWeight(FRandomStream& Stream, const int32 Count, WeightFunctorType&& GetWeight)
+	{
+		double TotalWeight = 0.0;
+		for (int32 Index = 0; Index < Count; ++Index)
+		{
+			TotalWeight += FMath::Max(GetWeight(Index), 0.0);
+		}
+
+		if (TotalWeight <= 0.0)
+		{
+			return INDEX_NONE;
+		}
+
+		double Roll = Stream.FRand() * TotalWeight;
+		int32 Chosen = INDEX_NONE;
+
+		for (int32 Index = 0; Index < Count; ++Index)
+		{
+			const double Weight = FMath::Max(GetWeight(Index), 0.0);
+
+			if (Weight <= 0.0)
+			{
+				continue;
+			}
+
+			// Taken whenever it is in the running, so rounding at the very top of the roll still lands
+			// on the last one that could have been drawn.
+			Chosen = Index;
+
+			if (Roll < Weight)
+			{
+				break;
+			}
+
+			Roll -= Weight;
+		}
+
+		return Chosen;
+	}
+}
+
 FTransform WEMStructures::MakeStructureTransform(
 	const FVector& MinCorner,
 	const double CellSize,
@@ -145,4 +190,89 @@ FTransform WEMStructures::MakeStructureTransform(
 	}
 
 	return FTransform(Rotation.ToQuat(), Centre);
+}
+
+float WEMStructures::GetContinueChance(const int32 Streak, const float ContinueChance, const float MaxContinueChance, const int32 StreakForMaxChance)
+{
+	const int32 Steps = FMath::Max(StreakForMaxChance, 2) - 1;
+	const float Progress = static_cast<float>(FMath::Clamp(Streak - 1, 0, Steps)) / static_cast<float>(Steps);
+
+	return FMath::Clamp(ContinueChance + (MaxContinueChance - ContinueChance) * Progress, 0.0f, 1.0f);
+}
+
+int32 WEMStructures::DrawWithPull(FRandomStream& Stream, const TConstArrayView<FDrawOption> Options, const TConstArrayView<FNeighbourOffer> Offers)
+{
+	// A category no option carries could never be drawn, so it pulls toward nothing.
+	TSet<int32> LiveCategories;
+	for (const FDrawOption& Option : Options)
+	{
+		if (Option.Weight > 0.0f)
+		{
+			LiveCategories.Append(Option.Categories);
+		}
+	}
+
+	// Each neighbour's offer: its live categories, and the strongest of their chances.
+	struct FLiveOffer
+	{
+		TArray<TPair<int32, float>, TInlineAllocator<4>> Categories;
+		float Chance = 0.0f;
+	};
+
+	TArray<FLiveOffer, TInlineAllocator<16>> LiveOffers;
+	double Stay = 1.0;
+
+	for (const FNeighbourOffer& Offer : Offers)
+	{
+		FLiveOffer Live;
+
+		for (const TPair<int32, float>& Category : Offer.Categories)
+		{
+			if (LiveCategories.Contains(Category.Key) && Category.Value > 0.0f)
+			{
+				Live.Categories.Add(Category);
+				Live.Chance = FMath::Max(Live.Chance, Category.Value);
+			}
+		}
+
+		if (Live.Categories.IsEmpty())
+		{
+			continue;
+		}
+
+		Stay *= 1.0 - FMath::Min(Live.Chance, 1.0f);
+		LiveOffers.Add(MoveTemp(Live));
+	}
+
+	// The pull is only rolled for when something pulls, so a face with no filled neighbour draws as it
+	// would with no categories at all.
+	if (!LiveOffers.IsEmpty() && Stream.FRand() < 1.0 - Stay)
+	{
+		const int32 Neighbour = DrawByWeight(Stream, LiveOffers.Num(), [&LiveOffers](const int32 Index)
+		{
+			return static_cast<double>(LiveOffers[Index].Chance);
+		});
+
+		const FLiveOffer& Offer = LiveOffers[Neighbour];
+		const int32 CategoryIndex = DrawByWeight(Stream, Offer.Categories.Num(), [&Offer](const int32 Index)
+		{
+			return static_cast<double>(Offer.Categories[Index].Value);
+		});
+
+		const int32 Category = Offer.Categories[CategoryIndex].Key;
+		const int32 Chosen = DrawByWeight(Stream, Options.Num(), [&Options, Category](const int32 Index)
+		{
+			return Options[Index].Categories.Contains(Category) ? static_cast<double>(Options[Index].Weight) : 0.0;
+		});
+
+		if (Chosen != INDEX_NONE)
+		{
+			return Chosen;
+		}
+	}
+
+	return DrawByWeight(Stream, Options.Num(), [&Options](const int32 Index)
+	{
+		return static_cast<double>(Options[Index].Weight);
+	});
 }

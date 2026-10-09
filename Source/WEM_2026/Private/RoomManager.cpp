@@ -5,6 +5,7 @@
 #include "GridMath.h"
 #include "PlatformStructureData.h"
 #include "PlatformTileData.h"
+#include "StructureCategory.h"
 #include "StructurePlacement.h"
 #include "Algo/BinarySearch.h"
 #include "Algo/Count.h"
@@ -92,6 +93,19 @@ namespace
 
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
+
+	/** Where one face of a platform is kept in ARoomManager::FaceFills: its positive face, then its negative one. */
+	FORCEINLINE int32 GetFaceFillIndex(const int32 PlatformIndex, const int32 FaceSign)
+	{
+		return PlatformIndex * 2 + (FaceSign > 0 ? 0 : 1);
+	}
+
+	/**
+	 * The four half-planes around a module edge in the order a quarter turn about the edge's axis
+	 * walks them - +A, +B, -A, -B, where A and B are the next two axes after the edge's - as indices
+	 * into GetEdgeFaces, which lists them +B, -B, +A, -A.
+	 */
+	constexpr int32 TurningOrder[4] = { 2, 0, 3, 1 };
 
 	FORCEINLINE int32 AxisIndex(const EGridAxis Axis)
 	{
@@ -1600,6 +1614,8 @@ void ARoomManager::ResolveUsableTiles()
 void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
 {
 	UsableStructures.Reset();
+	CategoryIndices.Reset();
+	CategoriesByIndex.Reset();
 
 	for (UPlatformStructureData* Structure : Structures)
 	{
@@ -1629,7 +1645,224 @@ void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
 		}
 
 		UsableStructures.Add(Structure);
+
+		// Numbered in the order the structures list them, so the same list numbers them the same way.
+		for (const UStructureCategory* Category : Structure->Categories)
+		{
+			if (Category && !CategoryIndices.Contains(Category))
+			{
+				CategoryIndices.Add(Category, CategoriesByIndex.Add(Category));
+			}
+		}
 	}
+}
+
+void ARoomManager::GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const
+{
+	OutCategories.Reset();
+
+	if (!Structure)
+	{
+		return;
+	}
+
+	for (const UStructureCategory* Category : Structure->Categories)
+	{
+		if (const int32* Index = CategoryIndices.Find(Category))
+		{
+			OutCategories.AddUnique(*Index);
+		}
+	}
+}
+
+void ARoomManager::GatherFaceNeighbours(
+	const FGridPlatform& Platform,
+	const int32 PlatformIndex,
+	const int32 FaceSign,
+	TArray<int32, TInlineAllocator<16>>& OutNeighbours) const
+{
+	OutNeighbours.Reset();
+
+	int32 SpanU, SpanV;
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// Whether a module face is one of the platform's own, which it may not have been recorded as yet.
+	auto IsOwnFace = [&](const FModuleFace& Face)
+	{
+		return Face.Normal == NormalAxis
+			&& Face.MinNode[NormalAxis] == Platform.MinNode[NormalAxis]
+			&& Face.MinNode[U] >= Platform.MinNode[U] && Face.MinNode[U] < Platform.MinNode[U] + SpanU
+			&& Face.MinNode[V] >= Platform.MinNode[V] && Face.MinNode[V] < Platform.MinNode[V] + SpanV;
+	};
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		// Only rim can be shared, and only where a platform already runs around the same edge.
+		if (!bRim || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		{
+			return;
+		}
+
+		FModuleFace Faces[4];
+		GetEdgeFaces(Edge, Module, Faces);
+
+		// Who stands in each half-plane round the edge, walked in turning order.
+		int32 Owners[4];
+		int32 Occupied[4];
+		int32 OccupiedCount = 0;
+
+		for (int32 Turn = 0; Turn < 4; ++Turn)
+		{
+			const FModuleFace& Face = Faces[TurningOrder[Turn]];
+			const int32* FaceOwner = IsOwnFace(Face) ? &PlatformIndex : ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal));
+
+			Owners[Turn] = FaceOwner ? *FaceOwner : INDEX_NONE;
+
+			if (FaceOwner)
+			{
+				Occupied[OccupiedCount++] = Turn;
+			}
+		}
+
+		// Each half-plane meets the next one round the edge: the first with its face looking the way
+		// its own direction turns forward a quarter, the second with its face looking the way its own
+		// turns back a quarter. Those directions lie along each one's normal. Two half-planes meet
+		// twice, once each way round.
+		for (int32 Pair = 0; OccupiedCount >= 2 && Pair < OccupiedCount; ++Pair)
+		{
+			const int32 First = Occupied[Pair];
+			const int32 Second = Occupied[(Pair + 1) % OccupiedCount];
+
+			// Turning order runs +A, +B, -A, -B, so the first two directions are the positive ones.
+			const int32 FirstSign = (First + 1) % 4 < 2 ? 1 : -1;
+			const int32 SecondSign = (Second + 3) % 4 < 2 ? 1 : -1;
+
+			if (Owners[First] == PlatformIndex && FirstSign == FaceSign && Owners[Second] != PlatformIndex)
+			{
+				OutNeighbours.AddUnique(GetFaceFillIndex(Owners[Second], SecondSign));
+			}
+
+			if (Owners[Second] == PlatformIndex && SecondSign == FaceSign && Owners[First] != PlatformIndex)
+			{
+				OutNeighbours.AddUnique(GetFaceFillIndex(Owners[First], FirstSign));
+			}
+		}
+	});
+}
+
+void ARoomManager::RecordFill(const int32 PlatformIndex)
+{
+	const FGridPlatform& Platform = BuiltPlatforms[PlatformIndex];
+	FaceFills.SetNum(GetFaceFillIndex(PlatformIndex + 1, 1));
+
+	for (const int32 FaceSign : { 1, -1 })
+	{
+		FFaceFill& Fill = FaceFills[GetFaceFillIndex(PlatformIndex, FaceSign)];
+		Fill = FFaceFill();
+		Fill.Structure = FaceSign > 0 ? Platform.PositiveStructure.Get() : Platform.NegativeStructure.Get();
+
+		GetCategoryIndices(Fill.Structure, Fill.Categories);
+
+		if (Fill.Categories.IsEmpty())
+		{
+			continue;
+		}
+
+		// Its streaks, and its patches, follow from the faces beside it that were filled before it.
+		TArray<int32, TInlineAllocator<16>> Neighbours;
+		GatherFaceNeighbours(Platform, PlatformIndex, FaceSign, Neighbours);
+
+		for (const int32 Category : Fill.Categories)
+		{
+			const int32 Node = PatchParents.Add(PatchParents.Num());
+			PatchSizes.Add(1);
+			PatchSizeSquares += 1;
+
+			int32 LongestBeside = 0;
+
+			for (const int32 Neighbour : Neighbours)
+			{
+				const FFaceFill& NeighbourFill = FaceFills[Neighbour];
+				const int32 Index = NeighbourFill.Categories.Find(Category);
+
+				if (Index != INDEX_NONE)
+				{
+					LongestBeside = FMath::Max(LongestBeside, NeighbourFill.Streaks[Index]);
+					JoinPatches(Node, NeighbourFill.PatchNodes[Index]);
+				}
+			}
+
+			Fill.Streaks.Add(1 + LongestBeside);
+			Fill.PatchNodes.Add(Node);
+		}
+	}
+
+	CategoryPatchSize = PatchParents.IsEmpty() ? 0.0 : static_cast<double>(PatchSizeSquares) / PatchParents.Num();
+}
+
+int32 ARoomManager::FindPatch(int32 Node)
+{
+	// Halving the path on the way up keeps every later find short.
+	while (PatchParents[Node] != Node)
+	{
+		PatchParents[Node] = PatchParents[PatchParents[Node]];
+		Node = PatchParents[Node];
+	}
+
+	return Node;
+}
+
+void ARoomManager::JoinPatches(const int32 First, const int32 Second)
+{
+	int32 Root = FindPatch(First);
+	int32 Other = FindPatch(Second);
+
+	if (Root == Other)
+	{
+		return;
+	}
+
+	// The smaller goes under the larger, so no path grows long.
+	if (PatchSizes[Root] < PatchSizes[Other])
+	{
+		Swap(Root, Other);
+	}
+
+	// Two patches of a and b become one of a + b, which adds 2ab to the sum of squares.
+	PatchSizeSquares += 2 * static_cast<int64>(PatchSizes[Root]) * PatchSizes[Other];
+	PatchParents[Other] = Root;
+	PatchSizes[Root] += PatchSizes[Other];
+}
+
+TArray<int32> ARoomManager::GetPatchLabels()
+{
+	TArray<int32> Lowest;
+	Lowest.Init(INDEX_NONE, PatchParents.Num());
+
+	for (int32 Node = 0; Node < PatchParents.Num(); ++Node)
+	{
+		int32& Label = Lowest[FindPatch(Node)];
+		Label = Label == INDEX_NONE ? Node : FMath::Min(Label, Node);
+	}
+
+	TArray<int32> Labels;
+	Labels.SetNumUninitialized(PatchParents.Num());
+
+	for (int32 Node = 0; Node < PatchParents.Num(); ++Node)
+	{
+		Labels[Node] = Lowest[FindPatch(Node)];
+	}
+
+	return Labels;
 }
 
 bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const int32 SpanFirst, const int32 SpanSecond, const bool bLoadBearingOnly) const
@@ -1728,7 +1961,7 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	TArray<UPlatformStructureData*> Options;
 	GatherFillOptions(Platform, FirstSign, /*bSecondFace=*/false, bLoadBearingOnly, Options);
 
-	UPlatformStructureData* First = DrawStructure(Options);
+	UPlatformStructureData* First = DrawStructure(Options, Platform, FirstSign);
 
 	if (!First)
 	{
@@ -1744,7 +1977,7 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 
 	GatherFillOptions(Platform, -FirstSign, /*bSecondFace=*/true, bLoadBearingOnly, Options);
 
-	UPlatformStructureData* Second = DrawStructure(Options);
+	UPlatformStructureData* Second = DrawStructure(Options, Platform, -FirstSign);
 
 	if (!Second)
 	{
@@ -1756,37 +1989,48 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	return true;
 }
 
-UPlatformStructureData* ARoomManager::DrawStructure(const TConstArrayView<UPlatformStructureData*> Options)
+UPlatformStructureData* ARoomManager::DrawStructure(
+	const TConstArrayView<UPlatformStructureData*> Options,
+	const FGridPlatform& Platform,
+	const int32 FaceSign)
 {
-	float TotalWeight = 0.0f;
+	TArray<WEMStructures::FDrawOption, TInlineAllocator<32>> DrawOptions;
+
 	for (const UPlatformStructureData* Option : Options)
 	{
-		TotalWeight += Option->Weight;
+		WEMStructures::FDrawOption& DrawOption = DrawOptions.AddDefaulted_GetRef();
+		DrawOption.Weight = Option->Weight;
+		GetCategoryIndices(Option, DrawOption.Categories);
 	}
 
-	if (TotalWeight <= 0.0f)
+	// Every filled face beside this one offers each of its categories, as likely to carry on as its
+	// streak there is long. The platform is not placed yet, so it is named by the index it will take.
+	TArray<int32, TInlineAllocator<16>> Neighbours;
+	GatherFaceNeighbours(Platform, BuiltPlatforms.Num(), FaceSign, Neighbours);
+
+	TArray<WEMStructures::FNeighbourOffer, TInlineAllocator<16>> Offers;
+
+	for (const int32 Neighbour : Neighbours)
 	{
-		return nullptr;
-	}
+		const FFaceFill& Fill = FaceFills[Neighbour];
 
-	float Roll = StructureStream.FRand() * TotalWeight;
-	UPlatformStructureData* Chosen = nullptr;
-
-	for (UPlatformStructureData* Option : Options)
-	{
-		// Taken whenever it is in the running, so rounding at the very top of the roll still lands on
-		// the last option.
-		Chosen = Option;
-
-		if (Roll < Option->Weight)
+		if (Fill.Categories.IsEmpty())
 		{
-			break;
+			continue;
 		}
 
-		Roll -= Option->Weight;
+		WEMStructures::FNeighbourOffer& Offer = Offers.AddDefaulted_GetRef();
+
+		for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)
+		{
+			Offer.Categories.Emplace(Fill.Categories[Index],
+				WEMStructures::GetContinueChance(Fill.Streaks[Index], ContinueChance, MaxContinueChance, StreakForMaxChance));
+		}
 	}
 
-	return Chosen;
+	const int32 Chosen = WEMStructures::DrawWithPull(StructureStream, DrawOptions, Offers);
+
+	return Chosen == INDEX_NONE ? nullptr : Options[Chosen];
 }
 
 void ARoomManager::RebuildPlatformState()
@@ -1809,6 +2053,11 @@ void ARoomManager::RebuildPlatformState()
 	ModuleEdgeUses.Reset();
 	RimCellNormals.Reset();
 	PromotedFaces.Reset();
+	FaceFills.Reset();
+	PatchParents.Reset();
+	PatchSizes.Reset();
+	PatchSizeSquares = 0;
+	CategoryPatchSize = 0.0;
 
 	// The candidates follow from everything below, so they are gathered afresh on the next draw.
 	bPlatformCandidatesStale = true;
@@ -2154,6 +2403,9 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 			RimCellNormals.FindOrAdd(MakeCellKey(Cell)) |= NormalBit;
 		}
 	});
+
+	// What fills it follows from the faces placed before it, so it is recorded in the same order.
+	RecordFill(PlatformIndex);
 }
 
 void ARoomManager::JournalSurfaceChanges(const TConstArrayView<FGridSurfaceRef> Surfaces)
@@ -2255,6 +2507,8 @@ void ARoomManager::VerifyIncrementalState()
 	const TSet<uint64> IncrementalObstacleNodes = ObstacleNodes;
 	const bool bHadCandidates = !bPlatformCandidatesStale;
 	const TArray<FTileCandidates> IncrementalCandidates = TileCandidates;
+	const TArray<FFaceFill> IncrementalFaceFills = FaceFills;
+	const TArray<int32> IncrementalPatchLabels = GetPatchLabels();
 	const int32 IncrementalStructureRevision = StructureRevision;
 
 	// The record of changed surfaces belongs with the revision, and goes back with it below.
@@ -2314,6 +2568,30 @@ void ARoomManager::VerifyIncrementalState()
 	CompareKeySets(TEXT("obstacle faces"), IncrementalObstacleFaces, ObstacleFaces);
 	CompareKeySets(TEXT("obstacle edges"), IncrementalObstacleEdges, ObstacleEdges);
 	CompareKeySets(TEXT("obstacle nodes"), IncrementalObstacleNodes, ObstacleNodes);
+
+	// The streaks and patches depend on the order platforms were placed in, which the list keeps.
+	int32 DifferentFills = FMath::Abs(IncrementalFaceFills.Num() - FaceFills.Num());
+
+	for (int32 Index = 0; Index < FMath::Min(IncrementalFaceFills.Num(), FaceFills.Num()); ++Index)
+	{
+		const FFaceFill& Incremental = IncrementalFaceFills[Index];
+		const FFaceFill& Rebuilt = FaceFills[Index];
+
+		DifferentFills += Incremental.Structure == Rebuilt.Structure
+			&& Incremental.Categories == Rebuilt.Categories
+			&& Incremental.Streaks == Rebuilt.Streaks
+			&& Incremental.PatchNodes == Rebuilt.PatchNodes ? 0 : 1;
+	}
+
+	if (DifferentFills > 0)
+	{
+		Mismatches.Add(FString::Printf(TEXT("face fills: %d differ"), DifferentFills));
+	}
+
+	if (IncrementalPatchLabels != GetPatchLabels())
+	{
+		Mismatches.Add(TEXT("category patches differ"));
+	}
 
 	// Compared in order, since the order is what the placement stream draws from.
 	if (bHadCandidates)
@@ -2734,6 +3012,8 @@ void ARoomManager::UpdateDebugReadouts()
 	DebugProbeSurface.Face = EGridFace::PosZ;
 	DebugProbeSurfaceCapacity = ESurfaceCapacity::Empty;
 	bDebugProbeSurfaceOccupied = false;
+	DebugProbeStructure = nullptr;
+	DebugProbeCategories.Reset();
 
 	if (CellSize <= 0.0f)
 	{
@@ -2804,10 +3084,39 @@ void ARoomManager::UpdateDebugReadouts()
 		}
 	}
 
-	if (bFoundSurface)
+	if (!bFoundSurface)
 	{
-		ResolveSurface(DebugProbeSurface.Cell, DebugProbeSurface.Face, DebugProbeSurfaceCapacity, bDebugProbeSurfaceOccupied);
+		return;
 	}
+
+	ResolveSurface(DebugProbeSurface.Cell, DebugProbeSurface.Face, DebugProbeSurfaceCapacity, bDebugProbeSurfaceOccupied);
+
+	// Across an opening the surface is one face of its platform's fill. On the rim it is a beam's,
+	// which no structure fills.
+	int32 InteriorOwner = INDEX_NONE;
+	GetCellSurfaceAxes(DebugProbeSurface.Cell, InteriorOwner);
+
+	const int32 FaceIndex = InteriorOwner != INDEX_NONE ? GetFaceFillIndex(InteriorOwner, FaceSign(DebugProbeSurface.Face)) : INDEX_NONE;
+
+	if (!FaceFills.IsValidIndex(FaceIndex))
+	{
+		return;
+	}
+
+	const FFaceFill& Fill = FaceFills[FaceIndex];
+	const FGridPlatform& OwnerPlatform = BuiltPlatforms[InteriorOwner];
+	DebugProbeStructure = FaceSign(DebugProbeSurface.Face) > 0 ? OwnerPlatform.PositiveStructure : OwnerPlatform.NegativeStructure;
+
+	TArray<FString> Streaks;
+	for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)
+	{
+		const UStructureCategory* Category = CategoriesByIndex[Fill.Categories[Index]];
+		const FString Name = Category->DisplayName.IsEmpty() ? Category->GetName() : Category->DisplayName.ToString();
+
+		Streaks.Add(FString::Printf(TEXT("%s: streak %d"), *Name, Fill.Streaks[Index]));
+	}
+
+	DebugProbeCategories = Streaks.IsEmpty() ? TEXT("none") : FString::Join(Streaks, TEXT(", "));
 }
 
 double ARoomManager::ResolveGridBaseZ() const

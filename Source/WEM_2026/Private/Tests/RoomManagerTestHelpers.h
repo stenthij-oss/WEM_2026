@@ -13,6 +13,7 @@
 #include "PlatformStructureData.h"
 #include "PlatformTileData.h"
 #include "RoomManager.h"
+#include "StructureCategory.h"
 #include "UObject/Package.h"
 
 /** What the tests read of the room manager's private state. Befriended by ARoomManager. */
@@ -87,6 +88,34 @@ struct FRoomManagerTestAccess
 	static const TArray<FGridPlatform>& GetBuilt(const ARoomManager& Manager)
 	{
 		return Manager.BuiltPlatforms;
+	}
+
+	/** Replaces the platform list and rebuilds everything from it, as loading a level would. */
+	static void Rebuild(ARoomManager& Manager, const TArray<FGridPlatform>& Platforms)
+	{
+		Manager.Platforms = Platforms;
+		Manager.RebuildPlatformState();
+	}
+
+	/** The faces beside one face of a built platform, as face indices (platform * 2, + 1 for its negative face), sorted. */
+	static TArray<int32> GetFaceNeighbours(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign)
+	{
+		TArray<int32, TInlineAllocator<16>> Neighbours;
+		Manager.GatherFaceNeighbours(Manager.BuiltPlatforms[PlatformIndex], PlatformIndex, FaceSign, Neighbours);
+
+		TArray<int32> Sorted(Neighbours);
+		Sorted.Sort();
+		return Sorted;
+	}
+
+	/** A face's streak in a category, or zero when its structure does not carry it. */
+	static int32 GetStreak(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign, const UStructureCategory* Category)
+	{
+		const int32* CategoryIndex = Manager.CategoryIndices.Find(Category);
+		const ARoomManager::FFaceFill& Fill = Manager.FaceFills[PlatformIndex * 2 + (FaceSign > 0 ? 0 : 1)];
+		const int32 Index = CategoryIndex ? Fill.Categories.Find(*CategoryIndex) : INDEX_NONE;
+
+		return Index != INDEX_NONE ? Fill.Streaks[Index] : 0;
 	}
 };
 
