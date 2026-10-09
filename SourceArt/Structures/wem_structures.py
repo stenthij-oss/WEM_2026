@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import re
+import sys
 
 import bpy
 from mathutils import Vector
@@ -306,8 +307,19 @@ def write_settings(path, obj, width, length, low, high):
         "exported": datetime.datetime.now().replace(microsecond=0).isoformat(),
     }
 
+    # An unchanged structure keeps its file as it was, export time and all, so the importer skips it.
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as file:
+                old = json.load(file)
+            if {k: v for k, v in old.items() if k != "exported"} == json.loads(json.dumps({k: v for k, v in data.items() if k != "exported"})):
+                return False
+        except (OSError, ValueError):
+            pass
+
     with open(path, "w", encoding="utf-8", newline="\n") as file:
         file.write(format_settings(data))
+    return True
 
 
 def format_settings(data):
@@ -331,8 +343,11 @@ def format_settings(data):
     return "\n".join(lines) + "\n"
 
 
-def export_structure(obj, context):
-    """Checks the object and exports it. Returns the problems that stopped it, or an empty list."""
+def export_structure(obj, context, changed=None):
+    """
+    Checks the object and exports it. Returns the problems that stopped it, or an empty list. When
+    `changed` is a list, the object's name is appended to it if either file changed.
+    """
     problems, measured = check(obj, context)
     if problems:
         return problems
@@ -341,14 +356,31 @@ def export_structure(obj, context):
     folder = os.path.join(find_structures_folder(context) or os.path.dirname(bpy.data.filepath), "Export")
     os.makedirs(folder, exist_ok=True)
 
+    # Every .blend exports into the one folder, so a name already exported from another .blend would
+    # be overwritten without a word.
+    existing = os.path.join(folder, obj.name + ".json")
+    if os.path.isfile(existing):
+        try:
+            with open(existing, encoding="utf-8") as file:
+                owner = json.load(file).get("blend", "")
+        except (OSError, ValueError):
+            owner = ""
+        if owner and owner != os.path.basename(bpy.data.filepath):
+            return [f"'{obj.name}' was already exported from {owner}. Rename the object, or delete Export/{obj.name}.* first."]
+
     # Only this object, with its modifiers applied. glTF fixes its axes in the format, where FBX
     # leaves them to per-file settings, so the importer always knows how to read them.
     for other in context.view_layer.objects:
         other.select_set(other == obj)
     context.view_layer.objects.active = obj
 
+    # Exported beside the old .glb first, and only moved over it when the bytes differ, so an
+    # unchanged structure keeps its file and the importer skips it.
+    target = os.path.join(folder, obj.name + ".glb")
+    fresh = os.path.join(folder, obj.name + ".new.glb")
+
     bpy.ops.export_scene.gltf(
-        filepath=os.path.join(folder, obj.name + ".glb"),
+        filepath=fresh,
         export_format="GLB",
         use_selection=True,
         export_apply=True,
@@ -359,8 +391,32 @@ def export_structure(obj, context):
         export_animations=False,
     )
 
-    write_settings(os.path.join(folder, obj.name + ".json"), obj, width, length, low, high)
+    mesh_changed = True
+    if os.path.isfile(target):
+        with open(target, "rb") as old_file, open(fresh, "rb") as new_file:
+            mesh_changed = old_file.read() != new_file.read()
+
+    if mesh_changed:
+        os.replace(fresh, target)
+    else:
+        os.remove(fresh)
+
+    settings_changed = write_settings(os.path.join(folder, obj.name + ".json"), obj, width, length, low, high)
+
+    if changed is not None and (mesh_changed or settings_changed):
+        changed.append(obj.name)
     return []
+
+
+def export_many(objects, context):
+    """Exports every mesh among objects. Returns (changed names, {name: problems}) and never stops early."""
+    changed = []
+    refused = {}
+    for obj in sorted((o for o in objects if o.type == "MESH"), key=lambda o: o.name):
+        problems = export_structure(obj, context, changed)
+        if problems:
+            refused[obj.name] = problems
+    return changed, refused
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -413,6 +469,48 @@ class WEM_OT_export_structure(bpy.types.Operator):
             return {"CANCELLED"}
 
         self.report({"INFO"}, f"Exported {context.active_object.name}.")
+        return {"FINISHED"}
+
+
+class WEM_OT_export_selected(bpy.types.Operator):
+    bl_idname = "wem.export_selected"
+    bl_label = "Export Selected"
+    bl_description = "Check and export every selected mesh. Unchanged structures keep their files, so the importer skips them; refused ones are listed in the Info editor"
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+        active = context.view_layer.objects.active
+        changed, refused = export_many(selected, context)
+
+        # Exporting selects one object at a time; put the selection back as it was.
+        for obj in context.view_layer.objects:
+            obj.select_set(obj in selected)
+        context.view_layer.objects.active = active
+
+        for name, problems in refused.items():
+            for problem in problems:
+                self.report({"WARNING"}, f"{name}: {problem}")
+
+        meshes = sum(1 for o in selected if o.type == "MESH")
+        self.report({"WARNING"} if refused else {"INFO"},
+                    f"{meshes - len(refused)} checked, {len(changed)} changed and written, {len(refused)} refused.")
+        return {"FINISHED"}
+
+
+class WEM_OT_copy_settings(bpy.types.Operator):
+    bl_idname = "wem.copy_settings"
+    bl_label = "Copy Settings to Selected"
+    bl_description = "Give every selected mesh the active object's WEM settings: types, categories, two-sided, fence, load-bearing, holds items, may lie sideways and weight"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        source = get_settings(context.active_object)
+        targets = [o for o in context.selected_objects if o.type == "MESH" and o != context.active_object]
+        for obj in targets:
+            settings = get_settings(obj)
+            for name in ("categories", "types", "two_sided", "load_bearing", "holds_items", "fence", "may_lie_sideways", "weight"):
+                setattr(settings, name, getattr(source, name))
+        self.report({"INFO"}, f"Settings copied to {len(targets)} object(s).")
         return {"FINISHED"}
 
 
@@ -479,12 +577,20 @@ class WEM_PT_structure(bpy.types.Panel):
         row.scale_y = 1.4
         row.operator(WEM_OT_export_structure.bl_idname, icon="EXPORT")
 
+        selected = sum(1 for o in context.selected_objects if o.type == "MESH")
+        column = layout.column(align=True)
+        column.label(text=f"{selected} mesh(es) selected")
+        column.operator(WEM_OT_copy_settings.bl_idname, icon="PASTEDOWN")
+        column.operator(WEM_OT_export_selected.bl_idname, icon="EXPORT")
+
 
 CLASSES = (
     WEMStructureSettings,
     WEM_OT_reload_categories,
     WEM_OT_toggle_category,
     WEM_OT_export_structure,
+    WEM_OT_export_selected,
+    WEM_OT_copy_settings,
     WEM_PT_structure,
 )
 
@@ -508,5 +614,40 @@ def unregister():
         bpy.utils.unregister_class(cls)
 
 
+def export_from_command_line(argv):
+    """
+    blender --background <file.blend> --python wem_structures.py -- --export-all [--collection NAME] [--folder PATH]
+    Exports every mesh in the file, or in one collection, and exits non-zero when any was refused.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="wem_structures.py")
+    parser.add_argument("--export-all", action="store_true")
+    parser.add_argument("--collection", default="")
+    parser.add_argument("--folder", default="")
+    args = parser.parse_args(argv)
+
+    if args.folder:
+        bpy.context.scene.wem_structures_folder = args.folder
+
+    if args.collection:
+        collection = bpy.data.collections.get(args.collection)
+        if collection is None:
+            print(f"There is no collection named {args.collection}.")
+            sys.exit(2)
+        objects = list(collection.all_objects)
+    else:
+        objects = list(bpy.context.scene.objects)
+
+    changed, refused = export_many(objects, bpy.context)
+    for name, problems in refused.items():
+        print(f"{name} was not exported:\n  " + "\n  ".join(problems))
+    meshes = sum(1 for o in objects if o.type == "MESH")
+    print(f"WEM: {meshes - len(refused)} checked, {len(changed)} changed and written, {len(refused)} refused.")
+    sys.exit(1 if refused else 0)
+
+
 if __name__ == "__main__":
     register()
+    if "--" in sys.argv and "--export-all" in sys.argv[sys.argv.index("--") + 1:]:
+        export_from_command_line(sys.argv[sys.argv.index("--") + 1:])

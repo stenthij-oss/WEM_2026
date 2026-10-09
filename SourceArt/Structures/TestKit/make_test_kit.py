@@ -1,11 +1,11 @@
 # Builds the structure test kit: plain coloured structures for every tile size, category and kind of
 # fill, made to watch growth with - not to keep. The real structures are authored by hand.
 #
-#   - per size, a two-sided slab per category, of every type, free to lie sideways, flat in its
-#     category's colour, so clustering shows;
-#   - a few slabs of two or three categories, striped in their colours;
-#   - per size, one-sided ground, ceiling and wall structures across the categories, ribbed so their
-#     face reads, with lying walls as well as upright ones for 8 x 16 and 16 x 32;
+#   - mostly one-sided: per size four grounds, three ceilings and four walls across the categories,
+#     ribbed so their face reads, with four lying walls for each of 8 x 16 and 16 x 32;
+#   - fewer two-sided: two slabs per size and three striped multi-category slabs, every one with a
+#     front and back that cannot be mistaken - its colour on the front with a white corner tab, a dark
+#     shade on the back with a black bar across;
 #   - two fences, both two-sided walls with an arrow along the run: a load-bearing railing, 8 x 8,
 #     and a parapet that is not load-bearing, 8 x 16 lying;
 #   - a facade that is not load-bearing, upright 8 x 16.
@@ -132,20 +132,43 @@ def configure(obj, types, categories, two_sided, load_bearing=True, fence=False,
     settings.set_categories([asset(key) for key in categories])
 
 
+def back_material(key):
+    """The same category, much darker: the back of a two-sided structure never passes for its front."""
+    return material("TK_" + key + "_Back", tuple(0.3 * c for c in COLOURS[key]))
+
+
+def mark_front_and_back(builder, hx, hy):
+    """
+    A white tab standing on the front face at its +X, +Y corner, and a black bar across the back
+    from corner to corner, so either face, and which way round it lies, reads at a glance.
+    """
+    tab = min(hx, hy) * 0.35
+    builder.box(hx - tab - 0.05, hx - 0.05, hy - tab - 0.05, hy - 0.05, 0.20, 0.23, material("TK_FrontMark", (0.95, 0.95, 0.95)))
+    w = 0.08
+    builder.prism([(-hx + 0.05, -hy + 0.05 + w), (-hx + 0.05 + w, -hy + 0.05), (hx - 0.05, hy - 0.05 - w), (hx - 0.05 - w, hy - 0.05)],
+                  -0.03, 0.0, material("TK_BackMark", (0.03, 0.03, 0.03)))
+
+
 def make_slab(width, length, key):
+    """Two-sided: its category colour on the front half, a dark shade of it on the back half."""
     hx, hy = half_extents(width, length)
     builder = Builder()
-    builder.box(-hx, hx, -hy, hy, 0.0, 0.20, category_material(key))
+    builder.box(-hx, hx, -hy, hy, 0.0, 0.10, back_material(key))
+    builder.box(-hx, hx, -hy, hy, 0.10, 0.20, category_material(key))
+    mark_front_and_back(builder, hx, hy)
     obj = builder.finish(f"TK_Slab_{width}x{length}_{key}")
     configure(obj, {"GROUND", "CEILING", "WALL"}, [key], two_sided=True, lie=True)
 
 
 def make_mixed(width, length, keys, number):
+    """Two-sided, striped in its categories on the front, dark on the back."""
     hx, hy = half_extents(width, length)
     builder = Builder()
     step = 2.0 * hx / len(keys)
+    builder.box(-hx, hx, -hy, hy, 0.0, 0.10, material("TK_MixBack", (0.06, 0.06, 0.07)))
     for index, key in enumerate(keys):
-        builder.box(-hx + index * step, -hx + (index + 1) * step, -hy, hy, 0.0, 0.20, category_material(key))
+        builder.box(-hx + index * step, -hx + (index + 1) * step, -hy, hy, 0.10, 0.20, category_material(key))
+    mark_front_and_back(builder, hx, hy)
     obj = builder.finish(f"TK_Mix_{width}x{length}_{number}")
     configure(obj, {"GROUND", "CEILING", "WALL"}, keys, two_sided=True, lie=True)
 
@@ -168,7 +191,7 @@ def make_one_sided(kind, width, length, key):
             builder.box(-hx, hx, y - 0.03, y + 0.03, 0.10, 0.13, mat)
 
     label = {"GROUND": "Ground", "CEILING": "Ceiling", "WALL": "Wall"}[kind]
-    obj = builder.finish(f"TK_{label}_{width}x{length}")
+    obj = builder.finish(f"TK_{label}_{width}x{length}_{key}")
     configure(obj, {kind}, [key], two_sided=False)
 
 
@@ -185,13 +208,15 @@ def arrow(hx, hy, z0, z1, builder, mat):
 def make_fence(name, width, length, key, load_bearing):
     hx, hy = half_extents(width, length)
     builder = Builder()
-    body = material("TK_FenceBody", (0.85, 0.85, 0.82))
-    mark = material("TK_FenceArrow", (0.05, 0.05, 0.05))
-    builder.box(-hx, hx, -hy, hy, 0.0, 0.20, body)
+    front = material("TK_FenceBody", (0.85, 0.85, 0.82))
+    back = material("TK_FenceBack", (0.20, 0.20, 0.22))
+    builder.box(-hx, hx, -hy, hy, 0.0, 0.10, back)
+    builder.box(-hx, hx, -hy, hy, 0.10, 0.20, front)
 
-    # Relief on both faces, so the run reads from either side.
-    arrow(hx, hy, 0.20, 0.24, builder, mark)
-    arrow(hx, hy, -0.04, 0.0, builder, mark)
+    # An arrow on both faces, so the run reads from either side: black on the light front, white on
+    # the dark back.
+    arrow(hx, hy, 0.20, 0.24, builder, material("TK_FenceArrow", (0.05, 0.05, 0.05)))
+    arrow(hx, hy, -0.04, 0.0, builder, material("TK_FenceArrowBack", (0.95, 0.95, 0.95)))
 
     obj = builder.finish(name)
     configure(obj, {"WALL"}, [key], two_sided=True, load_bearing=load_bearing, fence=True)
@@ -221,30 +246,34 @@ def build():
 
     keys = [key for key, _ in CATEGORIES]
 
-    for width, length in SIZES:
-        for key in keys:
+    def pick(start, count):
+        return [keys[(start + i) % len(keys)] for i in range(count)]
+
+    # Two-sided: two slabs per size, a striped slab for three sizes, and the two fences.
+    for index, (width, length) in enumerate(SIZES):
+        for key in pick(index * 2, 2):
             make_slab(width, length, key)
 
     mixes = [["ExteriorUrban", "ExteriorIndustrial"], ["ExteriorRural", "NaturalFlora"], ["NaturalSand", "NaturalStone", "NaturalFlora"]]
-    for width, length in [(8, 16), (16, 16), (32, 32)]:
-        for number, mix in enumerate(mixes, start=1):
-            make_mixed(width, length, mix, number)
-
-    grounds = ["NaturalFlora", "NaturalSand", "InteriorDomestic", "NaturalStone", "ExteriorRural"]
-    ceilings = ["InteriorOffice", "InteriorDomestic", "InteriorOffice", "ExteriorIndustrial", "InteriorDomestic"]
-    walls = ["ExteriorUrban", "InteriorOffice", "ExteriorRural", "InteriorDomestic", "ExteriorIndustrial"]
-
-    for index, (width, length) in enumerate(SIZES):
-        make_one_sided("GROUND", width, length, grounds[index])
-        make_one_sided("CEILING", width, length, ceilings[index])
-        make_one_sided("WALL", width, length, walls[index])
-
-        # An upright wall of a long size has a lying twin of its own.
-        if width != length:
-            make_one_sided("WALL", length, width, walls[(index + 2) % len(walls)])
+    for number, (width, length) in enumerate([(8, 16), (16, 16), (32, 32)], start=1):
+        make_mixed(width, length, mixes[number - 1], number)
 
     make_fence("TK_Fence_Railing_8x8", 8, 8, "ExteriorUrban", load_bearing=True)
     make_fence("TK_Fence_Parapet_16x8", 16, 8, "ExteriorIndustrial", load_bearing=False)
+
+    # One-sided, the majority: per size four grounds, three ceilings and four walls across the
+    # categories, and four lying walls for each long size.
+    for index, (width, length) in enumerate(SIZES):
+        for key in pick(index, 4):
+            make_one_sided("GROUND", width, length, key)
+        for key in pick(index + 3, 3):
+            make_one_sided("CEILING", width, length, key)
+        for key in pick(index + 5, 4):
+            make_one_sided("WALL", width, length, key)
+        if width != length:
+            for key in pick(index + 1, 4):
+                make_one_sided("WALL", length, width, key)
+
     make_facade()
 
 
@@ -255,15 +284,21 @@ def main():
     bpy.context.scene.wem_structures_folder = HERE
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(HERE, "TestKit.blend"))
 
-    failed = 0
-    for obj in sorted(bpy.context.scene.objects, key=lambda o: o.name):
-        problems = wem_structures.export_structure(obj, bpy.context)
-        if problems:
-            failed += 1
-            print(f"{obj.name} was not exported:\n  " + "\n  ".join(problems))
+    # Structures no longer in the kit leave no files behind for the importer to pick up.
+    export = os.path.join(HERE, "Export")
+    names = {obj.name for obj in bpy.context.scene.objects}
+    for file in os.listdir(export) if os.path.isdir(export) else []:
+        if os.path.splitext(file)[0] not in names:
+            os.remove(os.path.join(export, file))
 
-    print(f"Test kit: {len(bpy.context.scene.objects) - failed} exported, {failed} refused.")
-    sys.exit(1 if failed else 0)
+    changed, refused = wem_structures.export_many(bpy.context.scene.objects, bpy.context)
+    for name, problems in refused.items():
+        print(f"{name} was not exported:\n  " + "\n  ".join(problems))
+
+    two_sided = sum(1 for obj in bpy.context.scene.objects if wem_structures.get_settings(obj).two_sided)
+    print(f"Test kit: {len(names) - len(refused)} exported ({len(names) - two_sided} one-sided, {two_sided} two-sided), "
+          f"{len(changed)} changed, {len(refused)} refused.")
+    sys.exit(1 if refused else 0)
 
 
 if __name__ == "__main__":

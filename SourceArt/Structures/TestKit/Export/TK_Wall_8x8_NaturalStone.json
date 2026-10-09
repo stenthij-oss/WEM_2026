@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "name": "TK_Wall_8x8_NaturalStone",
+  "blend": "TestKit.blend",
+  "object": "TK_Wall_8x8_NaturalStone",
+  "width": 8,
+  "length": 8,
+  "twoSided": false,
+  "categories": ["DA_Category_NaturalStone"],
+  "types": ["Wall"],
+  "loadBearing": true,
+  "holdsItems": true,
+  "fence": false,
+  "mayLieSideways": false,
+  "weight": 1.0,
+  "bounds": { "min": [-0.7, -0.7, 0.0], "max": [0.7, 0.7, 0.13] },
+  "exported": "2026-10-09T18:24:19"
+}

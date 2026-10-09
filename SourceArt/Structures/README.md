@@ -4,6 +4,9 @@ A **structure** is a mesh that fills a segment's opening between its beams. You 
 give it its settings in the **WEM** tab, press **Export**, then press **Import** in Unreal. The room
 manager draws from every structure in its `Structures` list, by weight, among those that fit.
 
+For many structures at once - tagging in bulk (**Copy Settings to Selected**), **Export Selected**,
+exporting from the command line, and how to organise a thousand panels - see `TUTORIAL.md`.
+
 ## The convention
 
 | | |

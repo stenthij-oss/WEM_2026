@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "name": "TK_Ground_8x8_ExteriorRural",
+  "blend": "TestKit.blend",
+  "object": "TK_Ground_8x8_ExteriorRural",
+  "width": 8,
+  "length": 8,
+  "twoSided": false,
+  "categories": ["DA_Category_ExteriorRural"],
+  "types": ["Ground"],
+  "loadBearing": true,
+  "holdsItems": true,
+  "fence": false,
+  "mayLieSideways": false,
+  "weight": 1.0,
+  "bounds": { "min": [-0.7, -0.7, 0.0], "max": [0.7, 0.7, 0.13] },
+  "exported": "2026-10-09T18:24:18"
+}
