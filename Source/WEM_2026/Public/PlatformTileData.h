@@ -6,22 +6,6 @@
 #include "Engine/DataAsset.h"
 #include "PlatformTileData.generated.h"
 
-class UStaticMesh;
-
-/** Which of a tile's two broad faces, if either, is closed off from being a surface. */
-UENUM(BlueprintType)
-enum class ETileBlockedFace : uint8
-{
-	/** Both faces are surfaces, as on any platform. */
-	None UMETA(DisplayName = "None"),
-
-	/** The face the tile's top looks out from: up from a floor, out along +X or +Y from a wall. */
-	Top UMETA(DisplayName = "Top"),
-
-	/** The face its underside looks out from: down from a ceiling, out along -X or -Y from a wall. */
-	Bottom UMETA(DisplayName = "Bottom")
-};
-
 /** Which ways growth may lay a tile: flat as a floor and ceiling, stood up as a wall, or either. */
 UENUM(BlueprintType)
 enum class ETileOrientation : uint8
@@ -37,8 +21,8 @@ enum class ETileOrientation : uint8
 };
 
 /**
- * One kind of tile a platform can be laid from: its size, how it may be turned, how often it is
- * chosen, and what it is built with.
+ * One kind of tile a platform can be laid from: its size, how it may be turned, and how often it
+ * is chosen. What fills it is the room manager's structures' business, not the tile's.
  *
  * Sizes are counted beam to beam - from the centre line of one rim to the centre line of the
  * next - since neighbouring platforms share their rims. A tile of 8 has seven cells of interior
@@ -85,25 +69,6 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tile", meta = (ClampMin = "0.0"))
 	float Weight = 1.0f;
-
-	/**
-	 * A broad face of the tile that is not a surface: across its interior that side carries
-	 * nothing, and never opens into floorspace with the tiles beside it. The beams around it are
-	 * shared with its neighbours and stay surfaces as they are.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tile|Surfaces")
-	ETileBlockedFace BlockedFace = ETileBlockedFace::None;
-
-	/**
-	 * Built in place of the plain box across the tile's interior, with its own materials. Left
-	 * empty, the box is drawn.
-	 *
-	 * Modelled in centimetres at the size of the interior - Width - 1 by Length - 1 cells, one
-	 * cell thick - around its own centre, with its width along X, its length along Y and its top
-	 * facing +Z. The beams around it are built apart, since neighbouring platforms share them.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Tile|Appearance")
-	TObjectPtr<UStaticMesh> Mesh;
 
 	/** Whether Orientation lets the tile be stood up as a wall (bVertical) or laid flat (not). */
 	bool AllowsOrientation(const bool bVertical) const

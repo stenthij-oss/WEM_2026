@@ -13,131 +13,13 @@
 #include "PlacementTestHelpers.h"
 #include "PlatformTileData.h"
 #include "RoomManager.h"
-
-/** What the tests read of the room manager's private state. Befriended by ARoomManager. */
-struct FRoomManagerTestAccess
-{
-	static void EnsureCandidates(ARoomManager& Manager)
-	{
-		Manager.EnsurePlatformCandidates();
-	}
-
-	static bool IsListed(const ARoomManager& Manager, const FGridPlatform& Platform)
-	{
-		for (const ARoomManager::FTileCandidates& Candidates : Manager.TileCandidates)
-		{
-			if (Candidates.Tile != Platform.Tile)
-			{
-				continue;
-			}
-
-			for (const TArray<FGridPlatform>& ByKind : Candidates.ByKind)
-			{
-				for (const FGridPlatform& Listed : ByKind)
-				{
-					if (Listed.MinNode == Platform.MinNode && Listed.Normal == Platform.Normal && Listed.bTurned == Platform.bTurned)
-					{
-						return true;
-					}
-				}
-			}
-		}
-
-		return false;
-	}
-
-	static TArray<FGridPlatform> GetListed(const ARoomManager& Manager)
-	{
-		TArray<FGridPlatform> Listed;
-		for (const ARoomManager::FTileCandidates& Candidates : Manager.TileCandidates)
-		{
-			for (const TArray<FGridPlatform>& ByKind : Candidates.ByKind)
-			{
-				Listed.Append(ByKind);
-			}
-		}
-
-		return Listed;
-	}
-
-	/** Runs the wholesale check and returns how many checks have drifted so far. */
-	static int32 Verify(ARoomManager& Manager)
-	{
-		Manager.VerifyIncrementalState();
-		return Manager.FailedVerifications;
-	}
-
-	static int32 GetFailedVerifications(const ARoomManager& Manager)
-	{
-		return Manager.FailedVerifications;
-	}
-
-	static int32 GetVerifiedPlacements(const ARoomManager& Manager)
-	{
-		return Manager.VerifiedPlacements;
-	}
-
-	static bool IsStale(const ARoomManager& Manager)
-	{
-		return Manager.bPlatformCandidatesStale;
-	}
-};
+#include "RoomManagerTestHelpers.h"
 
 namespace PlacementIntegrationTestsPrivate
 {
 	using namespace WEMPlacementTests;
-
-	/** A game world with nothing in it, torn down again when this goes out of scope. */
-	struct FScopedTestWorld
-	{
-		FScopedTestWorld()
-		{
-			World = UWorld::CreateWorld(EWorldType::Game, /*bInformEngineOfWorld=*/false, TEXT("WEMPlacementTestWorld"));
-			FWorldContext& Context = GEngine->CreateNewWorldContext(EWorldType::Game);
-			Context.SetCurrentWorld(World);
-		}
-
-		~FScopedTestWorld()
-		{
-			GEngine->DestroyWorldContext(World);
-			World->DestroyWorld(/*bInformEngineOfWorld=*/false);
-		}
-
-		UWorld* World = nullptr;
-	};
-
-	UPlatformTileData* MakeTile(const int32 Width, const int32 Length, const bool bCanTurn = false)
-	{
-		UPlatformTileData* Tile = NewObject<UPlatformTileData>(GetTransientPackage());
-		Tile->Width = Width;
-		Tile->Length = Length;
-		Tile->bCanTurn = bCanTurn;
-		Tile->AddToRoot();
-		return Tile;
-	}
-
-	/** A room manager with the designer's tile sizes, overlay and pieces off, on a fixed seed. */
-	ARoomManager* SpawnRoomManager(UWorld* World, TArray<UObject*>& OutRooted)
-	{
-		// Deferred, so its construction sees the tiles rather than warning that there are none.
-		ARoomManager* Manager = World->SpawnActorDeferred<ARoomManager>(ARoomManager::StaticClass(), FTransform::Identity);
-		Manager->bShowSurfaces = false;
-		Manager->bShowPieces = false;
-		Manager->bShowDebugGrid = false;
-		Manager->bSnapToLandscapeHeight = false;
-		Manager->PlatformRandomSeed = 1234;
-
-		UPlatformTileData* Square = MakeTile(16, 16);
-		UPlatformTileData* Small = MakeTile(8, 8);
-		UPlatformTileData* Long = MakeTile(8, 16, true);
-		OutRooted.Append({ Square, Small, Long });
-
-		Manager->FirstTile = Square;
-		Manager->Tiles = { Square, Small, Long };
-		Manager->FinishSpawning(FTransform::Identity);
-		Manager->ClearPlatforms();
-		return Manager;
-	}
+	using WEMRoomManagerTests::FScopedTestWorld;
+	using WEMRoomManagerTests::SpawnRoomManager;
 
 	UDataTable* MakeCatalog(TArray<UObject*>& OutRooted, const double CellSize = 20.0)
 	{

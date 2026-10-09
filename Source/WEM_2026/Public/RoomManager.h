@@ -13,6 +13,7 @@ class ULineBatchComponent;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
+class UPlatformStructureData;
 class UPlatformTileData;
 class UStaticMesh;
 
@@ -95,13 +96,25 @@ struct FGridPlatform
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
 	EGridAxis Normal = EGridAxis::Z;
 
-	/** The tile it was laid from, which gives it its size and what it is built with. */
+	/** The tile it was laid from, which gives it its size. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
 	TObjectPtr<UPlatformTileData> Tile;
 
 	/** Laid the other way round: the tile's length runs where its width would, and its width where its length would. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
 	bool bTurned = false;
+
+	/**
+	 * The structure filling the platform's positive face - up from a floor, out along +X or +Y from a
+	 * wall - and the one filling its negative face. A two-sided structure fills both and is held in
+	 * both. A platform placed before there were structures has neither: it is drawn with no fill, and
+	 * both of its faces carry anything.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	TObjectPtr<UPlatformStructureData> PositiveStructure;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	TObjectPtr<UPlatformStructureData> NegativeStructure;
 
 	EPlatformKind GetKind() const
 	{
@@ -143,8 +156,8 @@ struct FGridObstacle
 };
 
 /**
- * One kind of built piece - horizontal interior, vertical interior, a tile's own mesh, edge,
- * node - spread over a run of small instanced components, "chunks", filled one at a time.
+ * One kind of built piece - a structure, edge, node - spread over a run of small instanced
+ * components, "chunks", filled one at a time.
  *
  * Lumen throws away its surface cache for every instance of a component whose instance count
  * changes, then recaptures all of it over the frames that follow. With a kind of piece in one
@@ -159,8 +172,8 @@ struct FRoomPieceLayer
 
 	/**
 	 * Oldest first, and only the last is ever still being filled. The first is the actor's own
-	 * component for this kind of piece, or for a tile's mesh one made alongside the layer; the
-	 * rest are made as the structure grows. None but the actor's own are saved, and none are
+	 * component for this kind of piece, or for a structure one made alongside the layer; the rest
+	 * are made as the structure grows. None but the actor's own are saved, and none are
 	 * copied with the actor: each layer property on ARoomManager is DuplicateTransient.
 	 */
 	UPROPERTY(Transient)
@@ -173,16 +186,16 @@ struct FRoomPieceLayer
 	uint32 SyncStamp = 0;
 };
 
-/** The interiors of platforms whose tile brings a mesh of its own: one piece layer per tile. */
+/** The structures filling the platforms' openings: one piece layer per structure asset. */
 USTRUCT()
-struct FTileMeshLayer
+struct FStructureLayer
 {
 	GENERATED_BODY()
 
 	UPROPERTY(Transient)
-	TObjectPtr<UPlatformTileData> Tile;
+	TObjectPtr<UPlatformStructureData> Structure;
 
-	/** Its first chunk is made with the layer, set up like HorizontalInteriorPieces, rather than being one of the actor's own. */
+	/** Its first chunk is made with the layer, set up like EdgePieces, rather than being one of the actor's own. */
 	UPROPERTY(Transient)
 	FRoomPieceLayer Pieces;
 };
@@ -274,7 +287,17 @@ struct FSurfaceMarkLayer
  * and a surface that has opened is never closed again afterwards.
  *
  * Each beat rolls which kind to try first, then which tile, by the tiles' weights among those
- * with somewhere to go, then draws one of that tile's free placements.
+ * with somewhere to go, then draws one of that tile's free placements, and fills it.
+ *
+ * Structures
+ * ----------
+ * A platform is built as beams around an opening, and the opening is filled by structures - meshes
+ * made for it: one two-sided structure, filling both of its faces, or two one-sided ones, one per
+ * face. A face takes a structure whose types include its own: ground up from a floor, ceiling down
+ * from one, wall either side of a wall. The fill is drawn in the same beat as the platform, from a
+ * stream of its own, since what fills a platform can change where growth may go next. A tile that
+ * no structures could fill completely, laid a given way, is not laid that way, and the platform
+ * that starts growth is always filled with load-bearing structures.
  *
  * Surfaces
  * --------
@@ -283,8 +306,9 @@ struct FSurfaceMarkLayer
  * platforms facing two ways both run through carries surfaces along both.
  *
  * What a surface carries follows from the cell: interior surfaces carry anything, rim surfaces
- * walls only. A tile can close off one side of its interior (UPlatformTileData::BlockedFace), and
- * there it carries nothing and is not a surface at all. A surface is occupied once the cell it
+ * walls only. A structure that holds no items closes off the face it fills
+ * (UPlatformStructureData::bHoldsItems), and there the interior carries nothing and is not a
+ * surface at all. A surface is occupied once the cell it
  * looks into has been built, and occupancy outranks what it carries.
  *
  * A rim surface caught between two fields stops being rim and joins them: a wall surface
@@ -407,6 +431,13 @@ public:
 	float VerticalPlacementChance = 0.5f;
 
 	/**
+	 * The structures that fill the platforms' openings, each drawn by its weight among those that fit
+	 * the face. A plain list, like Tiles.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures")
+	TArray<TObjectPtr<UPlatformStructureData>> Structures;
+
+	/**
 	 * Every platform placed, in the order it was placed. This list alone is the simulation's
 	 * state; everything else is derived from it.
 	 *
@@ -436,23 +467,23 @@ public:
 	UPROPERTY(BlueprintReadOnly, Transient, Category = "Grid|Obstacles")
 	TArray<FGridObstacle> Obstacles;
 
-	/** Master toggle for the built geometry: every interior, edge and node. */
+	/** Master toggle for the built geometry: every beam, post and structure. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	bool bShowPieces = true;
 
 	/**
-	 * Unit box every piece is built from: the engine's 100cm cube, centred on its own origin.
-	 * Anything with those conventions can be swapped in. Across the interior of a tile with a
-	 * mesh of its own, that mesh is built instead.
+	 * Unit box every beam and post is built from: the engine's 100cm cube, centred on its own
+	 * origin. Anything with those conventions can be swapped in. The openings between them are
+	 * filled by the structures, with meshes of their own.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	TObjectPtr<UStaticMesh> PieceMesh;
 
 	/**
-	 * Material the pieces are built from. Lit, unlike the surface overlay laid over them: the
-	 * overlay is notation and reads best flat, while a platform is a thing standing in the world
+	 * Material the beams and posts are built from. Lit, unlike the surface overlay laid over them:
+	 * the overlay is notation and reads best flat, while a platform is a thing standing in the world
 	 * and needs light falling across it to read as one. Tinted per layer, so one material covers
-	 * every colour. It is expected to expose PieceColorParameterName.
+	 * both colours. It is expected to expose PieceColorParameterName.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	TObjectPtr<UMaterialInterface> PieceMaterial;
@@ -462,23 +493,15 @@ public:
 	FName PieceColorParameterName = FName(TEXT("Color"));
 
 	/**
-	 * The interiors of horizontal platforms - floor and ceiling at once. A tile's own mesh keeps
-	 * its own materials rather than taking this or the colour below.
+	 * The beams: one run per module edge of rim, however many platforms share it. The structures
+	 * keep their own materials.
 	 *
-	 * These are straight linear albedos and not pitched to suit an exposure: the pieces are
-	 * lit, so what lands on screen is whatever the level's exposure makes of them. A level left
-	 * on auto-exposure renormalises the whole frame and will wash these out however they are
-	 * set here - that is fixed in the level, with a post-process volume on manual exposure, not
+	 * This and the colour below are straight linear albedos and not pitched to suit an exposure:
+	 * the pieces are lit, so what lands on screen is whatever the level's exposure makes of them. A
+	 * level left on auto-exposure renormalises the whole frame and will wash these out however they
+	 * are set here - that is fixed in the level, with a post-process volume on manual exposure, not
 	 * by dimming the colour.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
-	FLinearColor HorizontalInteriorColor = FLinearColor(0.35f, 0.34f, 0.32f);
-
-	/** The interiors of vertical platforms. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
-	FLinearColor VerticalInteriorColor = FLinearColor(0.25f, 0.10f, 0.03f);
-
-	/** The beams: one run per module edge of rim, however many platforms share it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Pieces")
 	FLinearColor EdgeColor = FLinearColor(0.21f, 0.21f, 0.21f);
 
@@ -812,7 +835,7 @@ private:
 
 	/**
 	 * The colour one surface's square should be, or INDEX_NONE when the face is not a surface at
-	 * all - nothing built faces that way, or a tile has blocked that side off.
+	 * all - nothing built faces that way, or its structure closes that side off.
 	 */
 	int32 ResolveSurfaceMarkLayer(const FIntVector& Cell, EGridFace Face) const;
 
@@ -848,19 +871,17 @@ private:
 	/** Pieces sorted by the layer each goes to: one platform's worth, or the whole structure's. */
 	struct FGatheredPieces
 	{
-		TArray<FPlacedPiece> HorizontalInteriors;
-		TArray<FPlacedPiece> VerticalInteriors;
 		TArray<FPlacedPiece> Edges;
 		TArray<FPlacedPiece> Nodes;
 
-		/** Interiors of tiles that bring a mesh of their own, per tile. */
-		TMap<UPlatformTileData*, TArray<FPlacedPiece>> MeshInteriors;
+		/** The structures filling the openings, per structure. */
+		TMap<UPlatformStructureData*, TArray<FPlacedPiece>> Structures;
 	};
 
 	/**
-	 * Brings the built geometry in line with the platforms - one piece per interior, per module
-	 * edge and per node of rim - adding only what is new. Walks the whole structure. Returns how
-	 * many pieces it had to add.
+	 * Brings the built geometry in line with the platforms - one piece per structure filling an
+	 * opening, per module edge and per node of rim - adding only what is new. Walks the whole
+	 * structure. Returns how many pieces it had to add.
 	 */
 	int32 SyncPieces();
 
@@ -876,11 +897,11 @@ private:
 	/** Drops every piece of every kind, so the next sync builds the lot. */
 	void ResetPieces();
 
-	/** The layer a tile's mesh is built in, made the first time the tile needs one. */
-	FTileMeshLayer& FindOrAddTileMeshLayer(UPlatformTileData* Tile);
+	/** The layer a structure is built in, made the first time the structure needs one. */
+	FStructureLayer& FindOrAddStructureLayer(UPlatformStructureData* Structure);
 
-	/** Takes down every tile's mesh layer, first chunk and all. */
-	void ResetTileMeshLayers();
+	/** Takes down every structure's layer, first chunk and all. */
+	void ResetStructureLayers();
 
 	/**
 	 * Adds the pieces a layer has not drawn yet. If a piece it did draw is missing from Pieces,
@@ -973,8 +994,50 @@ private:
 	 */
 	bool IsFlushWith(const FGridPlatform& Platform, const FGridPlatform& Neighbour, int32 SharedAxis) const;
 
-	/** Brings the usable tiles and the warnings about the rest up to date with Tiles, FirstTile and the module. */
+	/**
+	 * Brings the usable tiles and structures, which ways each tile can be filled, and the warnings
+	 * about the rest up to date with Tiles, Structures, FirstTile and the module.
+	 */
 	void ResolveUsableTiles();
+
+	/** The usable structures, from Structures, with what is wrong with the rest added to OutProblems. */
+	void ResolveUsableStructures(TArray<FString>& OutProblems);
+
+	/**
+	 * Whether the usable structures can fill a platform facing NormalAxis with these spans
+	 * completely: one two-sided structure, or a one-sided one on each face. Only load-bearing ones
+	 * count when asked.
+	 */
+	bool HasCompleteFill(int32 NormalAxis, int32 SpanFirst, int32 SpanSecond, bool bLoadBearingOnly) const;
+
+	/**
+	 * The ways round, one bit each - as it is, then turned - that a usable tile can be laid as a kind
+	 * of platform and still be filled. Placements of it laid any other way are never drawn.
+	 */
+	uint8 GetFillableWays(int32 TileIndex, EPlatformKind Kind) const;
+
+	/**
+	 * The usable structures that may fill one face of a platform: every two-sided one that fits it,
+	 * and every one-sided one that fits this face - but those only when some one-sided structure
+	 * fits the face behind, so a draw never leaves a face empty. The second face of a one-sided fill
+	 * takes one-sided structures alone.
+	 */
+	void GatherFillOptions(
+		const FGridPlatform& Platform,
+		int32 FaceSign,
+		bool bSecondFace,
+		bool bLoadBearingOnly,
+		TArray<UPlatformStructureData*>& OutOptions) const;
+
+	/**
+	 * Draws the structures filling a platform that is about to be placed, from the structure
+	 * stream: a face first - the top of a floor, either face of a wall - then a structure for it,
+	 * and when that is one-sided, one for the face behind. False when nothing fits.
+	 */
+	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
+
+	/** Draws one of the options by weight from the structure stream. Null when there are none. */
+	UPlatformStructureData* DrawStructure(TConstArrayView<UPlatformStructureData*> Options);
 
 	/** Works out the pieces every obstacle cuts afresh from Obstacles. */
 	void RebuildObstacleKeys();
@@ -1029,7 +1092,7 @@ private:
 	 */
 	int32 FindInteriorOwner(const FIntVector& Cell, int32 NormalAxis) const;
 
-	/** Whether a platform's tile has blocked off this side of its interior. */
+	/** Whether the structure filling this face of a platform holds nothing, which closes its interior off on that side. */
 	bool IsFaceBlocked(const FGridPlatform& Platform, EGridFace Face) const;
 
 	/** Whether any platform covers this cell. */
@@ -1078,12 +1141,6 @@ private:
 	void UpdateDebugReadouts();
 
 	void AppendLatticeLines(TArray<FBatchedLine>& Lines) const;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> HorizontalInteriorPieceMaterial;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> VerticalInteriorPieceMaterial;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> EdgePieceMaterial;
@@ -1169,6 +1226,15 @@ private:
 	/** The tiles growth draws from: Tiles, less empty entries, repeats, and any that do not fit the lattice. */
 	TArray<TObjectPtr<UPlatformTileData>> UsableTiles;
 
+	/**
+	 * The structures growth fills platforms from: Structures, less empty entries, repeats, any with
+	 * no mesh, no type or no weight, and fences that are not two-sided.
+	 */
+	TArray<TObjectPtr<UPlatformStructureData>> UsableStructures;
+
+	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
+	TArray<uint8> FillableWays;
+
 	/** The shortest side of any usable tile: the narrowest step between two flush platforms that growth could still fill. */
 	int32 SmallestTileSide = 0;
 
@@ -1225,14 +1291,6 @@ private:
 	UPROPERTY(Transient, DuplicateTransient)
 	FSurfaceMarkLayer OccupiedMarkChunks;
 
-	/** Interiors of horizontal platforms. Starts from HorizontalInteriorPieces. */
-	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer HorizontalInteriorLayer;
-
-	/** Interiors of vertical platforms. Starts from VerticalInteriorPieces. */
-	UPROPERTY(Transient, DuplicateTransient)
-	FRoomPieceLayer VerticalInteriorLayer;
-
 	/** Module edges of rim, the beams. Starts from EdgePieces. */
 	UPROPERTY(Transient, DuplicateTransient)
 	FRoomPieceLayer EdgeLayer;
@@ -1241,11 +1299,17 @@ private:
 	UPROPERTY(Transient, DuplicateTransient)
 	FRoomPieceLayer NodeLayer;
 
-	/** Interiors of platforms whose tile brings its own mesh, a layer per tile. Made at runtime and never saved. */
+	/** The structures filling the openings, a layer per structure. Made at runtime and never saved. */
 	UPROPERTY(Transient, DuplicateTransient)
-	TArray<FTileMeshLayer> TileMeshLayers;
+	TArray<FStructureLayer> StructureLayers;
 
 	FRandomStream PlacementStream;
+
+	/**
+	 * What fills each platform is drawn from a stream of its own, so the platforms themselves are
+	 * drawn as they would be with no structures at all.
+	 */
+	FRandomStream StructureStream;
 
 	FTimerHandle PlacementTimerHandle;
 
@@ -1264,20 +1328,10 @@ private:
 	 */
 
 	/**
-	 * One instance per horizontal platform, spanning its whole interior - unless its tile brings
-	 * a mesh of its own, which is built in a layer of that tile's instead.
-	 *
-	 * A platform's interior is drawn as one box because it was placed as one thing; its rim is
-	 * drawn apart, as edges and nodes, because neighbours share it.
+	 * One instance per module edge of rim, spanning its run. Shared edges are built once. A
+	 * platform's rim is drawn apart from what fills it, as edges and nodes, because neighbours
+	 * share it. The structures' layers are set up like this one.
 	 */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> HorizontalInteriorPieces;
-
-	/** One instance per vertical platform, spanning its whole interior. */
-	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UInstancedStaticMeshComponent> VerticalInteriorPieces;
-
-	/** One instance per module edge of rim, spanning its run. Shared edges are built once. */
 	UPROPERTY(BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UInstancedStaticMeshComponent> EdgePieces;
 

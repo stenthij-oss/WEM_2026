@@ -3,8 +3,11 @@
 #include "RoomManager.h"
 
 #include "GridMath.h"
+#include "PlatformStructureData.h"
 #include "PlatformTileData.h"
+#include "StructurePlacement.h"
 #include "Algo/BinarySearch.h"
+#include "Algo/Count.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LineBatchComponent.h"
 #include "Components/SceneComponent.h"
@@ -82,6 +85,13 @@ namespace
 		TEXT("Every Nth placement, rebuilds ARoomManager's derived state and visuals from scratch and logs anything the\n")
 		TEXT("placements had built up differently. Costs a full rebuild each time, so leave it at 0 (off) outside of testing."),
 		ECVF_Default);
+
+	/** The ways round a tile can be laid, one bit each, as GetFillableWays reports them. */
+	constexpr uint8 AsLaidWay = 1 << 0;
+	constexpr uint8 TurnedWay = 1 << 1;
+
+	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
+	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
 	FORCEINLINE int32 AxisIndex(const EGridAxis Axis)
 	{
@@ -528,14 +538,9 @@ ARoomManager::ARoomManager()
 	GridLineBatcher->SetupAttachment(SceneRoot);
 
 	// Instanced rather than a component per piece: a cube fills with thousands of them. Each of
-	// these four is only the first chunk of its kind; SyncPieceLayer adds more as the structure
-	// grows, set up the way these are set up here.
-	HorizontalInteriorPieces = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("HorizontalInteriorPieces"));
-	HorizontalInteriorPieces->SetupAttachment(SceneRoot);
-
-	VerticalInteriorPieces = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("VerticalInteriorPieces"));
-	VerticalInteriorPieces->SetupAttachment(SceneRoot);
-
+	// these two is only the first chunk of its kind; SyncPieceLayer adds more as the structure
+	// grows, set up the way these are set up here. Each structure's layer starts from a chunk set up
+	// like the edges.
 	EdgePieces = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("EdgePieces"));
 	EdgePieces->SetupAttachment(SceneRoot);
 
@@ -551,8 +556,7 @@ ARoomManager::ARoomManager()
 	OccupiedSurfaceMarks = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("OccupiedSurfaceMarks"));
 	OccupiedSurfaceMarks->SetupAttachment(SceneRoot);
 
-	for (UInstancedStaticMeshComponent* Pieces :
-		{ HorizontalInteriorPieces.Get(), VerticalInteriorPieces.Get(), EdgePieces.Get(), NodePieces.Get() })
+	for (UInstancedStaticMeshComponent* Pieces : { EdgePieces.Get(), NodePieces.Get() })
 	{
 		// Every platform stands rather than marks, so it is lit and casts: without shadows falling
 		// off it the structure reads as flat as the notation laid over it. Still no collision,
@@ -989,6 +993,13 @@ void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandi
 			continue;
 		}
 
+		// It holds up whatever grows off it, so it is laid only a way round that load-bearing
+		// structures can fill.
+		if (!HasCompleteFill(AxisIndex(EGridAxis::Z), SpanX * Module, SpanY * Module, /*bLoadBearingOnly=*/true))
+		{
+			continue;
+		}
+
 		for (int32 SlotY = (ModulesPerSide - SpanY) / 2; SlotY <= (ModulesPerSide - SpanY + 1) / 2; ++SlotY)
 		{
 			for (int32 SlotX = (ModulesPerSide - SpanX) / 2; SlotX <= (ModulesPerSide - SpanX + 1) / 2; ++SlotX)
@@ -1141,20 +1152,34 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 	{
 		EnsurePlatformCandidates();
 
+		// A placement is only drawn laid a way round that the structures can fill. Where that is
+		// every way the tile is listed, every placement counts.
+		auto IsFillable = [this, Kind](const int32 TileIndex, const FGridPlatform& Candidate)
+		{
+			return (GetFillableWays(TileIndex, Kind) & (Candidate.bTurned ? TurnedWay : AsLaidWay)) != 0;
+		};
+
 		// The tile is rolled only among those with somewhere to go, so a tile with no room left
 		// never costs the beat while another has some. A tile kept to the other orientation has
-		// nowhere to go either; that is asked here rather than when the lists are kept, so a
-		// change to it takes effect on the very next beat.
-		auto GetDrawWeight = [Kind](const FTileCandidates& Candidates) -> float
+		// nowhere to go either, and nor has one with room only laid a way no structures can fill;
+		// both are asked here rather than when the lists are kept, so a change to either takes
+		// effect on the very next beat.
+		auto GetDrawWeight = [this, Kind, &IsFillable](const int32 TileIndex) -> float
 		{
+			const FTileCandidates& Candidates = TileCandidates[TileIndex];
 			const bool bAllowed = Candidates.Tile->AllowsOrientation(Kind == EPlatformKind::SurfaceVertical);
-			return !bAllowed || Candidates.ByKind[KindIndex(Kind)].IsEmpty() ? 0.0f : FMath::Max(Candidates.Tile->Weight, 0.0f);
+			const bool bHasRoom = Candidates.ByKind[KindIndex(Kind)].ContainsByPredicate([TileIndex, &IsFillable](const FGridPlatform& Candidate)
+			{
+				return IsFillable(TileIndex, Candidate);
+			});
+
+			return !bAllowed || !bHasRoom ? 0.0f : FMath::Max(Candidates.Tile->Weight, 0.0f);
 		};
 
 		float TotalWeight = 0.0f;
-		for (const FTileCandidates& Candidates : TileCandidates)
+		for (int32 TileIndex = 0; TileIndex < TileCandidates.Num(); ++TileIndex)
 		{
-			TotalWeight += GetDrawWeight(Candidates);
+			TotalWeight += GetDrawWeight(TileIndex);
 		}
 
 		if (TotalWeight <= 0.0f)
@@ -1163,11 +1188,11 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		}
 
 		float Roll = PlacementStream.FRand() * TotalWeight;
-		const FTileCandidates* ChosenTile = nullptr;
+		int32 ChosenTile = INDEX_NONE;
 
-		for (const FTileCandidates& Candidates : TileCandidates)
+		for (int32 TileIndex = 0; TileIndex < TileCandidates.Num(); ++TileIndex)
 		{
-			const float Weight = GetDrawWeight(Candidates);
+			const float Weight = GetDrawWeight(TileIndex);
 
 			if (Weight <= 0.0f)
 			{
@@ -1176,7 +1201,7 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 
 			// Taken whenever it is in the running, so rounding at the very top of the roll still
 			// lands on the last tile that could have been drawn.
-			ChosenTile = &Candidates;
+			ChosenTile = TileIndex;
 
 			if (Roll < Weight)
 			{
@@ -1186,10 +1211,32 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 			Roll -= Weight;
 		}
 
-		const TArray<FGridPlatform>& Candidates = ChosenTile->ByKind[KindIndex(Kind)];
+		const TArray<FGridPlatform>& Candidates = TileCandidates[ChosenTile].ByKind[KindIndex(Kind)];
 
-		// Copied out, since taking the platform in changes the list it was drawn from.
-		Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
+		// Drawn by place among the fillable ones, which are all of them unless a way round has no
+		// fill. Copied out, since taking the platform in changes the list it was drawn from.
+		const int32 Fillable = Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
+		{
+			return IsFillable(ChosenTile, Candidate);
+		});
+
+		int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
+
+		for (const FGridPlatform& Candidate : Candidates)
+		{
+			if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
+			{
+				Platform = Candidate;
+				break;
+			}
+		}
+	}
+
+	// The fill is drawn with the platform, before it is taken in, since what fills a face decides what
+	// that face carries. The platform that starts growth holds up everything that grows off it.
+	if (!DrawFill(Platform, /*bLoadBearingOnly=*/BuiltPlatforms.IsEmpty()))
+	{
+		return false;
 	}
 
 	Platforms.Add(Platform);
@@ -1238,7 +1285,12 @@ void ARoomManager::ClearPlatforms()
 void ARoomManager::ResetPlacementStream()
 {
 	// A zero seed means "different every run"; any other value replays the same growth.
-	PlacementStream.Initialize(PlatformRandomSeed != 0 ? PlatformRandomSeed : FMath::Rand());
+	const int32 Seed = PlatformRandomSeed != 0 ? PlatformRandomSeed : FMath::Rand();
+	PlacementStream.Initialize(Seed);
+
+	// The fills are drawn from the same seed but a stream apart, so a seed lays the same platforms
+	// whatever the structures draw in between.
+	StructureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Structures"))))));
 }
 
 void ARoomManager::AdvancePlacement()
@@ -1449,6 +1501,9 @@ void ARoomManager::ResolveUsableTiles()
 	const int32 Module = GetModule();
 	TArray<FString> Problems;
 
+	// The structures first, since which ways round a tile can be filled decides which ways it is laid.
+	ResolveUsableStructures(Problems);
+
 	for (UPlatformTileData* Tile : Tiles)
 	{
 		// An empty entry is only one not filled in yet, and a repeat adds nothing.
@@ -1471,6 +1526,41 @@ void ARoomManager::ResolveUsableTiles()
 		}
 	}
 
+	// Which ways round each tile can be filled, per kind. Every wall's first axis is level and its
+	// second up, whichever way it faces, so a wall facing X answers for both.
+	FillableWays.Reset();
+
+	for (const UPlatformTileData* Tile : UsableTiles)
+	{
+		for (const EPlatformKind Kind : { EPlatformKind::SurfaceHorizontal, EPlatformKind::SurfaceVertical })
+		{
+			const bool bVertical = Kind == EPlatformKind::SurfaceVertical;
+			const int32 NormalAxis = bVertical ? AxisIndex(EGridAxis::X) : AxisIndex(EGridAxis::Z);
+			uint8 Ways = 0;
+
+			for (const bool bTurned : { false, true })
+			{
+				const int32 SpanFirst = bTurned ? Tile->Length : Tile->Width;
+				const int32 SpanSecond = bTurned ? Tile->Width : Tile->Length;
+
+				if (HasCompleteFill(NormalAxis, SpanFirst, SpanSecond, /*bLoadBearingOnly=*/false))
+				{
+					Ways |= bTurned ? TurnedWay : AsLaidWay;
+				}
+			}
+
+			FillableWays.Add(Ways);
+
+			const bool bCanTurn = Tile->bCanTurn && Tile->Width != Tile->Length;
+
+			if (Tile->AllowsOrientation(bVertical) && (Ways & (bCanTurn ? (AsLaidWay | TurnedWay) : AsLaidWay)) == 0)
+			{
+				Problems.Add(FString::Printf(TEXT("no structures can fill tile '%s' (%d x %d) %s, so it is never laid that way"),
+					*Tile->GetName(), Tile->Width, Tile->Length, bVertical ? TEXT("stood up as a wall") : TEXT("laid flat")));
+			}
+		}
+	}
+
 	if (!FirstTile)
 	{
 		Problems.Add(TEXT("there is no FirstTile, so nothing grows"));
@@ -1484,6 +1574,12 @@ void ARoomManager::ResolveUsableTiles()
 	{
 		Problems.Add(FString::Printf(TEXT("FirstTile '%s' is kept to vertical, but the first platform is always laid horizontal, so nothing grows"),
 			*FirstTile->GetName()));
+	}
+	else if (!HasCompleteFill(AxisIndex(EGridAxis::Z), FirstTile->Width, FirstTile->Length, /*bLoadBearingOnly=*/true)
+		&& !(FirstTile->bCanTurn && HasCompleteFill(AxisIndex(EGridAxis::Z), FirstTile->Length, FirstTile->Width, /*bLoadBearingOnly=*/true)))
+	{
+		Problems.Add(FString::Printf(TEXT("no load-bearing structures can fill FirstTile '%s' (%d x %d) laid flat, and the first platform holds up all the rest, so nothing grows"),
+			*FirstTile->GetName(), FirstTile->Width, FirstTile->Length));
 	}
 
 	// This runs on every edit and every check, so the warning is only given when what it would
@@ -1499,6 +1595,198 @@ void ARoomManager::ResolveUsableTiles()
 			UE_LOG(LogTemp, Warning, TEXT("RoomManager: %s."), *Report);
 		}
 	}
+}
+
+void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
+{
+	UsableStructures.Reset();
+
+	for (UPlatformStructureData* Structure : Structures)
+	{
+		// An empty entry is only one not filled in yet, and a repeat adds nothing.
+		if (!Structure || UsableStructures.Contains(Structure))
+		{
+			continue;
+		}
+
+		if (!Structure->Mesh)
+		{
+			OutProblems.Add(FString::Printf(TEXT("structure '%s' has no mesh, and is left out"), *Structure->GetName()));
+			continue;
+		}
+
+		// A fence runs as one piece through the segment, both faces at once.
+		if (Structure->bFence && !Structure->bTwoSided)
+		{
+			OutProblems.Add(FString::Printf(TEXT("structure '%s' is a fence but not two-sided, as every fence is, and is left out"), *Structure->GetName()));
+			continue;
+		}
+
+		// One of no type fits no face, and one of no weight is never drawn: both are left out as asked.
+		if (Structure->Types == 0 || Structure->Weight <= 0.0f)
+		{
+			continue;
+		}
+
+		UsableStructures.Add(Structure);
+	}
+}
+
+bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const int32 SpanFirst, const int32 SpanSecond, const bool bLoadBearingOnly) const
+{
+	bool bFrontFits = false;
+	bool bBackFits = false;
+
+	for (const UPlatformStructureData* Structure : UsableStructures)
+	{
+		if (bLoadBearingOnly && !Structure->bLoadBearing)
+		{
+			continue;
+		}
+
+		bool bTurned = false;
+
+		// A two-sided structure fits only where it fits both faces, so one is enough.
+		if (Structure->bTwoSided)
+		{
+			if (WEMStructures::FitsFace(*Structure, NormalAxis, 1, SpanFirst, SpanSecond, bTurned))
+			{
+				return true;
+			}
+
+			continue;
+		}
+
+		bFrontFits = bFrontFits || WEMStructures::FitsFace(*Structure, NormalAxis, 1, SpanFirst, SpanSecond, bTurned);
+		bBackFits = bBackFits || WEMStructures::FitsFace(*Structure, NormalAxis, -1, SpanFirst, SpanSecond, bTurned);
+	}
+
+	return bFrontFits && bBackFits;
+}
+
+uint8 ARoomManager::GetFillableWays(const int32 TileIndex, const EPlatformKind Kind) const
+{
+	const int32 Index = TileIndex * PlatformKindCount + KindIndex(Kind);
+
+	return FillableWays.IsValidIndex(Index) ? FillableWays[Index] : 0;
+}
+
+void ARoomManager::GatherFillOptions(
+	const FGridPlatform& Platform,
+	const int32 FaceSign,
+	const bool bSecondFace,
+	const bool bLoadBearingOnly,
+	TArray<UPlatformStructureData*>& OutOptions) const
+{
+	OutOptions.Reset();
+
+	int32 SpanU, SpanV;
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return;
+	}
+
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+	auto Fits = [&](const UPlatformStructureData* Structure, const int32 Sign)
+	{
+		bool bTurned = false;
+		return (!bLoadBearingOnly || Structure->bLoadBearing)
+			&& WEMStructures::FitsFace(*Structure, NormalAxis, Sign, SpanU, SpanV, bTurned);
+	};
+
+	// A one-sided structure leaves the face behind it to another, so it is only offered when there
+	// is one that could fill it. The second face has nothing behind it to leave.
+	bool bBackCanBeFilled = bSecondFace;
+
+	for (int32 Index = 0; !bBackCanBeFilled && Index < UsableStructures.Num(); ++Index)
+	{
+		bBackCanBeFilled = !UsableStructures[Index]->bTwoSided && Fits(UsableStructures[Index], -FaceSign);
+	}
+
+	for (UPlatformStructureData* Structure : UsableStructures)
+	{
+		const bool bOffered = Structure->bTwoSided ? !bSecondFace : bBackCanBeFilled;
+
+		if (bOffered && Fits(Structure, FaceSign))
+		{
+			OutOptions.Add(Structure);
+		}
+	}
+}
+
+bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly)
+{
+	Platform.PositiveStructure = nullptr;
+	Platform.NegativeStructure = nullptr;
+
+	// A floor or ceiling is filled from its top, the face it is walked on. A wall has no such side, so
+	// either face goes first, evenly.
+	const bool bHorizontal = Platform.GetKind() == EPlatformKind::SurfaceHorizontal;
+	const int32 FirstSign = (bHorizontal || StructureStream.FRand() < 0.5f) ? 1 : -1;
+
+	TArray<UPlatformStructureData*> Options;
+	GatherFillOptions(Platform, FirstSign, /*bSecondFace=*/false, bLoadBearingOnly, Options);
+
+	UPlatformStructureData* First = DrawStructure(Options);
+
+	if (!First)
+	{
+		return false;
+	}
+
+	if (First->bTwoSided)
+	{
+		Platform.PositiveStructure = First;
+		Platform.NegativeStructure = First;
+		return true;
+	}
+
+	GatherFillOptions(Platform, -FirstSign, /*bSecondFace=*/true, bLoadBearingOnly, Options);
+
+	UPlatformStructureData* Second = DrawStructure(Options);
+
+	if (!Second)
+	{
+		return false;
+	}
+
+	Platform.PositiveStructure = FirstSign > 0 ? First : Second;
+	Platform.NegativeStructure = FirstSign > 0 ? Second : First;
+	return true;
+}
+
+UPlatformStructureData* ARoomManager::DrawStructure(const TConstArrayView<UPlatformStructureData*> Options)
+{
+	float TotalWeight = 0.0f;
+	for (const UPlatformStructureData* Option : Options)
+	{
+		TotalWeight += Option->Weight;
+	}
+
+	if (TotalWeight <= 0.0f)
+	{
+		return nullptr;
+	}
+
+	float Roll = StructureStream.FRand() * TotalWeight;
+	UPlatformStructureData* Chosen = nullptr;
+
+	for (UPlatformStructureData* Option : Options)
+	{
+		// Taken whenever it is in the running, so rounding at the very top of the roll still lands on
+		// the last option.
+		Chosen = Option;
+
+		if (Roll < Option->Weight)
+		{
+			break;
+		}
+
+		Roll -= Option->Weight;
+	}
+
+	return Chosen;
 }
 
 void ARoomManager::RebuildPlatformState()
@@ -2207,19 +2495,11 @@ int32 ARoomManager::FindInteriorOwner(const FIntVector& Cell, const int32 Normal
 
 bool ARoomManager::IsFaceBlocked(const FGridPlatform& Platform, const EGridFace Face) const
 {
-	if (!Platform.Tile)
-	{
-		return false;
-	}
+	// The structure filling that face answers for it. A two-sided one is held on both faces, so it
+	// answers for both; a platform with no structure holds anything.
+	const UPlatformStructureData* Structure = FaceSign(Face) > 0 ? Platform.PositiveStructure : Platform.NegativeStructure;
 
-	// Top and bottom are the tile's own, and a platform always lies with its top looking out
-	// along its normal - up from a floor, out along +X or +Y from a wall.
-	switch (Platform.Tile->BlockedFace)
-	{
-	case ETileBlockedFace::Top: return FaceSign(Face) > 0;
-	case ETileBlockedFace::Bottom: return FaceSign(Face) < 0;
-	default: return false;
-	}
+	return Structure && !Structure->bHoldsItems;
 }
 
 bool ARoomManager::IsSolidCell(const FIntVector& Cell) const
@@ -2429,7 +2709,7 @@ void ARoomManager::ResolveSurface(
 		return;
 	}
 
-	// A side a tile has blocked off is not a surface at all. Only an interior can be: the rim
+	// A side its structure closes off is not a surface at all. Only an interior can be: the rim
 	// around it is shared with its neighbours, and stays a surface for them.
 	if (InteriorOwner != INDEX_NONE && IsFaceBlocked(BuiltPlatforms[InteriorOwner], Face))
 	{
@@ -2497,7 +2777,7 @@ void ARoomManager::UpdateDebugReadouts()
 					{
 						const EGridFace Face = MakeFace(Axis, Sign);
 
-						// A side a tile has blocked off is no surface to find.
+						// A side its structure closes off is no surface to find.
 						if (InteriorOwner != INDEX_NONE && IsFaceBlocked(BuiltPlatforms[InteriorOwner], Face))
 						{
 							continue;
@@ -2605,7 +2885,7 @@ UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(
 
 int32 ARoomManager::SyncPieces()
 {
-	if (!HorizontalInteriorPieces || !VerticalInteriorPieces || !EdgePieces || !NodePieces)
+	if (!EdgePieces || !NodePieces)
 	{
 		return 0;
 	}
@@ -2626,38 +2906,32 @@ int32 ARoomManager::SyncPieces()
 
 	int32 AddedPieces = 0;
 
-	AddedPieces += SyncPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, Pieces.HorizontalInteriors, PieceMesh, ResolveTintedMaterial(
-		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
-
-	AddedPieces += SyncPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces, Pieces.VerticalInteriors, PieceMesh, ResolveTintedMaterial(
-		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
-
 	AddedPieces += SyncPieceLayer(EdgeLayer, EdgePieces, Pieces.Edges, PieceMesh, ResolveTintedMaterial(
 		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
 
 	AddedPieces += SyncPieceLayer(NodeLayer, NodePieces, Pieces.Nodes, PieceMesh, ResolveTintedMaterial(
 		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
 
-	// A tile that brings its own mesh has a layer of its own. One whose tile has nothing left to
-	// build - taken out of the structure, or its mesh cleared - is taken down rather than kept empty.
-	for (int32 LayerIndex = TileMeshLayers.Num() - 1; LayerIndex >= 0; --LayerIndex)
+	// Every structure has a layer of its own. One with nothing left to build - no longer filling any
+	// platform, or its mesh cleared - is taken down rather than kept empty.
+	for (int32 LayerIndex = StructureLayers.Num() - 1; LayerIndex >= 0; --LayerIndex)
 	{
-		FTileMeshLayer& Layer = TileMeshLayers[LayerIndex];
+		FStructureLayer& Layer = StructureLayers[LayerIndex];
 
-		if (!Pieces.MeshInteriors.Contains(Layer.Tile.Get()))
+		if (!Pieces.Structures.Contains(Layer.Structure.Get()))
 		{
 			ResetChunks(Layer.Pieces.Chunks, nullptr);
-			TileMeshLayers.RemoveAt(LayerIndex);
+			StructureLayers.RemoveAt(LayerIndex);
 		}
 	}
 
-	// The mesh keeps its own materials, so no tint is put over it.
-	for (const TPair<UPlatformTileData*, TArray<FPlacedPiece>>& MeshInteriors : Pieces.MeshInteriors)
+	// A structure keeps its own materials, so no tint is put over it.
+	for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& StructurePieces : Pieces.Structures)
 	{
-		FTileMeshLayer& Layer = FindOrAddTileMeshLayer(MeshInteriors.Key);
+		FStructureLayer& Layer = FindOrAddStructureLayer(StructurePieces.Key);
 
 		AddedPieces += SyncPieceLayer(
-			Layer.Pieces, Layer.Pieces.Chunks[0], MeshInteriors.Value, MeshInteriors.Key->Mesh, /*Material=*/nullptr);
+			Layer.Pieces, Layer.Pieces.Chunks[0], StructurePieces.Value, StructurePieces.Key->Mesh, /*Material=*/nullptr);
 	}
 
 	// Only a sync that built every platform can be added to one placement at a time.
@@ -2668,12 +2942,9 @@ int32 ARoomManager::SyncPieces()
 
 void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 {
-	bool bLayersIntact = IsPieceLayerIntact(HorizontalInteriorLayer, HorizontalInteriorPieces)
-		&& IsPieceLayerIntact(VerticalInteriorLayer, VerticalInteriorPieces)
-		&& IsPieceLayerIntact(EdgeLayer, EdgePieces)
-		&& IsPieceLayerIntact(NodeLayer, NodePieces);
+	bool bLayersIntact = IsPieceLayerIntact(EdgeLayer, EdgePieces) && IsPieceLayerIntact(NodeLayer, NodePieces);
 
-	for (const FTileMeshLayer& Layer : TileMeshLayers)
+	for (const FStructureLayer& Layer : StructureLayers)
 	{
 		bLayersIntact = bLayersIntact
 			&& !Layer.Pieces.Chunks.IsEmpty()
@@ -2702,7 +2973,7 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
 
 			// Any stamp but zero marks a piece as drawn, and the full sync that made this layer
-			// complete - or the making of a tile's layer - left SyncStamp above zero.
+			// complete - or the making of a structure's layer - left SyncStamp above zero.
 			if (Stamp == 0)
 			{
 				Stamp = Layer.SyncStamp;
@@ -2724,25 +2995,19 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
 	};
 
-	AppendToFixedLayer(HorizontalInteriorLayer, HorizontalInteriorPieces, Pieces.HorizontalInteriors, ResolveTintedMaterial(
-		HorizontalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, HorizontalInteriorColor));
-
-	AppendToFixedLayer(VerticalInteriorLayer, VerticalInteriorPieces, Pieces.VerticalInteriors, ResolveTintedMaterial(
-		VerticalInteriorPieceMaterial, PieceMaterial, PieceColorParameterName, VerticalInteriorColor));
-
 	AppendToFixedLayer(EdgeLayer, EdgePieces, Pieces.Edges, ResolveTintedMaterial(
 		EdgePieceMaterial, PieceMaterial, PieceColorParameterName, EdgeColor));
 
 	AppendToFixedLayer(NodeLayer, NodePieces, Pieces.Nodes, ResolveTintedMaterial(
 		NodePieceMaterial, PieceMaterial, PieceColorParameterName, NodeColor));
 
-	for (const TPair<UPlatformTileData*, TArray<FPlacedPiece>>& MeshInteriors : Pieces.MeshInteriors)
+	for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& StructurePieces : Pieces.Structures)
 	{
-		FTileMeshLayer& Layer = FindOrAddTileMeshLayer(MeshInteriors.Key);
-		ApplyMeshAndMaterial(Layer.Pieces.Chunks, MeshInteriors.Key->Mesh, /*Material=*/nullptr);
+		FStructureLayer& Layer = FindOrAddStructureLayer(StructurePieces.Key);
+		ApplyMeshAndMaterial(Layer.Pieces.Chunks, StructurePieces.Key->Mesh, /*Material=*/nullptr);
 
 		TArray<FTransform> NewPieces;
-		AppendToLayer(Layer.Pieces, MeshInteriors.Value, NewPieces);
+		AppendToLayer(Layer.Pieces, StructurePieces.Value, NewPieces);
 		AddPiecesToLayer(Layer.Pieces, Layer.Pieces.Chunks[0], NewPieces);
 	}
 }
@@ -2762,36 +3027,34 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 		return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
 	};
 
-	int32 U, V;
-	GetInPlaneAxes(NormalAxis, U, V);
-
-	// One piece for the whole interior - a platform is one thing that was placed, so it is drawn
-	// as one thing.
-	FVector InteriorExtent(CellSize);
-	InteriorExtent[U] = static_cast<double>(SpanU - 1) * CellSize;
-	InteriorExtent[V] = static_cast<double>(SpanV - 1) * CellSize;
-
-	const FIntVector InteriorMinCell = Platform.MinNode + AxisStep(U) + AxisStep(V);
+	// The opening is filled by its structures, each laid on the face it fills. A two-sided one is a
+	// single piece through both faces; a one-sided pair is two, keyed apart. A structure that no
+	// longer fits the opening - its size changed since it was drawn - is not drawn across it.
 	const uint64 PlatformKey = MakePlatformKey(Platform);
+	const FVector MinCorner = GetCellMinCorner(Platform.MinNode);
 
-	if (Platform.Tile && Platform.Tile->Mesh)
+	auto AddStructure = [&](UPlatformStructureData* Structure, const int32 FaceSign, const uint64 Key)
 	{
-		// The tile's own mesh stands at the interior's centre at its own size, its top looking
-		// out along the platform's normal and its width running wherever the tile's width does.
-		const FVector Normal(AxisStep(NormalAxis));
-		const FVector WidthDirection(AxisStep(Platform.bTurned ? V : U));
-		const FVector Centre = GetCellMinCorner(InteriorMinCell) + 0.5 * InteriorExtent;
+		bool bTurned = false;
 
-		OutPieces.MeshInteriors.FindOrAdd(Platform.Tile.Get()).Add(FPlacedPiece{
-			PlatformKey, FTransform(FRotationMatrix::MakeFromXZ(WidthDirection, Normal).ToQuat(), Centre) });
+		if (!Structure || !Structure->Mesh
+			|| !WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, SpanU, SpanV, bTurned))
+		{
+			return;
+		}
+
+		OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{
+			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, SpanU, SpanV, FaceSign, bTurned, Structure->bTwoSided) });
+	};
+
+	if (Platform.PositiveStructure && Platform.PositiveStructure->bTwoSided)
+	{
+		AddStructure(Platform.PositiveStructure, 1, PlatformKey);
 	}
 	else
 	{
-		TArray<FPlacedPiece>& InteriorBoxes = Platform.GetKind() == EPlatformKind::SurfaceHorizontal
-			? OutPieces.HorizontalInteriors
-			: OutPieces.VerticalInteriors;
-
-		InteriorBoxes.Add(FPlacedPiece{ PlatformKey, MakeBox(InteriorMinCell, InteriorExtent) });
+		AddStructure(Platform.PositiveStructure, 1, PlatformKey);
+		AddStructure(Platform.NegativeStructure, -1, PlatformKey | NegativeFacePieceBit);
 	}
 
 	// The rim is drawn per module edge and per node, each named by what it is rather than by the
@@ -2821,26 +3084,24 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 
 void ARoomManager::ResetPieces()
 {
-	ResetPieceLayer(HorizontalInteriorLayer, HorizontalInteriorPieces);
-	ResetPieceLayer(VerticalInteriorLayer, VerticalInteriorPieces);
 	ResetPieceLayer(EdgeLayer, EdgePieces);
 	ResetPieceLayer(NodeLayer, NodePieces);
-	ResetTileMeshLayers();
+	ResetStructureLayers();
 
 	bPiecesComplete = false;
 }
 
-FTileMeshLayer& ARoomManager::FindOrAddTileMeshLayer(UPlatformTileData* Tile)
+FStructureLayer& ARoomManager::FindOrAddStructureLayer(UPlatformStructureData* Structure)
 {
-	FTileMeshLayer* Layer = TileMeshLayers.FindByPredicate([Tile](const FTileMeshLayer& Existing)
+	FStructureLayer* Layer = StructureLayers.FindByPredicate([Structure](const FStructureLayer& Existing)
 	{
-		return Existing.Tile == Tile;
+		return Existing.Structure == Structure;
 	});
 
 	if (!Layer)
 	{
-		Layer = &TileMeshLayers.AddDefaulted_GetRef();
-		Layer->Tile = Tile;
+		Layer = &StructureLayers.AddDefaulted_GetRef();
+		Layer->Structure = Structure;
 	}
 
 	// Its first chunk is made here rather than being one of the actor's own, so if that has been
@@ -2853,22 +3114,22 @@ FTileMeshLayer& ARoomManager::FindOrAddTileMeshLayer(UPlatformTileData* Tile)
 		// A stamp of zero means "not drawn yet", so the layer's own has to start above it.
 		Layer->Pieces.SyncStamp = FMath::Max<uint32>(Layer->Pieces.SyncStamp, 1);
 
-		// Set up like the plain interiors it stands in for. The tile's mesh, with its own
-		// materials, goes on when the layer is first filled.
-		AddInstancedChunk(Layer->Pieces.Chunks, HorizontalInteriorPieces, FName(*FString::Printf(TEXT("%s_Pieces"), *Tile->GetName())));
+		// Set up like the beams it stands among: lit, casting shadows, with no collision. The
+		// structure's mesh, with its own materials, goes on when the layer is first filled.
+		AddInstancedChunk(Layer->Pieces.Chunks, EdgePieces, FName(*FString::Printf(TEXT("%s_Pieces"), *Structure->GetName())));
 	}
 
 	return *Layer;
 }
 
-void ARoomManager::ResetTileMeshLayers()
+void ARoomManager::ResetStructureLayers()
 {
-	for (FTileMeshLayer& Layer : TileMeshLayers)
+	for (FStructureLayer& Layer : StructureLayers)
 	{
 		ResetChunks(Layer.Pieces.Chunks, nullptr);
 	}
 
-	TileMeshLayers.Reset();
+	StructureLayers.Reset();
 }
 
 int32 ARoomManager::SyncPieceLayer(
@@ -3406,7 +3667,7 @@ int32 ARoomManager::SyncSurfaceMarks()
 			{
 				for (const EGridFace Face : PlatformFaces)
 				{
-					// A side a tile has blocked off is no surface, and never has a square.
+					// A side its structure closes off is no surface, and never has a square.
 					const int32 Layer = ResolveSurfaceMarkLayer(Cell, Face);
 
 					if (Layer == INDEX_NONE)
@@ -3479,7 +3740,7 @@ void ARoomManager::UpdateSurfaceMarks(const TConstArrayView<FGridSurfaceRef> Sur
 	// A surface can be named more than once; after the first it is already the right colour.
 	for (const FGridSurfaceRef& Surface : Surfaces)
 	{
-		// A side a tile has blocked off is no surface, and never has a square.
+		// A side its structure closes off is no surface, and never has a square.
 		const int32 Layer = ResolveSurfaceMarkLayer(Surface.Cell, Surface.Face);
 
 		if (Layer == INDEX_NONE)
