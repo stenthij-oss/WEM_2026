@@ -4,8 +4,14 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
+#include "HAL/FileManager.h"
 #include "MeshDescription.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "Misc/AutomationTest.h"
 #include "PlatformStructureData.h"
 #include "StaticMeshAttributes.h"
@@ -187,6 +193,88 @@ bool FStructureImportCalibrationTest::RunTest(const FString& Parameters)
 		Centroid.Equals(Expected, 1.0));
 	TestTrue(FString::Printf(TEXT("Blender's up is the mesh's up: the relief tops out at 25 cm (got %.2f)"), TopHeight), FMath::IsNearlyEqual(TopHeight, 25.0, 0.5));
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureImportCategoryListTest, "WEM.Structures.Import.CategoryList", StructureImportTestsPrivate::TestFlags)
+
+bool FStructureImportCategoryListTest::RunTest(const FString& Parameters)
+{
+	// The format the brief gives, two spaces, a category to a line - and a name that needs escaping.
+	const FString Json = WEMStructureImport::FormatCategoryList({
+		{ TEXT("DA_Category_ExteriorUrban"), TEXT("Exterior: Urban") },
+		{ TEXT("DA_Category_Quoted"), TEXT("Say \"hi\"") } });
+
+	const FString Expected =
+		TEXT("{\n")
+		TEXT("  \"format\": 1,\n")
+		TEXT("  \"categories\": [\n")
+		TEXT("    { \"asset\": \"DA_Category_ExteriorUrban\", \"name\": \"Exterior: Urban\" },\n")
+		TEXT("    { \"asset\": \"DA_Category_Quoted\", \"name\": \"Say \\\"hi\\\"\" }\n")
+		TEXT("  ]\n")
+		TEXT("}\n");
+
+	TestEqual(TEXT("categories.json reads as the brief shows it"), Json, Expected);
+
+	// And it is JSON that reads back.
+	TSharedPtr<FJsonObject> Object;
+	TestTrue(TEXT("It parses"), FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Object) && Object.IsValid());
+	TestEqual(TEXT("With both categories"), Object.IsValid() ? Object->GetArrayField(TEXT("categories")).Num() : 0, 2);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureImportChangesTest, "WEM.Structures.Import.Changes", StructureImportTestsPrivate::TestFlags)
+
+bool FStructureImportChangesTest::RunTest(const FString& Parameters)
+{
+	FStructureValues Before;
+	Before.Width = 8;
+	Before.Length = 16;
+	Before.Types = static_cast<int32>(EStructureType::Wall);
+	Before.Categories = { TEXT("DA_Category_ExteriorUrban") };
+
+	TestEqual(TEXT("Nothing changed, nothing reported"), WEMStructureImport::DescribeChanges(Before, Before).Num(), 0);
+
+	// A user who switched load-bearing off in Unreal, and a file that adds a category and a type: the
+	// report says what the file put back and what it changed.
+	FStructureValues Edited = Before;
+	Edited.bLoadBearing = false;
+
+	FStructureValues FromFile = Before;
+	FromFile.Types |= static_cast<int32>(EStructureType::Ground);
+	FromFile.Categories.Add(TEXT("DA_Category_NaturalSand"));
+
+	const TArray<FString> Changes = WEMStructureImport::DescribeChanges(Edited, FromFile);
+	TestEqual(TEXT("Three values changed"), Changes.Num(), 3);
+	TestTrue(TEXT("The types"), Changes.Contains(TEXT("Types: Wall -> Ground, Wall")));
+	TestTrue(TEXT("The categories"), Changes.Contains(TEXT("Categories: DA_Category_ExteriorUrban -> DA_Category_ExteriorUrban, DA_Category_NaturalSand")));
+	TestTrue(TEXT("And the setting made in Unreal that the file overwrote"), Changes.Contains(TEXT("Load-bearing: off -> on")));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureImportHashTest, "WEM.Structures.Import.Hash", StructureImportTestsPrivate::TestFlags)
+
+bool FStructureImportHashTest::RunTest(const FString& Parameters)
+{
+	const FString Folder = FPaths::ProjectSavedDir() / TEXT("Automation") / TEXT("StructureImportHash");
+	const FString Mesh = Folder / TEXT("Test.glb");
+	const FString Settings = Folder / TEXT("Test.json");
+
+	FFileHelper::SaveStringToFile(TEXT("mesh"), *Mesh);
+	FFileHelper::SaveStringToFile(TEXT("{ \"format\": 1 }"), *Settings);
+	const FString First = WEMStructureImport::HashFiles({ Mesh, Settings });
+
+	TestFalse(TEXT("Two files hash"), First.IsEmpty());
+	TestEqual(TEXT("The same files hash the same"), WEMStructureImport::HashFiles({ Mesh, Settings }), First);
+
+	FFileHelper::SaveStringToFile(TEXT("{ \"format\": 1, \"weight\": 2 }"), *Settings);
+	TestNotEqual(TEXT("A changed settings file changes the hash"), WEMStructureImport::HashFiles({ Mesh, Settings }), First);
+
+	TestTrue(TEXT("A missing file gives no hash"), WEMStructureImport::HashFiles({ Folder / TEXT("Missing.glb") }).IsEmpty());
+
+	IFileManager::Get().DeleteDirectory(*Folder, /*RequireExists=*/false, /*Tree=*/true);
 	return true;
 }
 

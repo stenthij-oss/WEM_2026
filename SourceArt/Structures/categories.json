@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "categories": [
+    { "asset": "DA_Category_ExteriorIndustrial", "name": "Exterior: Industrial" },
+    { "asset": "DA_Category_ExteriorRural", "name": "Exterior: Rural" },
+    { "asset": "DA_Category_ExteriorUrban", "name": "Exterior: Urban" },
+    { "asset": "DA_Category_InteriorDomestic", "name": "Interior: Domestic" },
+    { "asset": "DA_Category_InteriorOffice", "name": "Interior: Office" },
+    { "asset": "DA_Category_NaturalFlora", "name": "Natural: Flora" },
+    { "asset": "DA_Category_NaturalSand", "name": "Natural: Sand" },
+    { "asset": "DA_Category_NaturalStone", "name": "Natural: Stone" }
+  ]
+}

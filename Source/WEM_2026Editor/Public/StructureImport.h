@@ -44,6 +44,27 @@ struct FStructureSettings
 	FString Exported;
 };
 
+/**
+ * What the importer writes onto a structure asset from its settings file, as plain values, so a
+ * re-import can say what it changed. The weight is not among them: the file only gives a new
+ * structure its first.
+ */
+struct FStructureValues
+{
+	int32 Width = 0;
+	int32 Length = 0;
+	bool bTwoSided = false;
+	int32 Types = 0;
+
+	/** Category asset names, in order. */
+	TArray<FString> Categories;
+
+	bool bLoadBearing = true;
+	bool bHoldsItems = true;
+	bool bFence = false;
+	bool bMayLieSideways = false;
+};
+
 /** The structure import with no assets or editor attached: reading settings files and checking meshes against them. */
 namespace WEMStructureImport
 {
@@ -74,4 +95,16 @@ namespace WEMStructureImport
 
 	/** Whether two boxes agree to within SizeToleranceCm on every side. */
 	WEM_2026EDITOR_API bool BoundsMatch(const FBox& Expected, const FBox& Measured);
+
+	/**
+	 * categories.json, which the Blender add-on reads: every category's asset name and display name,
+	 * in the order given, as two-space JSON.
+	 */
+	WEM_2026EDITOR_API FString FormatCategoryList(TConstArrayView<TPair<FString, FString>> Categories);
+
+	/** Every value that differs between two sets, as "Name: old -> new", in a fixed order. */
+	WEM_2026EDITOR_API TArray<FString> DescribeChanges(const FStructureValues& Old, const FStructureValues& New);
+
+	/** One hash of several files' bytes, in order. Empty when one cannot be read. */
+	WEM_2026EDITOR_API FString HashFiles(TConstArrayView<FString> Paths);
 }

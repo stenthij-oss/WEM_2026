@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "name": "TK_Fence_Parapet_16x8",
+  "blend": "TestKit.blend",
+  "object": "TK_Fence_Parapet_16x8",
+  "width": 16,
+  "length": 8,
+  "twoSided": true,
+  "categories": ["DA_Category_ExteriorIndustrial"],
+  "types": ["Wall"],
+  "loadBearing": false,
+  "holdsItems": true,
+  "fence": true,
+  "mayLieSideways": false,
+  "weight": 1.0,
+  "bounds": { "min": [-1.5, -0.7, -0.04], "max": [1.5, 0.7, 0.24] },
+  "exported": "2026-10-08T23:13:15"
+}

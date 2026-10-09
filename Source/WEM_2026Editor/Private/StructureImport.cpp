@@ -3,6 +3,8 @@
 #include "StructureImport.h"
 
 #include "Dom/JsonObject.h"
+#include "Misc/FileHelper.h"
+#include "Misc/SecureHash.h"
 #include "PlatformStructureData.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -38,6 +40,52 @@ namespace StructureImportPrivate
 		TArray<FString> Strings;
 		Object->TryGetStringArrayField(Field, Strings);
 		return Strings;
+	}
+
+	/** A string as a JSON string literal, quotes and all. */
+	FString Quote(const FString& Text)
+	{
+		FString Escaped;
+		Escaped.Reserve(Text.Len() + 2);
+		Escaped += TEXT('"');
+
+		for (const TCHAR Character : Text)
+		{
+			switch (Character)
+			{
+			case TEXT('"'): Escaped += TEXT("\\\""); break;
+			case TEXT('\\'): Escaped += TEXT("\\\\"); break;
+			case TEXT('\n'): Escaped += TEXT("\\n"); break;
+			case TEXT('\r'): Escaped += TEXT("\\r"); break;
+			case TEXT('\t'): Escaped += TEXT("\\t"); break;
+			default:
+				if (Character < 0x20)
+				{
+					Escaped += FString::Printf(TEXT("\\u%04x"), static_cast<int32>(Character));
+				}
+				else
+				{
+					Escaped += Character;
+				}
+			}
+		}
+
+		Escaped += TEXT('"');
+		return Escaped;
+	}
+
+	FString DescribeTypes(const int32 Types)
+	{
+		TArray<FString> Names;
+		if (Types & static_cast<int32>(EStructureType::Ground)) { Names.Add(TEXT("Ground")); }
+		if (Types & static_cast<int32>(EStructureType::Ceiling)) { Names.Add(TEXT("Ceiling")); }
+		if (Types & static_cast<int32>(EStructureType::Wall)) { Names.Add(TEXT("Wall")); }
+		return Names.IsEmpty() ? TEXT("none") : FString::Join(Names, TEXT(", "));
+	}
+
+	FString DescribeBool(const bool bValue)
+	{
+		return bValue ? TEXT("on") : TEXT("off");
 	}
 }
 
@@ -185,4 +233,73 @@ bool WEMStructureImport::BoundsMatch(const FBox& Expected, const FBox& Measured)
 	return Expected.IsValid && Measured.IsValid
 		&& Expected.Min.Equals(Measured.Min, SizeToleranceCm)
 		&& Expected.Max.Equals(Measured.Max, SizeToleranceCm);
+}
+
+FString WEMStructureImport::FormatCategoryList(const TConstArrayView<TPair<FString, FString>> Categories)
+{
+	using namespace StructureImportPrivate;
+
+	FString Json = FString::Printf(TEXT("{\n  \"format\": %d,\n  \"categories\": ["), SettingsFormat);
+
+	for (int32 Index = 0; Index < Categories.Num(); ++Index)
+	{
+		Json += FString::Printf(TEXT("%s\n    { \"asset\": %s, \"name\": %s }"),
+			Index > 0 ? TEXT(",") : TEXT(""), *Quote(Categories[Index].Key), *Quote(Categories[Index].Value));
+	}
+
+	Json += Categories.IsEmpty() ? TEXT("]\n}\n") : TEXT("\n  ]\n}\n");
+	return Json;
+}
+
+TArray<FString> WEMStructureImport::DescribeChanges(const FStructureValues& Old, const FStructureValues& New)
+{
+	using namespace StructureImportPrivate;
+
+	TArray<FString> Changes;
+
+	auto Add = [&Changes](const TCHAR* Name, const FString& Before, const FString& After)
+	{
+		if (Before != After)
+		{
+			Changes.Add(FString::Printf(TEXT("%s: %s -> %s"), Name, *Before, *After));
+		}
+	};
+
+	Add(TEXT("Width"), FString::FromInt(Old.Width), FString::FromInt(New.Width));
+	Add(TEXT("Length"), FString::FromInt(Old.Length), FString::FromInt(New.Length));
+	Add(TEXT("Two-sided"), DescribeBool(Old.bTwoSided), DescribeBool(New.bTwoSided));
+	Add(TEXT("Types"), DescribeTypes(Old.Types), DescribeTypes(New.Types));
+	Add(TEXT("Categories"),
+		Old.Categories.IsEmpty() ? TEXT("none") : FString::Join(Old.Categories, TEXT(", ")),
+		New.Categories.IsEmpty() ? TEXT("none") : FString::Join(New.Categories, TEXT(", ")));
+	Add(TEXT("Load-bearing"), DescribeBool(Old.bLoadBearing), DescribeBool(New.bLoadBearing));
+	Add(TEXT("Holds items"), DescribeBool(Old.bHoldsItems), DescribeBool(New.bHoldsItems));
+	Add(TEXT("Fence"), DescribeBool(Old.bFence), DescribeBool(New.bFence));
+	Add(TEXT("May lie sideways"), DescribeBool(Old.bMayLieSideways), DescribeBool(New.bMayLieSideways));
+
+	return Changes;
+}
+
+FString WEMStructureImport::HashFiles(const TConstArrayView<FString> Paths)
+{
+	FMD5 Hash;
+
+	for (const FString& Path : Paths)
+	{
+		TArray<uint8> Bytes;
+
+		if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+		{
+			return FString();
+		}
+
+		// Each file's length goes in ahead of it, so moving bytes from one file to the other changes the hash.
+		const int64 Length = Bytes.Num();
+		Hash.Update(reinterpret_cast<const uint8*>(&Length), sizeof(Length));
+		Hash.Update(Bytes.GetData(), Bytes.Num());
+	}
+
+	uint8 Digest[16];
+	Hash.Final(Digest);
+	return BytesToHex(Digest, UE_ARRAY_COUNT(Digest));
 }

@@ -121,6 +121,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Rules", meta = (ClampMin = "0.0"))
 	float Weight = 1.0f;
 
+#if WITH_EDITORONLY_DATA
+	/** The .blend this structure was exported from, as its settings file says, so it can be found again. */
+	UPROPERTY(VisibleAnywhere, Category = "Source")
+	FString SourceBlend;
+
+	/** The object in that .blend. */
+	UPROPERTY(VisibleAnywhere, Category = "Source")
+	FString SourceObject;
+
+	/** A hash of the .glb and the settings file it was last imported from. An import skips a structure whose files have not changed. */
+	UPROPERTY(VisibleAnywhere, Category = "Source")
+	FString ImportHash;
+#endif
+
 	bool HasType(const EStructureType Type) const
 	{
 		return (Types & static_cast<int32>(Type)) != 0;

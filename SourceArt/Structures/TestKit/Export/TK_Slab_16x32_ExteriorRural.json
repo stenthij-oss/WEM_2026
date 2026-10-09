@@ -1,0 +1,18 @@
+{
+  "format": 1,
+  "name": "TK_Slab_16x32_ExteriorRural",
+  "blend": "TestKit.blend",
+  "object": "TK_Slab_16x32_ExteriorRural",
+  "width": 16,
+  "length": 32,
+  "twoSided": true,
+  "categories": ["DA_Category_ExteriorRural"],
+  "types": ["Ground", "Ceiling", "Wall"],
+  "loadBearing": true,
+  "holdsItems": true,
+  "fence": false,
+  "mayLieSideways": true,
+  "weight": 1.0,
+  "bounds": { "min": [-1.5, -3.1, 0.0], "max": [1.5, 3.1, 0.2] },
+  "exported": "2026-10-08T23:13:16"
+}
