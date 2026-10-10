@@ -100,6 +100,21 @@ structures past the first beat a rule applies to, so they are not timed on the s
 These runs are slower than the 1.363 / 1.406 ms in `NOTES.md` from the same benchmark on 2026-10-09;
 the machine was busier (Blender was open), which is why the rounds were interleaved.
 
+## Seen in the editor
+
+NewMap, all three turns on at 0.3, seed 7, about 1400 segments after 20 s of Simulate. The settings were
+put back afterwards (all off, 0.15, seed 0) and the level was not saved.
+
+![Turned, from outside](Screenshots/turned_overview.jpg)
+
+Walls lie flat in the world, wall textures running across segments that face up, beside floors facing
+every way.
+
+![Turned, inside](Screenshots/turned_room.jpg)
+
+Inside: a roof-tile ground standing upright on the left - a floor turned a quarter off a wall - and
+objects hanging from the ceilings overhead, standing on those faces as on any other.
+
 ## Known limits
 
 - With the turns on, structures that may not lie sideways can't fill some sideways walls. Those segments fall back to their parent's Up or +Z, so a turned region can snap back to the world's up where the kit doesn't fit it.
