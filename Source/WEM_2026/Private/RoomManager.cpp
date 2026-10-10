@@ -124,6 +124,49 @@ namespace
 		return static_cast<uint8>(1 << Axis);
 	}
 
+	/**
+	 * Which side of an enclosure a structure stands for, read from its categories' names: Interior for
+	 * one with a category named for the inside and none for the outside, Exterior the other way round,
+	 * and neither for anything else - a structure of both, or of neither.
+	 */
+	enum class EEnclosureSide : uint8
+	{
+		Neither,
+		Interior,
+		Exterior
+	};
+
+	EEnclosureSide GetEnclosureSide(const UPlatformStructureData* Structure)
+	{
+		bool bInterior = false;
+		bool bExterior = false;
+
+		if (Structure)
+		{
+			for (const UStructureCategory* Category : Structure->Categories)
+			{
+				if (!Category)
+				{
+					continue;
+				}
+
+				// The asset's name, and the name it shows, either of which may say it.
+				const FString Name = Category->GetName();
+				const FString DisplayName = Category->DisplayName.ToString();
+
+				bInterior = bInterior || Name.Contains(TEXT("Interior")) || DisplayName.Contains(TEXT("Interior"));
+				bExterior = bExterior || Name.Contains(TEXT("Exterior")) || DisplayName.Contains(TEXT("Exterior"));
+			}
+		}
+
+		if (bInterior == bExterior)
+		{
+			return EEnclosureSide::Neither;
+		}
+
+		return bInterior ? EEnclosureSide::Interior : EEnclosureSide::Exterior;
+	}
+
 	/** The face looking the other way along the same axis. */
 	FORCEINLINE EGridFace OppositeFace(const EGridFace Face)
 	{
@@ -2653,6 +2696,25 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	}
 
 	GatherFillOptions(Platform, -FirstSign, /*bSecondFace=*/true, bLoadBearingOnly, Options);
+
+	// Behind an inside, with InteriorBacksExteriorChance, an outside, and behind an outside an inside -
+	// where any of the options is one.
+	const EEnclosureSide FirstSide = GetEnclosureSide(First);
+
+	if (bInteriorBacksExterior && FirstSide != EEnclosureSide::Neither && StructureStream.FRand() < InteriorBacksExteriorChance)
+	{
+		const EEnclosureSide Wanted = FirstSide == EEnclosureSide::Interior ? EEnclosureSide::Exterior : EEnclosureSide::Interior;
+
+		TArray<UPlatformStructureData*> Backs = Options.FilterByPredicate([Wanted](const UPlatformStructureData* Option)
+		{
+			return GetEnclosureSide(Option) == Wanted;
+		});
+
+		if (!Backs.IsEmpty())
+		{
+			Options = MoveTemp(Backs);
+		}
+	}
 
 	UPlatformStructureData* Second = DrawStructure(Options, Platform, -FirstSign);
 

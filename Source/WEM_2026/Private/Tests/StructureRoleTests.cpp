@@ -720,6 +720,90 @@ bool FStructureRoleRuleGrowthTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleInteriorBacksExteriorTest, "WEM.Structures.Roles.InteriorBacksExterior", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleInteriorBacksExteriorTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	auto MakeCategory = [&Rooted](const TCHAR* Name)
+	{
+		UStructureCategory* Category = NewObject<UStructureCategory>(GetTransientPackage(),
+			MakeUniqueObjectName(GetTransientPackage(), UStructureCategory::StaticClass(), Name));
+		Category->AddToRoot();
+		Rooted.Add(Category);
+		return Category;
+	};
+
+	// One-sided walls of an interior, an exterior, and a category that is neither, equally weighted.
+	UStructureCategory* Interior = MakeCategory(TEXT("TestCategory_InteriorOffice"));
+	UStructureCategory* Exterior = MakeCategory(TEXT("TestCategory_ExteriorUrban"));
+	UStructureCategory* Natural = MakeCategory(TEXT("TestCategory_NaturalStone"));
+
+	UPlatformStructureData* InsideWall = MakeStructure(TEXT("TestInsideWall"), 16, 16, EStructureType::Wall, false);
+	UPlatformStructureData* OutsideWall = MakeStructure(TEXT("TestOutsideWall"), 16, 16, EStructureType::Wall, false);
+	UPlatformStructureData* StoneWall = MakeStructure(TEXT("TestStoneWall"), 16, 16, EStructureType::Wall, false);
+	InsideWall->Categories = { Interior };
+	OutsideWall->Categories = { Exterior };
+	StoneWall->Categories = { Natural };
+	Rooted.Append({ InsideWall, OutsideWall, StoneWall });
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted,
+		TArray<TObjectPtr<UPlatformStructureData>>{ InsideWall, OutsideWall, StoneWall, MakeSlab(16, 16, true, Rooted) });
+	UPlatformTileData* Square = Manager->Tiles[0];
+
+	// Filled again and again, a wall with nothing beside it: tally what goes behind each kind of face.
+	auto Tally = [&](int32& OutInsideBehindInside, int32& OutOutsideBehindInside, int32& OutInsideBehindOutside, int32& OutInsideFaces)
+	{
+		OutInsideBehindInside = 0;
+		OutOutsideBehindInside = 0;
+		OutInsideBehindOutside = 0;
+		OutInsideFaces = 0;
+
+		for (int32 Fill = 0; Fill < 300; ++Fill)
+		{
+			FGridPlatform Wall = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+
+			if (!FRoomManagerTestAccess::DrawFill(*Manager, Wall) || Wall.PositiveStructure->bTwoSided)
+			{
+				continue;
+			}
+
+			for (const TPair<UPlatformStructureData*, UPlatformStructureData*>& Pair :
+				{ MakeTuple(Wall.PositiveStructure.Get(), Wall.NegativeStructure.Get()), MakeTuple(Wall.NegativeStructure.Get(), Wall.PositiveStructure.Get()) })
+			{
+				OutInsideFaces += Pair.Key == InsideWall ? 1 : 0;
+				OutInsideBehindInside += Pair.Key == InsideWall && Pair.Value == InsideWall ? 1 : 0;
+				OutOutsideBehindInside += Pair.Key == InsideWall && Pair.Value == OutsideWall ? 1 : 0;
+				OutInsideBehindOutside += Pair.Key == OutsideWall && Pair.Value == InsideWall ? 1 : 0;
+			}
+		}
+	};
+
+	int32 InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces;
+
+	Manager->InteriorBacksExteriorChance = 1.0f;
+	Tally(InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces);
+	AddInfo(FString::Printf(TEXT("Always: %d interior faces, %d with an interior behind, %d with an exterior behind; %d exteriors with an interior behind."),
+		InsideFaces, InsideBehindInside, OutsideBehindInside, InsideBehindOutside));
+	TestTrue(TEXT("Interiors are drawn"), InsideFaces > 20);
+	TestEqual(TEXT("Sure to, an interior never has an interior behind it"), InsideBehindInside, 0);
+	TestTrue(TEXT("It has an exterior"), OutsideBehindInside > 0);
+
+	// Off, the back is drawn like any other face, and interiors turn up back to back.
+	Manager->bInteriorBacksExterior = false;
+	Tally(InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces);
+	AddInfo(FString::Printf(TEXT("Off: %d interior faces, %d with an interior behind, %d with an exterior behind."),
+		InsideFaces, InsideBehindInside, OutsideBehindInside));
+	TestTrue(TEXT("Off, interiors turn up back to back"), InsideBehindInside > 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleTurnedGrowthTest, "WEM.Structures.Roles.TurnedGrowth", WEMRoomManagerTests::TestFlags)
 
 bool FStructureRoleTurnedGrowthTest::RunTest(const FString& Parameters)

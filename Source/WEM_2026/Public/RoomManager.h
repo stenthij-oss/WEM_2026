@@ -353,6 +353,10 @@ struct FSurfaceMarkLayer
  * lacks the category breaks the chain. The longer the streak, the likelier it carries on
  * (ContinueChance, rising to MaxContinueChance at StreakForMaxChance).
  *
+ * The two faces of a one-sided pair are not beside each other, but they are back to back: behind an
+ * interior, growth reaches for an exterior, and behind an exterior for an interior
+ * (bInteriorBacksExterior), read from the categories' names.
+ *
  * A platform filled with anything not load-bearing blocks some of its beams: a wall the ones along
  * its top - the side its Up points to - so nothing is built onto it while more panels can still join beside it, and a floor or
  * ceiling every beam of its rim no platform used before it. No later platform takes in a blocked
@@ -526,6 +530,20 @@ public:
 	/** How long a streak has to be to carry on with MaxContinueChance. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "2"))
 	int32 StreakForMaxChance = 4;
+
+	/**
+	 * Draws the back of a one-sided face from the other side of an enclosure, with
+	 * InteriorBacksExteriorChance: behind a structure whose category is named for an interior, one named
+	 * for an exterior, and the other way round - where any structure that fits the back is one. Read from
+	 * the categories' names, so a category with "Interior" or "Exterior" in it takes part as soon as it is
+	 * made; a structure carrying both, or neither, is left to the usual draw.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures")
+	bool bInteriorBacksExterior = true;
+
+	/** The chance the back of an interior face is drawn from the exteriors, and the other way round, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bInteriorBacksExterior"))
+	float InteriorBacksExteriorChance = 0.8f;
 
 	/**
 	 * The chance each end of a fence panel, with room beyond it, carries its run on by another panel.
@@ -1252,7 +1270,8 @@ private:
 	/**
 	 * Draws the structures filling a platform that is about to be placed, from the structure
 	 * stream: a face first - a floor's Ground face, either face of a wall - then a structure for it,
-	 * and when that is one-sided, one for the face behind. False when nothing fits.
+	 * and when that is one-sided, one for the face behind, from the other side of an enclosure where
+	 * bInteriorBacksExterior says so. False when nothing fits.
 	 */
 	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
 
