@@ -316,9 +316,16 @@ struct FSurfaceMarkLayer
  * plane. The first platform's Up is +Z. Every one after takes the Up of a platform it grows off -
  * one drawn at random among those it shares a module edge with - so a platform folding off a floor is
  * a wall standing on it, one folding off a wall's top or foot is a floor, and one going on in a
- * platform's plane is what that platform is. Only a way up the structures can fill is taken: failing
- * that the Up of another platform it touches, and failing all of them +Z, which every placement drawn
- * can be filled for.
+ * platform's plane is what that platform is.
+ *
+ * Inherited and nothing more, every Up would stay +Z. Three turns, each switched on its own, change
+ * that: a platform folding off another may take the opposite Up (bFlipOnFold); a wall folding off a
+ * floor's Ceiling face, where that face holds items, hangs from it upside down (bHangFromCeilings);
+ * and a platform carrying a wall on in its plane may become a floor whose Ground looks the way one of
+ * the wall's holding faces does (bQuarterTurn). Whatever they turn, the platforms growing off it
+ * inherit. Only a way up the structures can fill is taken: failing that the Up it would have
+ * inherited, then the Up of another platform it touches, and failing all of them +Z, which every
+ * placement drawn can be filled for.
  *
  * Structures
  * ----------
@@ -527,6 +534,36 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float FenceTurnChance = 0.25f;
+
+	/**
+	 * Lets a platform folding off another take the opposite Up, with FlipChance, so it stands upside
+	 * down against the one it grew off - and everything growing off it after.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (DisplayName = "Flip On Perpendicular Growth"))
+	bool bFlipOnFold = false;
+
+	/** The chance a platform folding off another takes the opposite Up, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bFlipOnFold"))
+	float FlipChance = 0.15f;
+
+	/**
+	 * A wall folding off a floor's Ceiling face, where that face holds items, hangs from it: its Up points
+	 * away from the floor, so in its own frame it stands on the ceiling, upside down to the floor above.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up")
+	bool bHangFromCeilings = false;
+
+	/**
+	 * Lets a platform carrying a wall on in its plane turn a quarter, with QuarterTurnChance: it becomes a
+	 * floor whose Ground looks the way one of the wall's holding faces does - drawn evenly when both hold
+	 * items - so floors open out of walls. A wall holding nothing on either face is never turned.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (DisplayName = "Quarter-Turn"))
+	bool bQuarterTurn = false;
+
+	/** The chance a platform carrying a wall on in its plane turns into a floor, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bQuarterTurn"))
+	float QuarterTurnChance = 0.15f;
 
 	/**
 	 * How large a patch of one category the average face sits in: the patches' sizes, each weighted
@@ -1135,10 +1172,17 @@ private:
 
 	/**
 	 * The Up a placement about to be filled takes, from the role stream: that of a platform it touches,
-	 * drawn at random. A way up no structures can fill gives way to the Up of the other platforms it
+	 * drawn at random, turned where the turns that are on say so (see TurnUp). A way up no structures
+	 * can fill gives way to the Up it would have inherited, then to the Up of the other platforms it
 	 * touches, then to +Z.
 	 */
 	EGridFace ChooseUp(const FGridPlatform& Platform);
+
+	/**
+	 * The Up a placement growing off Parent takes: Parent's own, flipped, hung or quarter-turned as the
+	 * turns that are on say, from the role stream.
+	 */
+	EGridFace TurnUp(const FGridPlatform& Platform, const FGridPlatform& Parent);
 
 	/**
 	 * The ways round, one bit each - as it is, then turned - that a usable tile can be laid as a kind

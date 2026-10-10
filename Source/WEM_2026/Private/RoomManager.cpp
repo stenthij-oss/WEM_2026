@@ -117,6 +117,12 @@ namespace
 		return static_cast<uint8>(1 << Axis);
 	}
 
+	/** The face looking the other way along the same axis. */
+	FORCEINLINE EGridFace OppositeFace(const EGridFace Face)
+	{
+		return MakeFace(FaceAxis(Face), -FaceSign(Face));
+	}
+
 	FORCEINLINE FGridPlatform MakePlatform(
 		const FIntVector& MinNode,
 		const int32 NormalAxis,
@@ -1028,17 +1034,23 @@ EGridFace ARoomManager::ChooseUp(const FGridPlatform& Platform)
 		return HasCompleteFill(NormalAxis, Up, SpanU, SpanV, /*bLoadBearingOnly=*/false);
 	};
 
-	// It grows off one of the platforms it touches, and takes that one's Up.
-	const int32 Parent = Touching[Touching.Num() > 1 ? RoleStream.RandRange(0, Touching.Num() - 1) : 0];
-	const EGridFace Up = BuiltPlatforms[Parent].Up;
+	// It grows off one of the platforms it touches, and takes that one's Up, as the turns leave it.
+	const FGridPlatform& Parent = BuiltPlatforms[Touching[Touching.Num() > 1 ? RoleStream.RandRange(0, Touching.Num() - 1) : 0]];
+	const EGridFace Up = TurnUp(Platform, Parent);
 
 	if (CanFill(Up))
 	{
 		return Up;
 	}
 
-	// A way up the structures cannot fill is no use. Another platform it touches may offer one they can,
-	// and the world's always can: the placement was only drawn because it can be filled that way.
+	// A way up the structures cannot fill is no use. Unturned it may be one they can; failing that,
+	// another platform it touches may offer one, and the world's always can: the placement was only
+	// drawn because it can be filled that way.
+	if (Up != Parent.Up && CanFill(Parent.Up))
+	{
+		return Parent.Up;
+	}
+
 	for (const int32 Other : Touching)
 	{
 		if (CanFill(BuiltPlatforms[Other].Up))
@@ -1048,6 +1060,50 @@ EGridFace ARoomManager::ChooseUp(const FGridPlatform& Platform)
 	}
 
 	return EGridFace::PosZ;
+}
+
+EGridFace ARoomManager::TurnUp(const FGridPlatform& Platform, const FGridPlatform& Parent)
+{
+	EGridFace Up = Parent.Up;
+	const int32 ParentNormal = AxisIndex(Parent.Normal);
+
+	auto HoldsItems = [this, &Parent, ParentNormal](const int32 Sign)
+	{
+		return !IsFaceBlocked(Parent, MakeFace(ParentNormal, Sign));
+	};
+
+	if (Platform.Normal != Parent.Normal)
+	{
+		// Folding off it, the placement reaches from their shared edge to one side of the parent's plane.
+		const int32 Side = Platform.MinNode[ParentNormal] == Parent.MinNode[ParentNormal] ? 1 : -1;
+
+		// Off a floor's Ceiling face - the side its Up does not point to - a wall hangs, its Up pointing
+		// away from the floor.
+		if (bHangFromCeilings && !Parent.IsWall() && Side != FaceSign(Parent.Up) && HoldsItems(Side))
+		{
+			Up = OppositeFace(Up);
+		}
+
+		if (bFlipOnFold && RoleStream.FRand() < FlipChance)
+		{
+			Up = OppositeFace(Up);
+		}
+	}
+	else if (bQuarterTurn && Parent.IsWall() && RoleStream.FRand() < QuarterTurnChance)
+	{
+		// Carried on in a wall's plane, it becomes a floor whose Ground looks out of a face of the wall
+		// that holds items.
+		const bool bPositiveHolds = HoldsItems(1);
+		const bool bNegativeHolds = HoldsItems(-1);
+
+		if (bPositiveHolds || bNegativeHolds)
+		{
+			const int32 Sign = bPositiveHolds && bNegativeHolds ? (RoleStream.FRand() < 0.5f ? 1 : -1) : (bPositiveHolds ? 1 : -1);
+			Up = MakeFace(ParentNormal, Sign);
+		}
+	}
+
+	return Up;
 }
 
 void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const

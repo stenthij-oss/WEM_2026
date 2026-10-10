@@ -4,8 +4,10 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "HAL/IConsoleManager.h"
 #include "Misc/AutomationTest.h"
 #include "RoomManagerTestHelpers.h"
+#include "StructurePlacement.h"
 
 namespace StructureRoleTestsPrivate
 {
@@ -44,6 +46,52 @@ namespace StructureRoleTestsPrivate
 	FString DescribeUp(const EGridFace Up)
 	{
 		return StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(Up)).ToString();
+	}
+
+	/** A one-sided pair of wall structures for a 16 x 16 wall, whose negative face holds nothing. */
+	void MakeHalfHoldingWall(UPlatformStructureData*& OutHolds, UPlatformStructureData*& OutHoldsNothing, TArray<UObject*>& OutRooted)
+	{
+		OutHolds = MakeStructure(TEXT("TestRoleWallHolds"), 16, 16, EStructureType::Wall, false);
+		OutHoldsNothing = MakeStructure(TEXT("TestRoleWallBare"), 16, 16, EStructureType::Wall, false);
+		OutHoldsNothing->bHoldsItems = false;
+		OutRooted.Append({ OutHolds, OutHoldsNothing });
+	}
+
+	/**
+	 * Why a platform's fill does not fit it as it stands, its Up included, or an empty string when it
+	 * does: a structure on each face fitting that face, the same one on both when it is two-sided.
+	 */
+	FString CheckFill(const FGridPlatform& Platform)
+	{
+		const UPlatformStructureData* Positive = Platform.PositiveStructure;
+		const UPlatformStructureData* Negative = Platform.NegativeStructure;
+
+		if (!Positive || !Negative)
+		{
+			return TEXT("a face is empty");
+		}
+
+		if (Positive->bTwoSided != Negative->bTwoSided || (Positive->bTwoSided && Positive != Negative))
+		{
+			return TEXT("a two-sided structure fills one face but not the other");
+		}
+
+		const int32 SpanFirst = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+		const int32 SpanSecond = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+		const int32 NormalAxis = static_cast<int32>(Platform.Normal);
+		bool bTurned = false;
+
+		if (!WEMStructures::FitsFace(*Positive, NormalAxis, 1, Platform.Up, SpanFirst, SpanSecond, bTurned))
+		{
+			return FString::Printf(TEXT("%s does not fit the positive face"), *Positive->GetName());
+		}
+
+		if (!WEMStructures::FitsFace(*Negative, NormalAxis, -1, Platform.Up, SpanFirst, SpanSecond, bTurned))
+		{
+			return FString::Printf(TEXT("%s does not fit the negative face"), *Negative->GetName());
+		}
+
+		return FString();
 	}
 }
 
@@ -315,6 +363,240 @@ bool FStructureRoleUnturnedGrowthTest::RunTest(const FString& Parameters)
 
 	TestTrue(TEXT("Growth takes off"), Manager->GetPlatformCount() > 100);
 	TestEqual(TEXT("No platform is turned"), Turned, 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleHangTest, "WEM.Structures.Roles.HangFromCeilings", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleHangTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	UPlatformTileData* Square = Manager->Tiles[0];
+	UPlatformStructureData* Slab = MakeSlab(16, 16, true, Rooted);
+
+	const FGridPlatform Floor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, Slab);
+	const FGridPlatform Below = MakeFilled(FIntVector(32, 16, 16), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Above = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+	FRoomManagerTestAccess::Rebuild(*Manager, { Floor });
+
+	TestEqual(TEXT("Off, a wall below a floor stands the right way up"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::PosZ);
+
+	Manager->bHangFromCeilings = true;
+	TestEqual(TEXT("On, it hangs from the floor's ceiling, upside down"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::NegZ);
+	TestEqual(TEXT("A wall standing on the floor's ground does not"), FRoomManagerTestAccess::ChooseUp(*Manager, Above), EGridFace::PosZ);
+
+	// An upside-down floor's ceiling is its top: a wall standing on it in the world hangs from it, and so
+	// comes out the right way up.
+	const FGridPlatform UpsideDown = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, Slab, EGridFace::NegZ);
+	FRoomManagerTestAccess::Rebuild(*Manager, { UpsideDown });
+	TestEqual(TEXT("Above an upside-down floor, a wall hangs the right way up"), FRoomManagerTestAccess::ChooseUp(*Manager, Above), EGridFace::PosZ);
+	TestEqual(TEXT("Below it, one stands on its ground, upside down like it"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::NegZ);
+
+	// A ceiling that holds nothing has nothing to hang from.
+	UPlatformStructureData* Ground = MakeStructure(TEXT("TestRoleGround"), 16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* BareCeiling = MakeStructure(TEXT("TestRoleBareCeiling"), 16, 16, EStructureType::Ceiling, false);
+	BareCeiling->bHoldsItems = false;
+	Rooted.Append({ Ground, BareCeiling });
+
+	FGridPlatform BareFloor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr);
+	BareFloor.PositiveStructure = Ground;
+	BareFloor.NegativeStructure = BareCeiling;
+	FRoomManagerTestAccess::Rebuild(*Manager, { BareFloor });
+	TestEqual(TEXT("Below a ceiling that holds nothing, a wall stands the right way up"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::PosZ);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleFlipTest, "WEM.Structures.Roles.Flip", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleFlipTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	UPlatformTileData* Square = Manager->Tiles[0];
+	UPlatformStructureData* Slab = MakeSlab(16, 16, true, Rooted);
+
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, Slab) });
+
+	const FGridPlatform Fold = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Along = MakeFilled(FIntVector(32, 16, 32), EGridAxis::Z, Square, nullptr);
+
+	Manager->bFlipOnFold = true;
+	Manager->FlipChance = 1.0f;
+	TestEqual(TEXT("Sure to flip, a wall folding off the floor is upside down"), FRoomManagerTestAccess::ChooseUp(*Manager, Fold), EGridFace::NegZ);
+	TestEqual(TEXT("A floor carrying it on in its plane is not flipped"), FRoomManagerTestAccess::ChooseUp(*Manager, Along), EGridFace::PosZ);
+
+	Manager->FlipChance = 0.0f;
+	TestEqual(TEXT("Never flipping, it is not"), FRoomManagerTestAccess::ChooseUp(*Manager, Fold), EGridFace::PosZ);
+
+	// At a chance between, some folds flip and some do not.
+	Manager->FlipChance = 0.5f;
+	int32 Flipped = 0;
+
+	for (int32 Draw = 0; Draw < 200; ++Draw)
+	{
+		Flipped += FRoomManagerTestAccess::ChooseUp(*Manager, Fold) == EGridFace::NegZ ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(TEXT("At 0.5, %d of 200 folds flipped."), Flipped));
+	TestTrue(TEXT("At 0.5, about half the folds flip"), Flipped > 70 && Flipped < 130);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleQuarterTurnTest, "WEM.Structures.Roles.QuarterTurn", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleQuarterTurnTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	UPlatformTileData* Square = Manager->Tiles[0];
+	UPlatformStructureData* Slab = MakeSlab(16, 16, true, Rooted);
+
+	// A wall facing X, holding items on both faces.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, Slab) });
+
+	const FGridPlatform Along = MakeFilled(FIntVector(32, 32, 32), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Fold = MakeFilled(FIntVector(32, 16, 48), EGridAxis::Z, Square, nullptr);
+
+	Manager->bQuarterTurn = true;
+	Manager->QuarterTurnChance = 1.0f;
+
+	int32 TowardPositive = 0;
+	int32 TowardNegative = 0;
+
+	for (int32 Draw = 0; Draw < 64; ++Draw)
+	{
+		const EGridFace Up = FRoomManagerTestAccess::ChooseUp(*Manager, Along);
+		TowardPositive += Up == EGridFace::PosX ? 1 : 0;
+		TowardNegative += Up == EGridFace::NegX ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(TEXT("Carrying the wall on, %d of 64 turned toward +X and %d toward -X."), TowardPositive, TowardNegative));
+	TestEqual(TEXT("Sure to turn, carrying the wall on always makes a floor looking out of it"), TowardPositive + TowardNegative, 64);
+	TestTrue(TEXT("Out of either face, since both hold items"), TowardPositive > 0 && TowardNegative > 0);
+	TestEqual(TEXT("A floor folding off the wall's top is not turned"), FRoomManagerTestAccess::ChooseUp(*Manager, Fold), EGridFace::PosZ);
+
+	// Only a face that holds items is looked out of.
+	UPlatformStructureData* Holds = nullptr;
+	UPlatformStructureData* HoldsNothing = nullptr;
+	MakeHalfHoldingWall(Holds, HoldsNothing, Rooted);
+
+	FGridPlatform HalfWall = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+	HalfWall.PositiveStructure = Holds;
+	HalfWall.NegativeStructure = HoldsNothing;
+	FRoomManagerTestAccess::Rebuild(*Manager, { HalfWall });
+
+	bool bAlwaysPositive = true;
+
+	for (int32 Draw = 0; Draw < 16; ++Draw)
+	{
+		bAlwaysPositive = bAlwaysPositive && FRoomManagerTestAccess::ChooseUp(*Manager, Along) == EGridFace::PosX;
+	}
+
+	TestTrue(TEXT("Off a wall holding items on its +X face only, the floor's ground looks along +X"), bAlwaysPositive);
+
+	// A wall holding nothing either side is never turned.
+	FGridPlatform BareWall = HalfWall;
+	BareWall.PositiveStructure = HoldsNothing;
+	FRoomManagerTestAccess::Rebuild(*Manager, { BareWall });
+	TestEqual(TEXT("Off a wall holding nothing, it stays a wall"), FRoomManagerTestAccess::ChooseUp(*Manager, Along), EGridFace::PosZ);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleTurnedGrowthTest, "WEM.Structures.Roles.TurnedGrowth", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleTurnedGrowthTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	// Per size, a slab and a one-sided ground, ceiling and wall, so the fill has to follow each platform's
+	// Up to be right.
+	TArray<TObjectPtr<UPlatformStructureData>> Structures;
+
+	for (const FIntPoint Size : { FIntPoint(16, 16), FIntPoint(8, 8), FIntPoint(8, 16) })
+	{
+		UPlatformStructureData* Ground = MakeStructure(TEXT("TestRoleGround"), Size.X, Size.Y, EStructureType::Ground, false);
+		UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestRoleCeiling"), Size.X, Size.Y, EStructureType::Ceiling, false);
+		UPlatformStructureData* Wall = MakeStructure(TEXT("TestRoleWall"), Size.X, Size.Y, EStructureType::Wall, false, /*bMayLieSideways=*/true);
+		Rooted.Append({ Ground, Ceiling, Wall });
+		Structures.Append({ Ground, Ceiling, Wall, MakeSlab(Size.X, Size.Y, true, Rooted) });
+	}
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
+	Manager->bFlipOnFold = true;
+	Manager->FlipChance = 0.3f;
+	Manager->bHangFromCeilings = true;
+	Manager->bQuarterTurn = true;
+	Manager->QuarterTurnChance = 0.3f;
+
+	// Every placement checked against a full rebuild from the list, Ups and all.
+	IConsoleVariable* VerifyEvery = IConsoleManager::Get().FindConsoleVariable(TEXT("wem.RoomManager.VerifyEvery"));
+
+	if (!TestNotNull(TEXT("The VerifyEvery console variable exists"), VerifyEvery))
+	{
+		ReleaseRooted(Rooted);
+		return false;
+	}
+
+	const int32 Previous = VerifyEvery->GetInt();
+	VerifyEvery->Set(1, ECVF_SetByCode);
+
+	for (int32 Beat = 0; Beat < 400 && Manager->PlaceNextPlatform(); ++Beat)
+	{
+	}
+
+	VerifyEvery->Set(Previous, ECVF_SetByCode);
+
+	TestEqual(TEXT("No placement drifts from a full rebuild"), FRoomManagerTestAccess::GetFailedVerifications(*Manager), 0);
+	TestTrue(TEXT("Growth takes off"), Manager->GetPlatformCount() > 100);
+
+	// Every fill fits its platform as it is, its Up included, and the turns have turned the world round.
+	int32 NotWorldUp = 0;
+	int32 UpsideDown = 0;
+	int32 LyingWalls = 0;
+	int32 StandingFloors = 0;
+
+	for (const FGridPlatform& Platform : Manager->Platforms)
+	{
+		const FString Problem = CheckFill(Platform);
+
+		if (!Problem.IsEmpty())
+		{
+			AddError(FString::Printf(TEXT("The platform at %s facing %d, up %s, has no fill that fits: %s"),
+				*Platform.MinNode.ToString(), static_cast<int32>(Platform.Normal), *DescribeUp(Platform.Up), *Problem));
+			break;
+		}
+
+		NotWorldUp += Platform.Up != EGridFace::PosZ ? 1 : 0;
+		UpsideDown += Platform.Up == EGridFace::NegZ ? 1 : 0;
+		LyingWalls += Platform.Normal == EGridAxis::Z && Platform.IsWall() ? 1 : 0;
+		StandingFloors += Platform.Normal != EGridAxis::Z && !Platform.IsWall() ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(TEXT("%d platform(s): %d not up the world's way, %d upside down, %d walls lying flat, %d floors standing up."),
+		Manager->Platforms.Num(), NotWorldUp, UpsideDown, LyingWalls, StandingFloors));
+	TestTrue(TEXT("Some platforms are upside down"), UpsideDown > 0);
+	TestTrue(TEXT("Some floors stand up in the world"), StandingFloors > 0);
 
 	ReleaseRooted(Rooted);
 	return true;
