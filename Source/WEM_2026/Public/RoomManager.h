@@ -307,7 +307,8 @@ struct FSurfaceMarkLayer
  * and a surface that has opened is never closed again afterwards.
  *
  * Each beat rolls which kind to try first, then which tile, by the tiles' weights among those
- * with somewhere to go, then draws one of that tile's free placements, and fills it.
+ * with somewhere to go, then draws one of that tile's free placements - again, now and then, where
+ * it goes against a growth rule (see Up) - and fills it.
  *
  * Up
  * --
@@ -326,6 +327,11 @@ struct FSurfaceMarkLayer
  * inherit. Only a way up the structures can fill is taken: failing that the Up it would have
  * inherited, then the Up of another platform it touches, and failing all of them +Z, which every
  * placement drawn can be filled for.
+ *
+ * Two growth rules lean where platforms fold off others, by drawing a placement again when it goes
+ * against them: walls stand up on a ground that holds items rather than hang below it
+ * (bWallsStandOnGrounds), and off a wall's holding face a floor goes to the end of the wall its room
+ * still needs (bFloorsCloseRooms). Both read Up, so they hold upside down as well.
  *
  * Structures
  * ----------
@@ -564,6 +570,30 @@ public:
 	/** The chance a platform carrying a wall on in its plane turns into a floor, when that is on. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bQuarterTurn"))
 	float QuarterTurnChance = 0.15f;
+
+	/**
+	 * Off a floor whose Ground face holds items, walls stand up on it rather than hang below it: a
+	 * placement folding off the Ceiling side is drawn again with WallsStandChance.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up")
+	bool bWallsStandOnGrounds = true;
+
+	/** The chance a wall about to hang below a ground that holds items is drawn again, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bWallsStandOnGrounds"))
+	float WallsStandChance = 0.8f;
+
+	/**
+	 * Off a wall's holding face, a floor goes to the end of it - its top or its foot, across its Up - that
+	 * the room it faces still needs: the foot when a ceiling closes its top on that side, the top when a
+	 * ground already runs along its foot, and the foot when it has neither. A placement at the other end
+	 * is drawn again with FloorsCloseRoomsChance.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (DisplayName = "Floor Or Ceiling By Opposite Edge"))
+	bool bFloorsCloseRooms = true;
+
+	/** The chance a floor about to go to the end of a wall its room does not need is drawn again, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Up", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bFloorsCloseRooms"))
+	float FloorsCloseRoomsChance = 0.8f;
 
 	/**
 	 * How large a patch of one category the average face sits in: the patches' sizes, each weighted
@@ -1183,6 +1213,22 @@ private:
 	 * turns that are on say, from the role stream.
 	 */
 	EGridFace TurnUp(const FGridPlatform& Platform, const FGridPlatform& Parent);
+
+	/** Whether the face of a platform on the side Sign looks out of holds items. A face with no structure does. */
+	bool FaceHoldsItems(const FGridPlatform& Platform, int32 Sign) const;
+
+	/**
+	 * Whether a floor - a platform lying across Up in its own frame - runs along a wall's edge across its
+	 * Up at Coordinate along that Up, on the side Side of the wall's plane.
+	 */
+	bool HasFloorAlong(const FGridPlatform& Wall, int32 Coordinate, int32 Side) const;
+
+	/**
+	 * The chance a drawn placement is drawn again because it goes against a growth rule that is on - the
+	 * strongest of them, among the platforms it folds off - or zero when it goes against none.
+	 * See bWallsStandOnGrounds and bFloorsCloseRooms.
+	 */
+	float GetRuleRedrawChance(const FGridPlatform& Candidate) const;
 
 	/**
 	 * The ways round, one bit each - as it is, then turned - that a usable tile can be laid as a kind

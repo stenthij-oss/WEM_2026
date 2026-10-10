@@ -146,6 +146,18 @@ struct FRoomManagerTestAccess
 		OutTurns = Turns;
 	}
 
+	/** The chance a drawn placement is drawn again for going against a growth rule. */
+	static float GetRuleRedrawChance(const ARoomManager& Manager, const FGridPlatform& Candidate)
+	{
+		return Manager.GetRuleRedrawChance(Candidate);
+	}
+
+	/** Whether a floor runs along a wall's edge across its Up at Coordinate, on the side Side of its plane. */
+	static bool HasFloorAlong(const ARoomManager& Manager, const FGridPlatform& Wall, const int32 Coordinate, const int32 Side)
+	{
+		return Manager.HasFloorAlong(Wall, Coordinate, Side);
+	}
+
 	/** Whether a platform stands on something, as a fence beat asks it. */
 	static bool StandsOnSomething(const ARoomManager& Manager, const FGridPlatform& Platform)
 	{

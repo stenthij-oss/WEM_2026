@@ -520,6 +520,206 @@ bool FStructureRoleQuarterTurnTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleWallsStandTest, "WEM.Structures.Roles.WallsStand", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleWallsStandTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	UPlatformTileData* Square = Manager->Tiles[0];
+	UPlatformStructureData* Slab = MakeSlab(16, 16, true, Rooted);
+
+	const FGridPlatform Below = MakeFilled(FIntVector(32, 16, 16), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Above = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Along = MakeFilled(FIntVector(32, 16, 32), EGridAxis::Z, Square, nullptr);
+
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, Slab) });
+	TestEqual(TEXT("A wall about to hang below a ground is drawn again with the rule's chance"),
+		FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Below), Manager->WallsStandChance);
+	TestEqual(TEXT("One standing on it is not"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Above), 0.0f);
+	TestEqual(TEXT("Nor is a floor carrying it on"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Along), 0.0f);
+
+	Manager->bWallsStandOnGrounds = false;
+	TestEqual(TEXT("With the rule off, hanging is not redrawn"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Below), 0.0f);
+	Manager->bWallsStandOnGrounds = true;
+
+	// Upside down, the ground looks down: standing on it is hanging in the world.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, Slab, EGridFace::NegZ) });
+	TestEqual(TEXT("Off an upside-down ground, the wall above it is the one redrawn"),
+		FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Above), Manager->WallsStandChance);
+	TestEqual(TEXT("And the one below it stands"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Below), 0.0f);
+
+	// A ground that holds nothing asks nothing.
+	UPlatformStructureData* BareGround = MakeStructure(TEXT("TestRoleBareGround"), 16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestRoleCeiling"), 16, 16, EStructureType::Ceiling, false);
+	BareGround->bHoldsItems = false;
+	Rooted.Append({ BareGround, Ceiling });
+
+	FGridPlatform BareFloor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr);
+	BareFloor.PositiveStructure = BareGround;
+	BareFloor.NegativeStructure = Ceiling;
+	FRoomManagerTestAccess::Rebuild(*Manager, { BareFloor });
+	TestEqual(TEXT("Below a ground that holds nothing, hanging is not redrawn"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Below), 0.0f);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleFloorsCloseRoomsTest, "WEM.Structures.Roles.FloorsCloseRooms", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleFloorsCloseRoomsTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	UPlatformTileData* Square = Manager->Tiles[0];
+	UPlatformTileData* Small = Manager->Tiles[1];
+	UPlatformStructureData* Slab = MakeSlab(16, 16, true, Rooted);
+	UPlatformStructureData* SmallSlab = MakeSlab(8, 8, true, Rooted);
+	const float Chance = Manager->FloorsCloseRoomsChance;
+
+	// A wall facing X at X 32, Y 16 to 32 and Z 32 to 48, holding items on both faces. Floors fold off it
+	// at its foot (Z 32) or its top (Z 48), toward +X or toward -X.
+	const FGridPlatform Wall = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, Slab);
+	const FGridPlatform FootPlus = MakeFilled(FIntVector(32, 16, 32), EGridAxis::Z, Square, nullptr);
+	const FGridPlatform TopPlus = MakeFilled(FIntVector(32, 16, 48), EGridAxis::Z, Square, nullptr);
+	const FGridPlatform FootMinus = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr);
+	const FGridPlatform TopMinus = MakeFilled(FIntVector(16, 16, 48), EGridAxis::Z, Square, nullptr);
+	const FGridPlatform Corner = MakeFilled(FIntVector(32, 32, 32), EGridAxis::Y, Square, nullptr);
+
+	auto RedrawChance = [Manager](const FGridPlatform& Candidate)
+	{
+		return FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Candidate);
+	};
+
+	// With neither end closed, a ground at the foot is wanted on either side.
+	FRoomManagerTestAccess::Rebuild(*Manager, { Wall });
+	TestEqual(TEXT("Open both ends: a floor at the foot is kept"), RedrawChance(FootPlus), 0.0f);
+	TestEqual(TEXT("And one at the top is drawn again"), RedrawChance(TopPlus), Chance);
+	TestEqual(TEXT("On the other side too"), RedrawChance(TopMinus), Chance);
+	TestEqual(TEXT("A wall turning its corner asks nothing"), RedrawChance(Corner), 0.0f);
+
+	// A ceiling at the top on +X: the room there wants its ground. The -X side is still open both ends.
+	FRoomManagerTestAccess::Rebuild(*Manager, { Wall, MakeFilled(FIntVector(32, 16, 48), EGridAxis::Z, Square, Slab) });
+	TestEqual(TEXT("Under a ceiling, a ground at the foot is kept"), RedrawChance(FootPlus), 0.0f);
+	TestEqual(TEXT("Across the wall, the top is still drawn again"), RedrawChance(TopMinus), Chance);
+
+	// Part of a ground at the foot on +X: the room there wants its ceiling, so the rest of the foot is
+	// drawn again and the top is kept.
+	const FGridPlatform PartGround = MakeFilled(FIntVector(32, 16, 32), EGridAxis::Z, Small, SmallSlab);
+	const FGridPlatform RestOfFoot = MakeFilled(FIntVector(32, 24, 32), EGridAxis::Z, Small, nullptr);
+	FRoomManagerTestAccess::Rebuild(*Manager, { Wall, PartGround });
+	TestEqual(TEXT("With a ground at its foot, more of the foot is drawn again"), RedrawChance(RestOfFoot), Chance);
+	TestEqual(TEXT("And a ceiling at the top is kept"), RedrawChance(TopPlus), 0.0f);
+
+	// Closed at both ends, the room wants neither.
+	FRoomManagerTestAccess::Rebuild(*Manager, { Wall, PartGround, MakeFilled(FIntVector(32, 16, 48), EGridAxis::Z, Square, Slab) });
+	TestEqual(TEXT("Closed both ends, nothing is drawn again"), RedrawChance(RestOfFoot), 0.0f);
+
+	// A face that holds nothing faces no room.
+	UPlatformStructureData* Holds = nullptr;
+	UPlatformStructureData* HoldsNothing = nullptr;
+	MakeHalfHoldingWall(Holds, HoldsNothing, Rooted);
+
+	FGridPlatform HalfWall = Wall;
+	HalfWall.PositiveStructure = HoldsNothing;
+	HalfWall.NegativeStructure = Holds;
+	FRoomManagerTestAccess::Rebuild(*Manager, { HalfWall });
+	TestEqual(TEXT("Off a face holding nothing, the top is kept"), RedrawChance(TopPlus), 0.0f);
+	TestEqual(TEXT("Off the face that holds items, it is drawn again"), RedrawChance(TopMinus), Chance);
+
+	// Upside down, the wall's foot is its highest edge in the world.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, Slab, EGridFace::NegZ) });
+	TestEqual(TEXT("Upside down, a floor at Z 48, its foot, is kept"), RedrawChance(TopPlus), 0.0f);
+	TestEqual(TEXT("And one at Z 32, its top, is drawn again"), RedrawChance(FootPlus), Chance);
+
+	Manager->bFloorsCloseRooms = false;
+	TestEqual(TEXT("With the rule off, nothing is drawn again"), RedrawChance(FootPlus), 0.0f);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleRuleGrowthTest, "WEM.Structures.Roles.RuleGrowth", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleRuleGrowthTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	// The same seed grown with the rules and without. Every placement is then asked, against the
+	// platforms placed before it, whether it went against either rule: with the rules on, far fewer do.
+	struct FTally
+	{
+		int32 Placements = 0;
+		int32 AgainstWallsStand = 0;
+		int32 AgainstFloorsCloseRooms = 0;
+	};
+
+	auto Grow = [](const bool bRules)
+	{
+		FScopedTestWorld TestWorld;
+		TArray<UObject*> Rooted;
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+		Manager->bWallsStandOnGrounds = bRules;
+		Manager->bFloorsCloseRooms = bRules;
+
+		for (int32 Beat = 0; Beat < 300; ++Beat)
+		{
+			Manager->PlaceNextPlatform();
+		}
+
+		const TArray<FGridPlatform> Grown = Manager->Platforms;
+
+		FTally Tally;
+		Tally.Placements = Grown.Num();
+
+		// Replayed a placement at a time, each asked against those before it, one rule at a time.
+		TArray<FGridPlatform> Before;
+
+		for (const FGridPlatform& Platform : Grown)
+		{
+			if (!Before.IsEmpty())
+			{
+				FRoomManagerTestAccess::Rebuild(*Manager, Before);
+
+				Manager->bWallsStandOnGrounds = true;
+				Manager->bFloorsCloseRooms = false;
+				Tally.AgainstWallsStand += FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Platform) > 0.0f ? 1 : 0;
+
+				Manager->bWallsStandOnGrounds = false;
+				Manager->bFloorsCloseRooms = true;
+				Tally.AgainstFloorsCloseRooms += FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Platform) > 0.0f ? 1 : 0;
+			}
+
+			Before.Add(Platform);
+		}
+
+		ReleaseRooted(Rooted);
+		return Tally;
+	};
+
+	const FTally Without = Grow(false);
+	const FTally With = Grow(true);
+
+	AddInfo(FString::Printf(TEXT("Without the rules: of %d placements, %d hung below a ground and %d went to the end of a wall its room did not need."),
+		Without.Placements, Without.AgainstWallsStand, Without.AgainstFloorsCloseRooms));
+	AddInfo(FString::Printf(TEXT("With the rules: of %d placements, %d hung below a ground and %d went to the end of a wall its room did not need."),
+		With.Placements, With.AgainstWallsStand, With.AgainstFloorsCloseRooms));
+
+	TestTrue(TEXT("Both grow"), Without.Placements > 100 && With.Placements > 100);
+	TestTrue(TEXT("Without the rules, some walls hang below grounds"), Without.AgainstWallsStand > 10);
+	TestTrue(TEXT("Without the rules, some floors go where their room did not need them"), Without.AgainstFloorsCloseRooms > 10);
+	TestTrue(TEXT("With them, at most two thirds as many walls hang"), 3 * With.AgainstWallsStand <= 2 * Without.AgainstWallsStand);
+	TestTrue(TEXT("And at most two thirds as many floors go astray"), 3 * With.AgainstFloorsCloseRooms <= 2 * Without.AgainstFloorsCloseRooms);
+
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleTurnedGrowthTest, "WEM.Structures.Roles.TurnedGrowth", WEMRoomManagerTests::TestFlags)
 
 bool FStructureRoleTurnedGrowthTest::RunTest(const FString& Parameters)

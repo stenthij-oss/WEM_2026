@@ -91,6 +91,13 @@ namespace
 	constexpr uint8 AsLaidWay = 1 << 0;
 	constexpr uint8 TurnedWay = 1 << 1;
 
+	/**
+	 * How many times a beat draws a placement again when the one it drew goes against a growth rule
+	 * (see ARoomManager::GetRuleRedrawChance). Bounded, so a structure with nowhere the rules favour
+	 * still grows, and a beat costs at most this many draws more.
+	 */
+	constexpr int32 MaxRuleRedraws = 4;
+
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
@@ -1067,9 +1074,9 @@ EGridFace ARoomManager::TurnUp(const FGridPlatform& Platform, const FGridPlatfor
 	EGridFace Up = Parent.Up;
 	const int32 ParentNormal = AxisIndex(Parent.Normal);
 
-	auto HoldsItems = [this, &Parent, ParentNormal](const int32 Sign)
+	auto HoldsItems = [this, &Parent](const int32 Sign)
 	{
-		return !IsFaceBlocked(Parent, MakeFace(ParentNormal, Sign));
+		return FaceHoldsItems(Parent, Sign);
 	};
 
 	if (Platform.Normal != Parent.Normal)
@@ -1104,6 +1111,124 @@ EGridFace ARoomManager::TurnUp(const FGridPlatform& Platform, const FGridPlatfor
 	}
 
 	return Up;
+}
+
+bool ARoomManager::FaceHoldsItems(const FGridPlatform& Platform, const int32 Sign) const
+{
+	return !IsFaceBlocked(Platform, MakeFace(AxisIndex(Platform.Normal), Sign));
+}
+
+bool ARoomManager::HasFloorAlong(const FGridPlatform& Wall, const int32 Coordinate, const int32 Side) const
+{
+	int32 SpanU, SpanV, U, V;
+	if (!GetPlatformSpans(Wall, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+	const int32 WallNormal = AxisIndex(Wall.Normal);
+	const int32 UpAxis = FaceAxis(Wall.Up);
+	GetInPlaneAxes(WallNormal, U, V);
+
+	const int32 AcrossAxis = UpAxis == U ? V : U;
+	bool bFound = false;
+
+	// The module faces lying across Up beside the wall's edge there, on that side of its plane.
+	ForEachModuleEdge(Wall, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (bFound || !bRim || Edge.Axis != AcrossAxis || Edge.Node[UpAxis] != Coordinate)
+		{
+			return;
+		}
+
+		const FIntVector FaceMinNode = Side > 0 ? Edge.Node : Edge.Node - AxisStep(WallNormal, Module);
+
+		if (const int32* Owner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, UpAxis)))
+		{
+			bFound = !BuiltPlatforms[*Owner].IsWall();
+		}
+	});
+
+	return bFound;
+}
+
+float ARoomManager::GetRuleRedrawChance(const FGridPlatform& Candidate) const
+{
+	if (!bWallsStandOnGrounds && !bFloorsCloseRooms)
+	{
+		return 0.0f;
+	}
+
+	TArray<int32, TInlineAllocator<8>> Touching;
+	GatherTouchingPlatforms(Candidate, Touching);
+
+	float Chance = 0.0f;
+
+	for (const int32 Index : Touching)
+	{
+		const FGridPlatform& Parent = BuiltPlatforms[Index];
+
+		// Both rules are about folding off a platform, into one side of its plane or the other.
+		if (Candidate.Normal == Parent.Normal)
+		{
+			continue;
+		}
+
+		const int32 ParentNormal = AxisIndex(Parent.Normal);
+		const int32 Side = Candidate.MinNode[ParentNormal] == Parent.MinNode[ParentNormal] ? 1 : -1;
+
+		if (!Parent.IsWall())
+		{
+			// Off a ground that holds items, walls stand up on it rather than hang below it.
+			const int32 GroundSide = FaceSign(Parent.Up);
+
+			if (bWallsStandOnGrounds && Side != GroundSide && FaceHoldsItems(Parent, GroundSide))
+			{
+				Chance = FMath::Max(Chance, WallsStandChance);
+			}
+
+			continue;
+		}
+
+		// Off a wall's holding face, a floor at its top or its foot - the ends across its Up - goes where the
+		// room it faces still needs one: at the foot when its top is closed by a ceiling, at the top when its
+		// foot already has a ground, and at the foot when it has neither.
+		const int32 UpAxis = FaceAxis(Parent.Up);
+
+		if (!bFloorsCloseRooms || AxisIndex(Candidate.Normal) != UpAxis || !FaceHoldsItems(Parent, Side))
+		{
+			continue;
+		}
+
+		int32 SpanU, SpanV, U, V;
+		GetPlatformSpans(Parent, SpanU, SpanV);
+		GetInPlaneAxes(ParentNormal, U, V);
+
+		const int32 UpSpan = UpAxis == U ? SpanU : SpanV;
+		const bool bUpPositive = FaceSign(Parent.Up) > 0;
+		const int32 TopCoordinate = Parent.MinNode[UpAxis] + (bUpPositive ? UpSpan : 0);
+		const int32 FootCoordinate = Parent.MinNode[UpAxis] + (bUpPositive ? 0 : UpSpan);
+
+		const bool bCeilingAtTop = HasFloorAlong(Parent, TopCoordinate, Side);
+		const bool bGroundAtFoot = HasFloorAlong(Parent, FootCoordinate, Side);
+
+		// A room closed at both ends wants neither.
+		if (bCeilingAtTop && bGroundAtFoot)
+		{
+			continue;
+		}
+
+		const bool bTopWanted = bGroundAtFoot;
+		const bool bAtTop = Candidate.MinNode[UpAxis] == TopCoordinate;
+
+		if (bAtTop != bTopWanted)
+		{
+			Chance = FMath::Max(Chance, FloorsCloseRoomsChance);
+		}
+	}
+
+	return Chance;
 }
 
 void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const
@@ -1364,17 +1489,18 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		// list it was drawn from. Where every way the tile is listed can be filled - nearly always - every
 		// placement is fillable, and the draw is the same without counting them.
 		const uint8 ListedWays = Tile->bCanTurn && Tile->Width != Tile->Length ? (AsLaidWay | TurnedWay) : AsLaidWay;
+		const bool bAllFillable = (GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays;
+		const int32 Fillable = bAllFillable ? Candidates.Num() : Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
+		{
+			return IsFillable(ChosenTile, Candidate);
+		});
 
-		if ((GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays)
+		auto DrawPlacement = [&]() -> FGridPlatform
 		{
-			Platform = Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
-		}
-		else
-		{
-			const int32 Fillable = Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
+			if (bAllFillable)
 			{
-				return IsFillable(ChosenTile, Candidate);
-			});
+				return Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
+			}
 
 			int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
 
@@ -1382,10 +1508,27 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 			{
 				if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
 				{
-					Platform = Candidate;
-					break;
+					return Candidate;
 				}
 			}
+
+			return Candidates[0];
+		};
+
+		Platform = DrawPlacement();
+
+		// A placement going against a growth rule is drawn again, with the rule's chance, so growth leans
+		// the way the rules say without ever being held to it.
+		for (int32 Redraw = 0; Redraw < MaxRuleRedraws; ++Redraw)
+		{
+			const float Chance = GetRuleRedrawChance(Platform);
+
+			if (Chance <= 0.0f || PlacementStream.FRand() >= Chance)
+			{
+				break;
+			}
+
+			Platform = DrawPlacement();
 		}
 
 		// Which way up it is follows from what it grows off, and decides what can fill it.
