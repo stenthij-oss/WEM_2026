@@ -6,13 +6,17 @@
 #include "Math/RandomStream.h"
 #include "PlatformStructureData.h"
 
+enum class EGridFace : uint8;
+
 /**
  * How a structure is laid onto a segment: which face it fits, which way round, and where its mesh
  * goes. Pure geometry, with nothing read from a room manager, so every case can be checked on its own.
  *
- * A segment is named here the way the room manager names a platform: the axis it faces along, and
- * its spans beam to beam along its first and second in-plane axes (see WEMGrid::GetInPlaneAxes) -
- * level and level across a floor, level and up a wall.
+ * A segment is named here the way the room manager names a platform: the axis it faces along, its
+ * spans beam to beam along its first and second in-plane axes (see WEMGrid::GetInPlaneAxes), and
+ * its Up - the way up in its own frame, which need not be the world's. Up along its normal makes it
+ * a floor, its Ground face the one looking along Up and its Ceiling face the other; Up in its plane
+ * makes it a wall, whose structures stand with their tops along Up.
  *
  * The category pull is here too, with categories as the room manager numbers them: which structure
  * a face is filled with, given what the faces around it were filled with.
@@ -44,28 +48,31 @@ namespace WEMStructures
 	 */
 	WEM_2026_API FVector GetMeshAxisForBlenderAxis(int32 BlenderAxis);
 
-	/** The type of the face a segment facing along NormalAxis shows on the side FaceSign looks out from. */
-	WEM_2026_API EStructureType GetFaceType(int32 NormalAxis, int32 FaceSign);
+	/** Whether a segment facing along NormalAxis is a wall in its own frame: its Up lies in its plane. */
+	WEM_2026_API bool IsWall(int32 NormalAxis, EGridFace Up);
+
+	/** The type of the face a segment facing along NormalAxis, with its Up, shows on the side FaceSign looks out from. */
+	WEM_2026_API EStructureType GetFaceType(int32 NormalAxis, int32 FaceSign, EGridFace Up);
 
 	/**
 	 * Whether a structure of Width x Length cells fits a segment's opening. Across a floor or ceiling
-	 * it may lie either way round; up a wall it stands with its length up, or lies on its side only
-	 * when it may. Turned means its length runs along the segment's first axis.
+	 * it may lie either way round; up a wall it stands with its length along the wall's Up, or lies on
+	 * its side only when it may. Turned means its length runs along the segment's first axis.
 	 */
-	WEM_2026_API bool FitsShape(int32 Width, int32 Length, bool bMayLieSideways, int32 NormalAxis, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
+	WEM_2026_API bool FitsShape(int32 Width, int32 Length, bool bMayLieSideways, int32 NormalAxis, EGridFace Up, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
 
 	/**
 	 * Whether a structure may fill one face of a segment: its types take in the face's, and the other
 	 * face's too when it is two-sided, and its shape fits the opening.
 	 */
-	WEM_2026_API bool FitsFace(const UPlatformStructureData& Structure, int32 NormalAxis, int32 FaceSign, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
+	WEM_2026_API bool FitsFace(const UPlatformStructureData& Structure, int32 NormalAxis, int32 FaceSign, EGridFace Up, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
 
 	/**
 	 * Where a structure's mesh goes on one face of a segment whose min node's cell starts at MinCorner.
 	 *
-	 * The mesh's face - Blender's +Z - looks out of the segment on the side FaceSign says. Up a wall
-	 * its top - Blender's +Y - points up, or along the wall's level axis when it lies on its side;
-	 * across a floor or ceiling it points along the axis its length runs. Its X follows as a proper
+	 * The mesh's face - Blender's +Z - looks out of the segment on the side FaceSign says. Its top -
+	 * Blender's +Y - points along the axis its length runs: up a wall that is the wall's Up, or the
+	 * wall's level axis when it lies on its side; across a floor or ceiling it is either in-plane axis. Its X follows as a proper
 	 * rotation, never a mirror, so it reads the same from the side it faces as it did in Blender.
 	 * It stands at the centre of the opening on the segment's mid-plane, its back there; a two-sided
 	 * structure was modelled lying on the ground, so it goes back half a cell to fill both halves.
@@ -74,6 +81,7 @@ namespace WEMStructures
 		const FVector& MinCorner,
 		double CellSize,
 		int32 NormalAxis,
+		EGridFace Up,
 		int32 SpanFirst,
 		int32 SpanSecond,
 		int32 FaceSign,

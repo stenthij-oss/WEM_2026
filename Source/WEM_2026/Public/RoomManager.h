@@ -83,6 +83,9 @@ enum class ESurfaceCapacity : uint8
  * Only the axis is stored. The kind follows from it - facing Z is horizontal, facing X or Y
  * is vertical - so storing the kind as well would only leave room for the two to disagree. Its
  * size follows from the tile the same way, so changing a tile reshapes every platform laid from it.
+ *
+ * The kind is the world's view of it. What it is in its own frame - floor or wall - follows from its
+ * Up instead, and the two need not agree: a platform lying flat in the world can be a wall.
  */
 USTRUCT(BlueprintType)
 struct FGridPlatform
@@ -106,8 +109,18 @@ struct FGridPlatform
 	bool bTurned = false;
 
 	/**
-	 * The structure filling the platform's positive face - up from a floor, out along +X or +Y from a
-	 * wall - and the one filling its negative face. A two-sided structure fills both and is held in
+	 * The way up in the platform's own frame, which need not be the world's. Along its normal it is a
+	 * floor: its Ground face looks along Up and its Ceiling face the other way. In its plane it is a
+	 * wall, whose structures stand with their tops along Up. Taken from the platform it grew off, and
+	 * changed only where growth turns it. +Z for the first platform, and for any platform saved before
+	 * platforms had one, so those read as they always did.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	EGridFace Up = EGridFace::PosZ;
+
+	/**
+	 * The structure filling the platform's positive face - the one looking out along +X, +Y or +Z - and
+	 * the one filling its negative face. A two-sided structure fills both and is held in
 	 * both. A platform placed before there were structures has neither: it is drawn with no fill, and
 	 * both of its faces carry anything.
 	 */
@@ -120,6 +133,12 @@ struct FGridPlatform
 	EPlatformKind GetKind() const
 	{
 		return Normal == EGridAxis::Z ? EPlatformKind::SurfaceHorizontal : EPlatformKind::SurfaceVertical;
+	}
+
+	/** Whether it is a wall in its own frame: its Up lies in its plane. A wall need not stand upright in the world. */
+	bool IsWall() const
+	{
+		return static_cast<int32>(Up) / 2 != static_cast<int32>(Normal);
 	}
 };
 
@@ -290,12 +309,24 @@ struct FSurfaceMarkLayer
  * Each beat rolls which kind to try first, then which tile, by the tiles' weights among those
  * with somewhere to go, then draws one of that tile's free placements, and fills it.
  *
+ * Up
+ * --
+ * Floor, wall and ceiling are not the world's. Every platform carries its own Up (FGridPlatform::Up),
+ * and what it is follows from that: a floor when Up lies along its normal, a wall when Up lies in its
+ * plane. The first platform's Up is +Z. Every one after takes the Up of a platform it grows off -
+ * one drawn at random among those it shares a module edge with - so a platform folding off a floor is
+ * a wall standing on it, one folding off a wall's top or foot is a floor, and one going on in a
+ * platform's plane is what that platform is. Only a way up the structures can fill is taken: failing
+ * that the Up of another platform it touches, and failing all of them +Z, which every placement drawn
+ * can be filled for.
+ *
  * Structures
  * ----------
  * A platform is built as beams around an opening, and the opening is filled by structures - meshes
  * made for it: one two-sided structure, filling both of its faces, or two one-sided ones, one per
- * face. A face takes a structure whose types include its own: ground up from a floor, ceiling down
- * from one, wall either side of a wall. The fill is drawn in the same beat as the platform, from a
+ * face. A face takes a structure whose types include its own: ground on a floor's Ground face,
+ * ceiling on its Ceiling face, wall either side of a wall. The fill is drawn in the same beat as the
+ * platform, from a
  * stream of its own, since what fills a platform can change where growth may go next. A tile that
  * no structures could fill completely, laid a given way, is not laid that way, and the platform
  * that starts growth is always filled with load-bearing structures.
@@ -310,7 +341,7 @@ struct FSurfaceMarkLayer
  * (ContinueChance, rising to MaxContinueChance at StreakForMaxChance).
  *
  * A platform filled with anything not load-bearing blocks some of its beams: a wall the ones along
- * its top, so nothing is built onto it while more panels can still join beside it, and a floor or
+ * its top - the side its Up points to - so nothing is built onto it while more panels can still join beside it, and a floor or
  * ceiling every beam of its rim no platform used before it. No later platform takes in a blocked
  * module edge. A beam is built only where some platform using it has not blocked it, and a post
  * only where a built beam ends; a beam or post that is not built is not there at all - no surface,
@@ -321,9 +352,9 @@ struct FSurfaceMarkLayer
  * filled with one, each end of it with room beyond is drawn for (FenceContinueChance), and an end
  * that carries on waits in a queue. While anything waits, a beat places the next panel of the
  * oldest waiting end instead of drawing a platform: the same fence on the same tile laid the same
- * way round, straight on in the same plane - along the ground on a wall, along the fence's width
- * across a floor - or, for a wall, round the beam at its end onto a wall facing the other way
- * (FenceTurnChance). A panel that stands on something or hangs from it is preferred, so a parapet
+ * way round, with the same Up, straight on in the same plane - across its Up on a wall, along the
+ * fence's width across a floor - or, for a wall, round the beam at its end onto a wall facing the
+ * other way (FenceTurnChance), laid whichever way round keeps it as tall. A panel that stands on something or hangs from it is preferred, so a parapet
  * follows its roof's edge round a corner. An end that has reached a panel of its own fence - a run
  * closing round a roof, or meeting another of the same fence - is closed. A platform a normal beat
  * happens to lay on a waiting spot, laid as the run is, carries the run on. A fence that is not
@@ -691,6 +722,10 @@ public:
 	/** Whether that structure is a fence, and its platform a panel of a run. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	bool bDebugProbeInFenceRun = false;
+
+	/** What that surface's platform is in its own frame, and its Up, as in "wall, up -Z". Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
+	FString DebugProbeRole;
 
 	/** True when the coordinate addresses a cell inside the cube. */
 	UFUNCTION(BlueprintPure, Category = "Grid|Coordinates")
@@ -1086,11 +1121,24 @@ private:
 	void ResolveUsableStructures(TArray<FString>& OutProblems);
 
 	/**
-	 * Whether the usable structures can fill a platform facing NormalAxis with these spans
-	 * completely: one two-sided structure, or a one-sided one on each face. Only load-bearing ones
-	 * count when asked.
+	 * Whether the usable structures can fill a platform facing NormalAxis, with this Up and these
+	 * spans, completely: one two-sided structure, or a one-sided one on each face. Only load-bearing
+	 * ones count when asked.
 	 */
-	bool HasCompleteFill(int32 NormalAxis, int32 SpanFirst, int32 SpanSecond, bool bLoadBearingOnly) const;
+	bool HasCompleteFill(int32 NormalAxis, EGridFace Up, int32 SpanFirst, int32 SpanSecond, bool bLoadBearingOnly) const;
+
+	/**
+	 * Every platform a placement would share a module edge of rim with, as indices into BuiltPlatforms,
+	 * each once and in ascending order.
+	 */
+	void GatherTouchingPlatforms(const FGridPlatform& Platform, TArray<int32, TInlineAllocator<8>>& OutTouching) const;
+
+	/**
+	 * The Up a placement about to be filled takes, from the role stream: that of a platform it touches,
+	 * drawn at random. A way up no structures can fill gives way to the Up of the other platforms it
+	 * touches, then to +Z.
+	 */
+	EGridFace ChooseUp(const FGridPlatform& Platform);
 
 	/**
 	 * The ways round, one bit each - as it is, then turned - that a usable tile can be laid as a kind
@@ -1113,7 +1161,7 @@ private:
 
 	/**
 	 * Draws the structures filling a platform that is about to be placed, from the structure
-	 * stream: a face first - the top of a floor, either face of a wall - then a structure for it,
+	 * stream: a face first - a floor's Ground face, either face of a wall - then a structure for it,
 	 * and when that is one-sided, one for the face behind. False when nothing fits.
 	 */
 	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
@@ -1265,7 +1313,7 @@ private:
 	/** Whether a platform is filled with a fence: a two-sided fence structure on both faces. */
 	static bool IsFencePanel(const FGridPlatform& Platform);
 
-	/** The in-plane axis a fence panel's run goes along: along the ground up a wall, along the fence's width across a floor. */
+	/** The in-plane axis a fence panel's run goes along: across its Up on a wall, along the fence's width across a floor. */
 	int32 GetRunAxis(const FGridPlatform& Panel) const;
 
 	/**
@@ -1291,8 +1339,9 @@ private:
 	int32 GetJoinedSide(const FFenceEnd& End, const FGridPlatform& Continuation) const;
 
 	/**
-	 * Whether a platform stands on something: a wall when every module edge along its bottom, or
-	 * every one along its top, is used already - hanging counts. Floors and ceilings always do.
+	 * Whether a platform stands on something: a wall when every module edge along its foot, or every
+	 * one along its top, is used already - hanging counts. Its foot and top run across its Up. Floors
+	 * and ceilings always do.
 	 */
 	bool StandsOnSomething(const FGridPlatform& Platform) const;
 
@@ -1533,6 +1582,9 @@ private:
 	 * drawn as they would be with no structures at all.
 	 */
 	FRandomStream StructureStream;
+
+	/** Which way up each platform is, likewise from a stream of its own. */
+	FRandomStream RoleStream;
 
 	/**
 	 * Fence ends waiting to grow, oldest first. Beat state, like the streams: never saved, kept by a

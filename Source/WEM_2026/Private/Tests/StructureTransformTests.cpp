@@ -6,6 +6,7 @@
 
 #include "Misc/AutomationTest.h"
 #include "PlatformStructureData.h"
+#include "RoomManager.h"
 #include "StructurePlacement.h"
 #include "UObject/Package.h"
 
@@ -36,7 +37,7 @@ namespace StructureTransformTestsPrivate
 
 	/**
 	 * One case: a segment facing along NormalAxis at the cube's corner, the face it is filled on, and
-	 * where the mesh's face and top should then point.
+	 * where the mesh's face and top should then point. Its Up is the world's unless the case says.
 	 */
 	struct FTransformCase
 	{
@@ -49,6 +50,7 @@ namespace StructureTransformTestsPrivate
 		bool bTwoSided;
 		FVector ExpectedFace;
 		FVector ExpectedTop;
+		EGridFace Up = EGridFace::PosZ;
 	};
 
 	/** The mesh's back sits on the mid-plane, or half a cell behind it when two-sided, at the opening's centre. */
@@ -67,7 +69,7 @@ namespace StructureTransformTestsPrivate
 	bool CheckCase(FAutomationTestBase& Test, const FTransformCase& Case)
 	{
 		const FTransform Transform = WEMStructures::MakeStructureTransform(
-			FVector::ZeroVector, CellSize, Case.NormalAxis, Case.SpanFirst, Case.SpanSecond, Case.FaceSign, Case.bTurned, Case.bTwoSided);
+			FVector::ZeroVector, CellSize, Case.NormalAxis, Case.Up, Case.SpanFirst, Case.SpanSecond, Case.FaceSign, Case.bTurned, Case.bTwoSided);
 
 		const FLaidAxes Axes = LayAxes(Transform);
 		bool bPassed = true;
@@ -127,14 +129,14 @@ bool FStructureTransformFacesTest::RunTest(const FString& Parameters)
 
 	// Opposite faces of one wall show the same mesh from either side, so their widths run opposite
 	// ways: each reads left to right for whoever stands in front of it.
-	const FLaidAxes Front = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, 16, 16, 1, false, false));
-	const FLaidAxes Back = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, 16, 16, -1, false, false));
+	const FLaidAxes Front = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, EGridFace::PosZ, 16, 16, 1, false, false));
+	const FLaidAxes Back = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, EGridFace::PosZ, 16, 16, -1, false, false));
 	TestTrue(TEXT("The two faces of a wall run their widths opposite ways"), Front.Width.Equals(-Back.Width, 1.e-6));
 
 	// A wall facing X and one facing Y differ by a quarter turn about up, never by a half turn: the
 	// same face of the same structure, walked round a corner, keeps its top up and its width level.
-	const FLaidAxes FacingX = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, 16, 16, 1, false, false));
-	const FLaidAxes FacingY = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 1, 16, 16, 1, false, false));
+	const FLaidAxes FacingX = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 0, EGridFace::PosZ, 16, 16, 1, false, false));
+	const FLaidAxes FacingY = LayAxes(WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 1, EGridFace::PosZ, 16, 16, 1, false, false));
 	TestTrue(TEXT("Walls facing X and Y differ by a quarter turn about up"),
 		FVector::CrossProduct(FacingX.Face, FacingY.Face).Equals(FVector::CrossProduct(FacingX.Width, FacingY.Width), 1.e-6)
 		&& FMath::Abs(FVector::DotProduct(FacingX.Width, FacingY.Width)) < 1.e-6);
@@ -156,6 +158,35 @@ bool FStructureTransformTurnedTest::RunTest(const FString& Parameters)
 		{ TEXT("Turned ceiling underside"),  2, 8, 16, -1, true, false, FVector(0, 0, -1), FVector(1, 0, 0) },
 		{ TEXT("Lying wall facing +X"),      0, 16, 8,  1, true, false, FVector(1, 0, 0),  FVector(0, 1, 0) },
 		{ TEXT("Lying wall facing -Y"),      1, 16, 8, -1, true, false, FVector(0, -1, 0), FVector(1, 0, 0) },
+	};
+
+	for (const FTransformCase& Case : Cases)
+	{
+		CheckCase(*this, Case);
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureTransformRelativeTest, "WEM.Structures.Transform.Relative", StructureTransformTestsPrivate::TestFlags)
+
+bool FStructureTransformRelativeTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureTransformTestsPrivate;
+
+	// A wall's top points along its own Up - down when it is upside down, sideways when its Up lies
+	// along its first axis, which is where an upright structure's length then runs. A floor's faces are
+	// laid as before, whichever way up it is; only which of them is its ground changes.
+	const FTransformCase Cases[] =
+	{
+		{ TEXT("Upside-down wall facing +X"),         0, 16, 16,  1, false, false, FVector(1, 0, 0),  FVector(0, 0, -1), EGridFace::NegZ },
+		{ TEXT("Upside-down wall facing -Y"),         1, 8, 16,  -1, false, false, FVector(0, -1, 0), FVector(0, 0, -1), EGridFace::NegZ },
+		{ TEXT("Wall facing +X with Up +Y"),          0, 16, 8,   1, true,  false, FVector(1, 0, 0),  FVector(0, 1, 0),  EGridFace::PosY },
+		{ TEXT("Wall facing +X with Up -Y"),          0, 16, 8,  -1, true,  false, FVector(-1, 0, 0), FVector(0, -1, 0), EGridFace::NegY },
+		{ TEXT("World floor that is a wall, Up +X"),  2, 16, 8,   1, true,  false, FVector(0, 0, 1),  FVector(1, 0, 0),  EGridFace::PosX },
+		{ TEXT("World floor that is a wall, Up -Y"),  2, 8, 16,  -1, false, false, FVector(0, 0, -1), FVector(0, -1, 0), EGridFace::NegY },
+		{ TEXT("Upside-down floor's ground"),         2, 16, 16, -1, false, false, FVector(0, 0, -1), FVector(0, 1, 0),  EGridFace::NegZ },
+		{ TEXT("Lying upside-down wall facing +X"),   0, 16, 8,   1, true,  false, FVector(1, 0, 0),  FVector(0, 1, 0),  EGridFace::NegZ },
 	};
 
 	for (const FTransformCase& Case : Cases)
@@ -188,7 +219,7 @@ bool FStructureTransformTwoSidedTest::RunTest(const FString& Parameters)
 
 	// Its back half-cell behind the mid-plane and its face half a cell in front of it: both faces of
 	// the segment, exactly. The mid-plane of a segment at the cube's corner is at half a cell.
-	const FTransform Floor = WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 2, 16, 16, 1, false, true);
+	const FTransform Floor = WEMStructures::MakeStructureTransform(FVector::ZeroVector, CellSize, 2, EGridFace::PosZ, 16, 16, 1, false, true);
 	TestEqual(TEXT("A two-sided floor's back lies on the segment's underside"), Floor.GetLocation().Z, 0.0);
 
 	return true;
@@ -200,30 +231,35 @@ bool FStructureTransformNeverMirroredTest::RunTest(const FString& Parameters)
 {
 	using namespace StructureTransformTestsPrivate;
 
-	// Every face of every orientation, every way round: a proper rotation each time.
+	// Every face of every orientation, every way up, every way round: a proper rotation each time.
 	int32 Cases = 0;
 
 	for (int32 NormalAxis = 0; NormalAxis < 3; ++NormalAxis)
 	{
-		for (const int32 FaceSign : { 1, -1 })
+		for (int32 UpIndex = 0; UpIndex < 6; ++UpIndex)
 		{
-			for (const bool bTurned : { false, true })
-			{
-				for (const bool bTwoSided : { false, true })
-				{
-					const FLaidAxes Axes = LayAxes(WEMStructures::MakeStructureTransform(FVector(100.0, 200.0, 300.0), CellSize, NormalAxis, 8, 16, FaceSign, bTurned, bTwoSided));
+			const EGridFace Up = static_cast<EGridFace>(UpIndex);
 
-					TestTrue(FString::Printf(TEXT("Normal %d, face %d, turned %d, two-sided %d is a proper rotation"), NormalAxis, FaceSign, bTurned, bTwoSided),
-						FMath::IsNearlyEqual(Axes.Determinant, 1.0, 1.e-6));
-					TestTrue(FString::Printf(TEXT("Normal %d, face %d: the width, top and face are a frame"), NormalAxis, FaceSign),
-						FMath::Abs(FVector::DotProduct(Axes.Width, Axes.Top)) < 1.e-6 && FMath::Abs(FVector::DotProduct(Axes.Top, Axes.Face)) < 1.e-6);
-					++Cases;
+			for (const int32 FaceSign : { 1, -1 })
+			{
+				for (const bool bTurned : { false, true })
+				{
+					for (const bool bTwoSided : { false, true })
+					{
+						const FLaidAxes Axes = LayAxes(WEMStructures::MakeStructureTransform(FVector(100.0, 200.0, 300.0), CellSize, NormalAxis, Up, 8, 16, FaceSign, bTurned, bTwoSided));
+
+						TestTrue(FString::Printf(TEXT("Normal %d, up %d, face %d, turned %d, two-sided %d is a proper rotation"), NormalAxis, UpIndex, FaceSign, bTurned, bTwoSided),
+							FMath::IsNearlyEqual(Axes.Determinant, 1.0, 1.e-6));
+						TestTrue(FString::Printf(TEXT("Normal %d, up %d, face %d: the width, top and face are a frame"), NormalAxis, UpIndex, FaceSign),
+							FMath::Abs(FVector::DotProduct(Axes.Width, Axes.Top)) < 1.e-6 && FMath::Abs(FVector::DotProduct(Axes.Top, Axes.Face)) < 1.e-6);
+						++Cases;
+					}
 				}
 			}
 		}
 	}
 
-	TestEqual(TEXT("Every case was checked"), Cases, 24);
+	TestEqual(TEXT("Every case was checked"), Cases, 144);
 	return true;
 }
 
@@ -236,19 +272,19 @@ bool FStructureFitTest::RunTest(const FString& Parameters)
 	bool bTurned = false;
 
 	// Face types follow from the segment alone.
-	TestEqual(TEXT("A floor's top is ground"), WEMStructures::GetFaceType(2, 1), EStructureType::Ground);
-	TestEqual(TEXT("Its underside is ceiling"), WEMStructures::GetFaceType(2, -1), EStructureType::Ceiling);
-	TestEqual(TEXT("Either face of a wall facing X is wall"), WEMStructures::GetFaceType(0, -1), EStructureType::Wall);
-	TestEqual(TEXT("Either face of a wall facing Y is wall"), WEMStructures::GetFaceType(1, 1), EStructureType::Wall);
+	TestEqual(TEXT("A floor's top is ground"), WEMStructures::GetFaceType(2, 1, EGridFace::PosZ), EStructureType::Ground);
+	TestEqual(TEXT("Its underside is ceiling"), WEMStructures::GetFaceType(2, -1, EGridFace::PosZ), EStructureType::Ceiling);
+	TestEqual(TEXT("Either face of a wall facing X is wall"), WEMStructures::GetFaceType(0, -1, EGridFace::PosZ), EStructureType::Wall);
+	TestEqual(TEXT("Either face of a wall facing Y is wall"), WEMStructures::GetFaceType(1, 1, EGridFace::PosZ), EStructureType::Wall);
 
 	// Shape: floors turn freely, walls only when the structure may lie sideways.
-	TestTrue(TEXT("An 8 x 16 fits an 8 x 16 floor as it is"), WEMStructures::FitsShape(8, 16, false, 2, 8, 16, bTurned) && !bTurned);
-	TestTrue(TEXT("An 8 x 16 fits a 16 x 8 floor turned"), WEMStructures::FitsShape(8, 16, false, 2, 16, 8, bTurned) && bTurned);
-	TestTrue(TEXT("An upright 8 x 16 fits an upright wall"), WEMStructures::FitsShape(8, 16, false, 0, 8, 16, bTurned) && !bTurned);
-	TestFalse(TEXT("An upright 8 x 16 does not fit a lying wall"), WEMStructures::FitsShape(8, 16, false, 1, 16, 8, bTurned));
-	TestTrue(TEXT("One that may lie sideways does, turned"), WEMStructures::FitsShape(8, 16, true, 1, 16, 8, bTurned) && bTurned);
-	TestTrue(TEXT("A square fits a square wall without turning"), WEMStructures::FitsShape(16, 16, true, 0, 16, 16, bTurned) && !bTurned);
-	TestFalse(TEXT("A 16 x 16 does not fit an 8 x 16"), WEMStructures::FitsShape(16, 16, true, 2, 8, 16, bTurned));
+	TestTrue(TEXT("An 8 x 16 fits an 8 x 16 floor as it is"), WEMStructures::FitsShape(8, 16, false, 2, EGridFace::PosZ, 8, 16, bTurned) && !bTurned);
+	TestTrue(TEXT("An 8 x 16 fits a 16 x 8 floor turned"), WEMStructures::FitsShape(8, 16, false, 2, EGridFace::PosZ, 16, 8, bTurned) && bTurned);
+	TestTrue(TEXT("An upright 8 x 16 fits an upright wall"), WEMStructures::FitsShape(8, 16, false, 0, EGridFace::PosZ, 8, 16, bTurned) && !bTurned);
+	TestFalse(TEXT("An upright 8 x 16 does not fit a lying wall"), WEMStructures::FitsShape(8, 16, false, 1, EGridFace::PosZ, 16, 8, bTurned));
+	TestTrue(TEXT("One that may lie sideways does, turned"), WEMStructures::FitsShape(8, 16, true, 1, EGridFace::PosZ, 16, 8, bTurned) && bTurned);
+	TestTrue(TEXT("A square fits a square wall without turning"), WEMStructures::FitsShape(16, 16, true, 0, EGridFace::PosZ, 16, 16, bTurned) && !bTurned);
+	TestFalse(TEXT("A 16 x 16 does not fit an 8 x 16"), WEMStructures::FitsShape(16, 16, true, 2, EGridFace::PosZ, 8, 16, bTurned));
 
 	// Types: one-sided needs the face's own, two-sided both faces'.
 	UPlatformStructureData* GroundOnly = MakeStructure(16, 16, EStructureType::Ground, false);
@@ -256,14 +292,54 @@ bool FStructureFitTest::RunTest(const FString& Parameters)
 	UPlatformStructureData* GroundSlab = MakeStructure(16, 16, EStructureType::Ground, true);
 	UPlatformStructureData* WallSlab = MakeStructure(16, 16, EStructureType::Wall, true);
 
-	TestTrue(TEXT("A one-sided ground structure fits a floor's top"), WEMStructures::FitsFace(*GroundOnly, 2, 1, 16, 16, bTurned));
-	TestFalse(TEXT("But not its underside"), WEMStructures::FitsFace(*GroundOnly, 2, -1, 16, 16, bTurned));
-	TestFalse(TEXT("Nor a wall"), WEMStructures::FitsFace(*GroundOnly, 0, 1, 16, 16, bTurned));
+	TestTrue(TEXT("A one-sided ground structure fits a floor's top"), WEMStructures::FitsFace(*GroundOnly, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not its underside"), WEMStructures::FitsFace(*GroundOnly, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("Nor a wall"), WEMStructures::FitsFace(*GroundOnly, 0, 1, EGridFace::PosZ, 16, 16, bTurned));
 	TestTrue(TEXT("A two-sided ground-and-ceiling slab fits a floor from either face"),
-		WEMStructures::FitsFace(*FloorSlab, 2, 1, 16, 16, bTurned) && WEMStructures::FitsFace(*FloorSlab, 2, -1, 16, 16, bTurned));
-	TestFalse(TEXT("A two-sided slab of ground alone fits no floor, since it would be a ceiling too"), WEMStructures::FitsFace(*GroundSlab, 2, 1, 16, 16, bTurned));
-	TestTrue(TEXT("A two-sided wall slab fits a wall"), WEMStructures::FitsFace(*WallSlab, 1, -1, 16, 16, bTurned));
-	TestFalse(TEXT("But no floor"), WEMStructures::FitsFace(*WallSlab, 2, 1, 16, 16, bTurned));
+		WEMStructures::FitsFace(*FloorSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned) && WEMStructures::FitsFace(*FloorSlab, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("A two-sided slab of ground alone fits no floor, since it would be a ceiling too"), WEMStructures::FitsFace(*GroundSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestTrue(TEXT("A two-sided wall slab fits a wall"), WEMStructures::FitsFace(*WallSlab, 1, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("But no floor"), WEMStructures::FitsFace(*WallSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureFitRelativeTest, "WEM.Structures.Roles.Fit", StructureTransformTestsPrivate::TestFlags)
+
+bool FStructureFitRelativeTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureTransformTestsPrivate;
+
+	bool bTurned = false;
+
+	// The types follow the segment's own Up, not the world's.
+	TestEqual(TEXT("Upside down, a floor's underside is its ground"), WEMStructures::GetFaceType(2, -1, EGridFace::NegZ), EStructureType::Ground);
+	TestEqual(TEXT("And its top its ceiling"), WEMStructures::GetFaceType(2, 1, EGridFace::NegZ), EStructureType::Ceiling);
+	TestEqual(TEXT("A segment lying flat with Up along X is a wall"), WEMStructures::GetFaceType(2, 1, EGridFace::PosX), EStructureType::Wall);
+	TestEqual(TEXT("One standing up facing X with Up along X is a floor"), WEMStructures::GetFaceType(0, 1, EGridFace::PosX), EStructureType::Ground);
+	TestEqual(TEXT("Whose other face is its ceiling"), WEMStructures::GetFaceType(0, -1, EGridFace::PosX), EStructureType::Ceiling);
+	TestTrue(TEXT("IsWall agrees"), WEMStructures::IsWall(2, EGridFace::PosX) && !WEMStructures::IsWall(0, EGridFace::NegX));
+
+	// Shape: a wall's structure stands with its length along the wall's Up, wherever that is.
+	TestTrue(TEXT("An upright 8 x 16 fits a 16 x 8 wall whose Up is its first axis, turned"),
+		WEMStructures::FitsShape(8, 16, false, 0, EGridFace::PosY, 16, 8, bTurned) && bTurned);
+	TestFalse(TEXT("But not an 8 x 16 one, which lies across that Up"), WEMStructures::FitsShape(8, 16, false, 0, EGridFace::PosY, 8, 16, bTurned));
+	TestTrue(TEXT("Unless it may lie sideways"), WEMStructures::FitsShape(8, 16, true, 0, EGridFace::PosY, 8, 16, bTurned) && !bTurned);
+	TestTrue(TEXT("Upside down, an upright 8 x 16 still fits an 8 x 16 wall as it is"),
+		WEMStructures::FitsShape(8, 16, false, 1, EGridFace::NegZ, 8, 16, bTurned) && !bTurned);
+	TestTrue(TEXT("A wall lying flat in the world with Up along X takes an upright 8 x 16 turned"),
+		WEMStructures::FitsShape(8, 16, false, 2, EGridFace::PosX, 16, 8, bTurned) && bTurned);
+	TestTrue(TEXT("A floor standing up in the world turns freely"), WEMStructures::FitsShape(8, 16, false, 0, EGridFace::NegX, 16, 8, bTurned) && bTurned);
+
+	// One-sided ground goes on the Ground face, whichever way that looks.
+	UPlatformStructureData* GroundOnly = MakeStructure(16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* WallSlab = MakeStructure(16, 16, EStructureType::Wall, true);
+
+	TestTrue(TEXT("Ground fits the underside of an upside-down floor"), WEMStructures::FitsFace(*GroundOnly, 2, -1, EGridFace::NegZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not its top"), WEMStructures::FitsFace(*GroundOnly, 2, 1, EGridFace::NegZ, 16, 16, bTurned));
+	TestTrue(TEXT("Ground fits a world wall that is a floor in its own frame"), WEMStructures::FitsFace(*GroundOnly, 1, 1, EGridFace::PosY, 16, 16, bTurned));
+	TestTrue(TEXT("A wall slab fits a world floor that is a wall in its own frame"), WEMStructures::FitsFace(*WallSlab, 2, 1, EGridFace::NegY, 16, 16, bTurned));
+	TestFalse(TEXT("But not a world wall that is a floor"), WEMStructures::FitsFace(*WallSlab, 0, 1, EGridFace::PosX, 16, 16, bTurned));
 
 	return true;
 }

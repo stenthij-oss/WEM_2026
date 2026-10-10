@@ -85,12 +85,12 @@ namespace StructureFillTestsPrivate
 		const int32 NormalAxis = static_cast<int32>(Platform.Normal);
 		bool bTurned = false;
 
-		if (!WEMStructures::FitsFace(*Positive, NormalAxis, 1, SpanFirst, SpanSecond, bTurned))
+		if (!WEMStructures::FitsFace(*Positive, NormalAxis, 1, Platform.Up, SpanFirst, SpanSecond, bTurned))
 		{
 			return FString::Printf(TEXT("%s does not fit the positive face"), *Positive->GetName());
 		}
 
-		if (!WEMStructures::FitsFace(*Negative, NormalAxis, -1, SpanFirst, SpanSecond, bTurned))
+		if (!WEMStructures::FitsFace(*Negative, NormalAxis, -1, Platform.Up, SpanFirst, SpanSecond, bTurned))
 		{
 			return FString::Printf(TEXT("%s does not fit the negative face"), *Negative->GetName());
 		}

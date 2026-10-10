@@ -120,6 +120,38 @@ struct FRoomManagerTestAccess
 		return Manager.FenceQueue.Num();
 	}
 
+	/** The Up a placement would take if it were drawn now. Draws from the role stream, as a beat would. */
+	static EGridFace ChooseUp(ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.ChooseUp(Platform);
+	}
+
+	/** Fills a platform as a beat would, from the structure stream. False when nothing fits. */
+	static bool DrawFill(ARoomManager& Manager, FGridPlatform& Platform)
+	{
+		return Manager.DrawFill(Platform, /*bLoadBearingOnly=*/false);
+	}
+
+	/** The axis a fence panel's run goes along. */
+	static int32 GetRunAxis(const ARoomManager& Manager, const FGridPlatform& Panel)
+	{
+		return Manager.GetRunAxis(Panel);
+	}
+
+	/** Where a run could carry on from one end of a panel - straight on, and round each corner. */
+	static void GatherFenceContinuations(const ARoomManager& Manager, const FGridPlatform& Panel, const int32 Side, FGridPlatform& OutStraight, TArray<FGridPlatform>& OutTurns)
+	{
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		Manager.GatherFenceContinuations(ARoomManager::FFenceEnd{ Panel, Side }, OutStraight, Turns);
+		OutTurns = Turns;
+	}
+
+	/** Whether a platform stands on something, as a fence beat asks it. */
+	static bool StandsOnSomething(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.StandsOnSomething(Platform);
+	}
+
 	/** A face's streak in a category, or zero when its structure does not carry it. */
 	static int32 GetStreak(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign, const UStructureCategory* Category)
 	{

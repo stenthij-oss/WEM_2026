@@ -27,14 +27,19 @@ FVector WEMStructures::GetMeshAxisForBlenderAxis(const int32 BlenderAxis)
 	return MeshAxesForBlenderAxes[FMath::Clamp(BlenderAxis, 0, 2)];
 }
 
-EStructureType WEMStructures::GetFaceType(const int32 NormalAxis, const int32 FaceSign)
+bool WEMStructures::IsWall(const int32 NormalAxis, const EGridFace Up)
 {
-	if (NormalAxis != 2)
+	return FaceAxis(Up) != NormalAxis;
+}
+
+EStructureType WEMStructures::GetFaceType(const int32 NormalAxis, const int32 FaceSign, const EGridFace Up)
+{
+	if (IsWall(NormalAxis, Up))
 	{
 		return EStructureType::Wall;
 	}
 
-	return FaceSign > 0 ? EStructureType::Ground : EStructureType::Ceiling;
+	return FaceSign == WEMGrid::FaceSign(Up) ? EStructureType::Ground : EStructureType::Ceiling;
 }
 
 bool WEMStructures::FitsShape(
@@ -42,23 +47,43 @@ bool WEMStructures::FitsShape(
 	const int32 Length,
 	const bool bMayLieSideways,
 	const int32 NormalAxis,
+	const EGridFace Up,
 	const int32 SpanFirst,
 	const int32 SpanSecond,
 	bool& bOutTurned)
 {
 	bOutTurned = false;
 
-	// As authored first, so a square structure on a square opening is never turned for nothing.
-	if (Width == SpanFirst && Length == SpanSecond)
+	const bool bFitsAsAuthored = Width == SpanFirst && Length == SpanSecond;
+	const bool bFitsTurned = Width == SpanSecond && Length == SpanFirst;
+
+	// A floor or ceiling has no up across it, so a structure lies across it either way - as authored
+	// first, so a square structure on a square opening is never turned for nothing.
+	if (!IsWall(NormalAxis, Up))
 	{
+		bOutTurned = !bFitsAsAuthored && bFitsTurned;
+		return bFitsAsAuthored || bFitsTurned;
+	}
+
+	// A wall does. Its structure stands with its length along Up, which is the way round that leaves
+	// its length on whichever in-plane axis Up lies along - and only one made to lie on its side may lie
+	// the other way: a facade turned over is no longer a facade.
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	const bool bUprightTurned = FaceAxis(Up) == U;
+	const bool bFitsUpright = bUprightTurned ? bFitsTurned : bFitsAsAuthored;
+	const bool bFitsLying = bUprightTurned ? bFitsAsAuthored : bFitsTurned;
+
+	if (bFitsUpright)
+	{
+		bOutTurned = bUprightTurned;
 		return true;
 	}
 
-	// A floor or ceiling has no up, so a structure lies across it either way. A wall does, and only a
-	// structure made to lie on its side may: a facade turned over is no longer a facade.
-	if (Width == SpanSecond && Length == SpanFirst && (NormalAxis == 2 || bMayLieSideways))
+	if (bFitsLying && bMayLieSideways)
 	{
-		bOutTurned = true;
+		bOutTurned = !bUprightTurned;
 		return true;
 	}
 
@@ -69,24 +94,25 @@ bool WEMStructures::FitsFace(
 	const UPlatformStructureData& Structure,
 	const int32 NormalAxis,
 	const int32 FaceSign,
+	const EGridFace Up,
 	const int32 SpanFirst,
 	const int32 SpanSecond,
 	bool& bOutTurned)
 {
 	bOutTurned = false;
 
-	if (!Structure.HasType(GetFaceType(NormalAxis, FaceSign)))
+	if (!Structure.HasType(GetFaceType(NormalAxis, FaceSign, Up)))
 	{
 		return false;
 	}
 
 	// A two-sided structure is both faces at once, so it has to be allowed on the other one as well.
-	if (Structure.bTwoSided && !Structure.HasType(GetFaceType(NormalAxis, -FaceSign)))
+	if (Structure.bTwoSided && !Structure.HasType(GetFaceType(NormalAxis, -FaceSign, Up)))
 	{
 		return false;
 	}
 
-	return FitsShape(Structure.Width, Structure.Length, Structure.bMayLieSideways, NormalAxis, SpanFirst, SpanSecond, bOutTurned);
+	return FitsShape(Structure.Width, Structure.Length, Structure.bMayLieSideways, NormalAxis, Up, SpanFirst, SpanSecond, bOutTurned);
 }
 
 namespace
@@ -138,6 +164,7 @@ FTransform WEMStructures::MakeStructureTransform(
 	const FVector& MinCorner,
 	const double CellSize,
 	const int32 NormalAxis,
+	const EGridFace Up,
 	const int32 SpanFirst,
 	const int32 SpanSecond,
 	const int32 FaceSign,
@@ -147,11 +174,15 @@ FTransform WEMStructures::MakeStructureTransform(
 	int32 U, V;
 	GetInPlaneAxes(NormalAxis, U, V);
 
-	// Where Blender's three axes go in the world. Z looks out of the face. Y runs along the second
-	// axis - up a wall, along the length across a floor - unless the structure is turned, when its
-	// length runs along the first: the level axis of a wall it lies on its side across.
+	// Where Blender's three axes go in the world. Z looks out of the face. Y runs along the axis the
+	// structure's length does - the second unless it is turned, when it is the first. Standing on a
+	// wall that is the wall's Up, and Y points the way Up does, so a wall upside down in the world
+	// carries its structures upside down too; anywhere else it points along the axis.
+	const int32 TopAxis = bTurned ? U : V;
+	const int32 TopSign = IsWall(NormalAxis, Up) && FaceAxis(Up) == TopAxis ? WEMGrid::FaceSign(Up) : 1;
+
 	const FVector Out(AxisStep(NormalAxis, FaceSign > 0 ? 1 : -1));
-	const FVector Top(AxisStep(bTurned ? U : V));
+	const FVector Top(AxisStep(TopAxis, TopSign));
 
 	// X completes the frame so that the mesh's own frame is turned and never mirrored. The importer's
 	// frame is itself a mirror of Blender's, so Blender's X lands on whichever side keeps the whole a

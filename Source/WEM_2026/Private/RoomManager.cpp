@@ -974,6 +974,82 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 	return bFlush && bFoldsLegally && bTouchesStructure;
 }
 
+void ARoomManager::GatherTouchingPlatforms(const FGridPlatform& Platform, TArray<int32, TInlineAllocator<8>>& OutTouching) const
+{
+	OutTouching.Reset();
+
+	int32 SpanU, SpanV;
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+
+	// Only its rim can be shared, and only where some platform already runs around the same edge.
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (!bRim || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		{
+			return;
+		}
+
+		FModuleFace Faces[4];
+		GetEdgeFaces(Edge, Module, Faces);
+
+		for (const FModuleFace& Face : Faces)
+		{
+			if (const int32* Owner = ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal)))
+			{
+				OutTouching.AddUnique(*Owner);
+			}
+		}
+	});
+
+	// In index order, so a draw among them depends only on which platforms stand.
+	OutTouching.Sort();
+}
+
+EGridFace ARoomManager::ChooseUp(const FGridPlatform& Platform)
+{
+	TArray<int32, TInlineAllocator<8>> Touching;
+	GatherTouchingPlatforms(Platform, Touching);
+
+	int32 SpanU, SpanV;
+	if (Touching.IsEmpty() || !GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return EGridFace::PosZ;
+	}
+
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+	auto CanFill = [&](const EGridFace Up)
+	{
+		return HasCompleteFill(NormalAxis, Up, SpanU, SpanV, /*bLoadBearingOnly=*/false);
+	};
+
+	// It grows off one of the platforms it touches, and takes that one's Up.
+	const int32 Parent = Touching[Touching.Num() > 1 ? RoleStream.RandRange(0, Touching.Num() - 1) : 0];
+	const EGridFace Up = BuiltPlatforms[Parent].Up;
+
+	if (CanFill(Up))
+	{
+		return Up;
+	}
+
+	// A way up the structures cannot fill is no use. Another platform it touches may offer one they can,
+	// and the world's always can: the placement was only drawn because it can be filled that way.
+	for (const int32 Other : Touching)
+	{
+		if (CanFill(BuiltPlatforms[Other].Up))
+		{
+			return BuiltPlatforms[Other].Up;
+		}
+	}
+
+	return EGridFace::PosZ;
+}
+
 void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandidates) const
 {
 	OutCandidates.Reset();
@@ -1009,7 +1085,7 @@ void ARoomManager::GatherFirstPlatformCandidates(TArray<FGridPlatform>& OutCandi
 
 		// It holds up whatever grows off it, so it is laid only a way round that load-bearing
 		// structures can fill.
-		if (!HasCompleteFill(AxisIndex(EGridAxis::Z), SpanX * Module, SpanY * Module, /*bLoadBearingOnly=*/true))
+		if (!HasCompleteFill(AxisIndex(EGridAxis::Z), EGridFace::PosZ, SpanX * Module, SpanY * Module, /*bLoadBearingOnly=*/true))
 		{
 			continue;
 		}
@@ -1255,6 +1331,9 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 				}
 			}
 		}
+
+		// Which way up it is follows from what it grows off, and decides what can fill it.
+		Platform.Up = ChooseUp(Platform);
 	}
 
 	// A platform landing where a fence run waits to carry on, laid as the run is, carries it on.
@@ -1309,10 +1388,11 @@ int32 ARoomManager::GetRunAxis(const FGridPlatform& Panel) const
 	int32 U, V;
 	GetInPlaneAxes(NormalAxis, U, V);
 
-	// Up a wall the run keeps to the ground, whichever way the fence is laid.
-	if (Panel.GetKind() == EPlatformKind::SurfaceVertical)
+	// On a wall the run keeps across its Up - along the ground, in the wall's own frame - whichever way
+	// the fence is laid.
+	if (Panel.IsWall())
 	{
-		return U;
+		return FaceAxis(Panel.Up) == V ? U : V;
 	}
 
 	// Across a floor it goes the way the fence's width does: along the first axis as authored, the
@@ -1323,7 +1403,7 @@ int32 ARoomManager::GetRunAxis(const FGridPlatform& Panel) const
 	bool bTurned = false;
 	if (const UPlatformStructureData* Fence = Panel.PositiveStructure)
 	{
-		WEMStructures::FitsShape(Fence->Width, Fence->Length, Fence->bMayLieSideways, NormalAxis, SpanU, SpanV, bTurned);
+		WEMStructures::FitsShape(Fence->Width, Fence->Length, Fence->bMayLieSideways, NormalAxis, Panel.Up, SpanU, SpanV, bTurned);
 	}
 
 	return bTurned ? V : U;
@@ -1335,7 +1415,8 @@ bool ARoomManager::IsRunContinuation(const FGridPlatform& Panel, const FGridPlat
 		|| Panel.PositiveStructure != Previous.PositiveStructure
 		|| Panel.Tile != Previous.Tile
 		|| Panel.bTurned != Previous.bTurned
-		|| Panel.Normal != Previous.Normal)
+		|| Panel.Normal != Previous.Normal
+		|| Panel.Up != Previous.Up)
 	{
 		return false;
 	}
@@ -1380,23 +1461,52 @@ void ARoomManager::GatherFenceContinuations(
 
 	OutTurns.Reset();
 
-	if (Panel.GetKind() != EPlatformKind::SurfaceVertical)
+	if (!Panel.IsWall())
 	{
 		return;
 	}
 
 	// Round the corner: a wall facing along the run, standing in the plane of the beam at this end and
-	// reaching away from this wall's plane, either way. Its first axis is this wall's normal, so laid
-	// from the same tile the same way round it has the same shape, and the fence fills it as it fills
-	// this one.
+	// reaching away from this wall's plane, either way, as far as this one runs. It keeps this wall's Up
+	// and is as tall along it, so the fence fills it as it fills this one. It is laid from the same tile,
+	// the same way round where that gives it that shape - as it always does for a wall standing up in
+	// the world - or else turned, where the tile may be. A tile that can be neither has no corner to turn.
+	const int32 UpAxis = FaceAxis(Panel.Up);
+	const int32 UpSpan = UpAxis == U ? SpanU : SpanV;
+
+	int32 TurnU, TurnV;
+	GetInPlaneAxes(RunAxis, TurnU, TurnV);
+
+	const int32 TurnSpanU = TurnU == UpAxis ? UpSpan : RunSpan;
+	const int32 TurnSpanV = TurnU == UpAxis ? RunSpan : UpSpan;
+
+	const UPlatformTileData* Tile = Panel.Tile;
+	bool bTurnTurned = Panel.bTurned;
+
+	auto GivesShape = [Tile, TurnSpanU, TurnSpanV](const bool bTurned)
+	{
+		return (bTurned ? Tile->Length : Tile->Width) == TurnSpanU && (bTurned ? Tile->Width : Tile->Length) == TurnSpanV;
+	};
+
+	if (!GivesShape(bTurnTurned))
+	{
+		bTurnTurned = !bTurnTurned;
+
+		if (!Tile->bCanTurn || !GivesShape(bTurnTurned))
+		{
+			return;
+		}
+	}
+
 	const int32 EndCoordinate = Panel.MinNode[RunAxis] + (End.Side > 0 ? RunSpan : 0);
 
 	for (const int32 Away : { 1, -1 })
 	{
 		FGridPlatform& Turn = OutTurns.Add_GetRef(Panel);
 		Turn.Normal = static_cast<EGridAxis>(RunAxis);
+		Turn.bTurned = bTurnTurned;
 		Turn.MinNode[RunAxis] = EndCoordinate;
-		Turn.MinNode[NormalAxis] = Away > 0 ? Panel.MinNode[NormalAxis] : Panel.MinNode[NormalAxis] - SpanU;
+		Turn.MinNode[NormalAxis] = Away > 0 ? Panel.MinNode[NormalAxis] : Panel.MinNode[NormalAxis] - RunSpan;
 	}
 }
 
@@ -1436,7 +1546,7 @@ int32 ARoomManager::GetJoinedSide(const FFenceEnd& End, const FGridPlatform& Con
 
 bool ARoomManager::StandsOnSomething(const FGridPlatform& Platform) const
 {
-	if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal)
+	if (!Platform.IsWall())
 	{
 		return true;
 	}
@@ -1445,23 +1555,27 @@ bool ARoomManager::StandsOnSomething(const FGridPlatform& Platform) const
 	GetPlatformSpans(Platform, SpanU, SpanV);
 	GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
 
-	// Up a wall the second axis is up, so its rim along the first runs along its bottom and its top.
-	bool bBottomUsed = true;
-	bool bTopUsed = true;
+	// Its foot and its top are the rim running across its Up, at either end of it. Which is which does
+	// not matter, since hanging counts.
+	const int32 UpAxis = FaceAxis(Platform.Up);
+	const int32 AcrossAxis = UpAxis == U ? V : U;
+
+	bool bMinEndUsed = true;
+	bool bMaxEndUsed = true;
 
 	ForEachModuleEdge(Platform, SpanU, SpanV, GetModule(), [&](const FLatticeEdge& Edge, const bool bRim)
 	{
-		if (!bRim || Edge.Axis != U)
+		if (!bRim || Edge.Axis != AcrossAxis)
 		{
 			return;
 		}
 
 		const bool bUsed = ModuleEdgeUses.Contains(MakeEdgeKey(Edge));
-		bool& bSideUsed = Edge.Node[V] == Platform.MinNode[V] ? bBottomUsed : bTopUsed;
-		bSideUsed = bSideUsed && bUsed;
+		bool& bEndUsed = Edge.Node[UpAxis] == Platform.MinNode[UpAxis] ? bMinEndUsed : bMaxEndUsed;
+		bEndUsed = bEndUsed && bUsed;
 	});
 
-	return bBottomUsed || bTopUsed;
+	return bMinEndUsed || bMaxEndUsed;
 }
 
 void ARoomManager::QueueFenceEnds(const FGridPlatform& Panel, const int32 JoinedSide)
@@ -1575,7 +1689,7 @@ bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoine
 	{
 		const FFenceEnd& End = FenceQueue[Index];
 
-		if (End.Panel.Tile != Platform.Tile || End.Panel.bTurned != Platform.bTurned || !UsableStructures.Contains(End.Panel.PositiveStructure))
+		if (End.Panel.Tile != Platform.Tile || !UsableStructures.Contains(End.Panel.PositiveStructure))
 		{
 			continue;
 		}
@@ -1586,7 +1700,7 @@ bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoine
 
 		auto IsSpot = [&Platform](const FGridPlatform& Spot)
 		{
-			return Spot.MinNode == Platform.MinNode && Spot.Normal == Platform.Normal;
+			return Spot.MinNode == Platform.MinNode && Spot.Normal == Platform.Normal && Spot.bTurned == Platform.bTurned;
 		};
 
 		const FGridPlatform* Spot = IsSpot(Straight) ? &Straight : Turns.FindByPredicate(IsSpot);
@@ -1597,6 +1711,7 @@ bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoine
 			continue;
 		}
 
+		Platform.Up = Spot->Up;
 		Platform.PositiveStructure = Spot->PositiveStructure;
 		Platform.NegativeStructure = Spot->NegativeStructure;
 		OutJoinedSide = GetJoinedSide(End, *Spot);
@@ -1649,6 +1764,7 @@ void ARoomManager::ResetPlacementStream()
 	// The fills are drawn from the same seed but a stream apart, so a seed lays the same platforms
 	// whatever the structures draw in between.
 	StructureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Structures"))))));
+	RoleStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Roles"))))));
 }
 
 void ARoomManager::AdvancePlacement()
@@ -1902,8 +2018,9 @@ void ARoomManager::ResolveUsableTiles()
 		}
 	}
 
-	// Which ways round each tile can be filled, per kind. Every wall's first axis is level and its
-	// second up, whichever way it faces, so a wall facing X answers for both.
+	// Which ways round each tile can be filled, per kind, the way up the world is - the Up a placement
+	// can always fall back on (see ChooseUp). Every wall's first axis is level and its second up,
+	// whichever way it faces, so a wall facing X answers for both.
 	FillableWays.Reset();
 
 	for (const UPlatformTileData* Tile : UsableTiles)
@@ -1919,7 +2036,7 @@ void ARoomManager::ResolveUsableTiles()
 				const int32 SpanFirst = bTurned ? Tile->Length : Tile->Width;
 				const int32 SpanSecond = bTurned ? Tile->Width : Tile->Length;
 
-				if (HasCompleteFill(NormalAxis, SpanFirst, SpanSecond, /*bLoadBearingOnly=*/false))
+				if (HasCompleteFill(NormalAxis, EGridFace::PosZ, SpanFirst, SpanSecond, /*bLoadBearingOnly=*/false))
 				{
 					Ways |= bTurned ? TurnedWay : AsLaidWay;
 				}
@@ -1951,8 +2068,8 @@ void ARoomManager::ResolveUsableTiles()
 		Problems.Add(FString::Printf(TEXT("FirstTile '%s' is kept to vertical, but the first platform is always laid horizontal, so nothing grows"),
 			*FirstTile->GetName()));
 	}
-	else if (!HasCompleteFill(AxisIndex(EGridAxis::Z), FirstTile->Width, FirstTile->Length, /*bLoadBearingOnly=*/true)
-		&& !(FirstTile->bCanTurn && HasCompleteFill(AxisIndex(EGridAxis::Z), FirstTile->Length, FirstTile->Width, /*bLoadBearingOnly=*/true)))
+	else if (!HasCompleteFill(AxisIndex(EGridAxis::Z), EGridFace::PosZ, FirstTile->Width, FirstTile->Length, /*bLoadBearingOnly=*/true)
+		&& !(FirstTile->bCanTurn && HasCompleteFill(AxisIndex(EGridAxis::Z), EGridFace::PosZ, FirstTile->Length, FirstTile->Width, /*bLoadBearingOnly=*/true)))
 	{
 		Problems.Add(FString::Printf(TEXT("no load-bearing structures can fill FirstTile '%s' (%d x %d) laid flat, and the first platform holds up all the rest, so nothing grows"),
 			*FirstTile->GetName(), FirstTile->Width, FirstTile->Length));
@@ -2227,7 +2344,7 @@ TArray<int32> ARoomManager::GetPatchLabels()
 	return Labels;
 }
 
-bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const int32 SpanFirst, const int32 SpanSecond, const bool bLoadBearingOnly) const
+bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const EGridFace Up, const int32 SpanFirst, const int32 SpanSecond, const bool bLoadBearingOnly) const
 {
 	bool bFrontFits = false;
 	bool bBackFits = false;
@@ -2244,7 +2361,7 @@ bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const int32 SpanFirst
 		// A two-sided structure fits only where it fits both faces, so one is enough.
 		if (Structure->bTwoSided)
 		{
-			if (WEMStructures::FitsFace(*Structure, NormalAxis, 1, SpanFirst, SpanSecond, bTurned))
+			if (WEMStructures::FitsFace(*Structure, NormalAxis, 1, Up, SpanFirst, SpanSecond, bTurned))
 			{
 				return true;
 			}
@@ -2252,8 +2369,8 @@ bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const int32 SpanFirst
 			continue;
 		}
 
-		bFrontFits = bFrontFits || WEMStructures::FitsFace(*Structure, NormalAxis, 1, SpanFirst, SpanSecond, bTurned);
-		bBackFits = bBackFits || WEMStructures::FitsFace(*Structure, NormalAxis, -1, SpanFirst, SpanSecond, bTurned);
+		bFrontFits = bFrontFits || WEMStructures::FitsFace(*Structure, NormalAxis, 1, Up, SpanFirst, SpanSecond, bTurned);
+		bBackFits = bBackFits || WEMStructures::FitsFace(*Structure, NormalAxis, -1, Up, SpanFirst, SpanSecond, bTurned);
 	}
 
 	return bFrontFits && bBackFits;
@@ -2287,7 +2404,7 @@ void ARoomManager::GatherFillOptions(
 	{
 		bool bTurned = false;
 		return (!bLoadBearingOnly || Structure->bLoadBearing)
-			&& WEMStructures::FitsFace(*Structure, NormalAxis, Sign, SpanU, SpanV, bTurned);
+			&& WEMStructures::FitsFace(*Structure, NormalAxis, Sign, Platform.Up, SpanU, SpanV, bTurned);
 	};
 
 	// A one-sided structure leaves the face behind it to another, so it is only offered when there
@@ -2315,10 +2432,9 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
 
-	// A floor or ceiling is filled from its top, the face it is walked on. A wall has no such side, so
-	// either face goes first, evenly.
-	const bool bHorizontal = Platform.GetKind() == EPlatformKind::SurfaceHorizontal;
-	const int32 FirstSign = (bHorizontal || StructureStream.FRand() < 0.5f) ? 1 : -1;
+	// A floor or ceiling is filled from its Ground face, the one it is walked on. A wall has no such
+	// side, so either face goes first, evenly.
+	const int32 FirstSign = !Platform.IsWall() ? FaceSign(Platform.Up) : (StructureStream.FRand() < 0.5f ? 1 : -1);
 
 	TArray<UPlatformStructureData*> Options;
 	GatherFillOptions(Platform, FirstSign, /*bSecondFace=*/false, bLoadBearingOnly, Options);
@@ -2751,13 +2867,16 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 	});
 
 	// A platform that is not load-bearing blocks beams of its rim as it is taken in: a wall the ones
-	// along its top, the far side of its second axis, which is up; a floor or ceiling every one no
+	// along its top, running across its Up at the end Up points to; a floor or ceiling every one no
 	// platform used before it, which leaves the ones it grew from open.
 	const bool bBlocks = !IsLoadBearing(Platform);
-	const bool bVertical = Platform.GetKind() == EPlatformKind::SurfaceVertical;
+	const bool bWall = Platform.IsWall();
 
 	int32 U, V;
 	GetInPlaneAxes(NormalAxis, U, V);
+
+	const int32 UpAxis = FaceAxis(Platform.Up);
+	const int32 TopCoordinate = Platform.MinNode[UpAxis] + (FaceSign(Platform.Up) > 0 ? (UpAxis == U ? SpanU : SpanV) : 0);
 
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
@@ -2765,10 +2884,10 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 
 		if (bRim && bBlocks)
 		{
-			const bool bTop = Edge.Axis == U && Edge.Node[V] == Platform.MinNode[V] + SpanV;
+			const bool bTop = Edge.Axis != UpAxis && Edge.Node[UpAxis] == TopCoordinate;
 			const bool bFree = !ModuleEdgeUses.Contains(EdgeKey);
 
-			if (bVertical ? bTop : bFree)
+			if (bWall ? bTop : bFree)
 			{
 				BlockedEdges.FindOrAdd(EdgeKey, PlatformIndex);
 			}
@@ -3450,6 +3569,7 @@ void ARoomManager::UpdateDebugReadouts()
 	DebugProbeStructure = nullptr;
 	DebugProbeCategories.Reset();
 	bDebugProbeInFenceRun = false;
+	DebugProbeRole.Reset();
 
 	if (CellSize <= 0.0f)
 	{
@@ -3543,6 +3663,11 @@ void ARoomManager::UpdateDebugReadouts()
 	const FGridPlatform& OwnerPlatform = BuiltPlatforms[InteriorOwner];
 	DebugProbeStructure = FaceSign(DebugProbeSurface.Face) > 0 ? OwnerPlatform.PositiveStructure : OwnerPlatform.NegativeStructure;
 	bDebugProbeInFenceRun = IsFencePanel(OwnerPlatform);
+
+	// As the structure types name the face: a floor's Ground face looks along its Up.
+	const TCHAR* RoleName = OwnerPlatform.IsWall() ? TEXT("wall")
+		: (FaceSign(DebugProbeSurface.Face) == FaceSign(OwnerPlatform.Up) ? TEXT("ground") : TEXT("ceiling"));
+	DebugProbeRole = FString::Printf(TEXT("%s, up %s"), RoleName, *StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString());
 
 	TArray<FString> Streaks;
 	for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)
@@ -3779,23 +3904,27 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 	const uint64 PlatformKey = MakePlatformKey(Platform);
 	const FVector MinCorner = GetCellMinCorner(Platform.MinNode);
 
-	auto AddStructure = [&](UPlatformStructureData* Structure, const int32 FaceSign, const uint64 Key)
+	// A two-sided one was modelled lying on the ground, so on a floor it faces the Ground face; on a
+	// wall, which has no such side, the positive one.
+	const int32 TwoSidedSign = Platform.IsWall() ? 1 : FaceSign(Platform.Up);
+
+	auto AddStructure = [&](UPlatformStructureData* Structure, const int32 Sign, const uint64 Key)
 	{
 		bool bTurned = false;
 
 		if (!Structure || !Structure->Mesh
-			|| !WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, SpanU, SpanV, bTurned))
+			|| !WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned))
 		{
 			return;
 		}
 
 		OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{
-			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, SpanU, SpanV, FaceSign, bTurned, Structure->bTwoSided) });
+			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, Platform.Up, SpanU, SpanV, Sign, bTurned, Structure->bTwoSided) });
 	};
 
 	if (Platform.PositiveStructure && Platform.PositiveStructure->bTwoSided)
 	{
-		AddStructure(Platform.PositiveStructure, 1, PlatformKey);
+		AddStructure(Platform.PositiveStructure, TwoSidedSign, PlatformKey);
 	}
 	else
 	{
