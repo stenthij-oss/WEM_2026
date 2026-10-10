@@ -17,9 +17,9 @@ namespace StructureBenchmarkTestsPrivate
 	/**
 	 * Grows a room manager set up as NewMap's - a 509-cell cube, 16 x 16 tiles first, 8 x 8 laid flat
 	 * only, 8 x 16 that does not turn, pieces built, the overlay off - to Target platforms, and returns
-	 * the mean time of the last Measured beats in milliseconds.
+	 * the mean time of the last Measured beats in milliseconds. With bTurns, every turn of Up is on.
 	 */
-	double MeasureBeats(UWorld* World, TArray<UObject*>& Rooted, const TOptional<TArray<TObjectPtr<UPlatformStructureData>>>& Structures, const int32 Target, const int32 Measured, int32& OutPlatforms)
+	double MeasureBeats(UWorld* World, TArray<UObject*>& Rooted, const TOptional<TArray<TObjectPtr<UPlatformStructureData>>>& Structures, const int32 Target, const int32 Measured, int32& OutPlatforms, const bool bTurns = false)
 	{
 		ARoomManager* Manager = SpawnRoomManager(World, Rooted, Structures);
 		Manager->Tiles[1]->Orientation = ETileOrientation::HorizontalOnly;
@@ -27,6 +27,9 @@ namespace StructureBenchmarkTestsPrivate
 		Manager->GridSize = 509;
 		Manager->PlatformRandomSeed = 4242;
 		Manager->bShowPieces = true;
+		Manager->bFlipOnFold = bTurns;
+		Manager->bHangFromCeilings = bTurns;
+		Manager->bQuarterTurn = bTurns;
 		Manager->ClearPlatforms();
 
 		double MeasuredSeconds = 0.0;
@@ -88,33 +91,40 @@ bool FStructureBenchmarkBeatTest::RunTest(const FString& Parameters)
 {
 	using namespace StructureBenchmarkTestsPrivate;
 
-	// The time a beat takes once about 3000 platforms stand, filled from a plain slab per size, and
-	// from the whole test kit - categories, one-sided pairs, fences and structures that are not
-	// load-bearing among them. Each the best of three runs.
+	// The time a beat takes once about 3000 platforms stand, filled from a plain slab per size, from
+	// the whole test kit - categories, one-sided pairs, fences and structures that are not load-bearing
+	// among them - and from the test kit with every turn of Up on. Each the best of three runs.
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
 
 	const TArray<TObjectPtr<UPlatformStructureData>> TestKit = LoadTestKit();
 	TestTrue(TEXT("The test kit is there"), TestKit.Num() > 60);
 
-	for (const bool bTestKit : { false, true })
+	struct FSetup
+	{
+		const TCHAR* Name;
+		bool bTestKit;
+		bool bTurns;
+	};
+
+	for (const FSetup& Setup : { FSetup{ TEXT("Plain slabs"), false, false }, FSetup{ TEXT("Test kit"), true, false }, FSetup{ TEXT("Test kit, turned"), true, true } })
 	{
 		double Best = TNumericLimits<double>::Max();
 		int32 Platforms = 0;
 
 		// Unset, the room manager is given a plain slab for each of its own tiles.
 		TOptional<TArray<TObjectPtr<UPlatformStructureData>>> Fills;
-		if (bTestKit)
+		if (Setup.bTestKit)
 		{
 			Fills = TestKit;
 		}
 
 		for (int32 Run = 0; Run < 3; ++Run)
 		{
-			Best = FMath::Min(Best, MeasureBeats(TestWorld.World, Rooted, Fills, 3000, 1000, Platforms));
+			Best = FMath::Min(Best, MeasureBeats(TestWorld.World, Rooted, Fills, 3000, 1000, Platforms, Setup.bTurns));
 		}
 
-		AddInfo(FString::Printf(TEXT("%s: %.3f ms a beat over the last 1000 beats to %d platforms."), bTestKit ? TEXT("Test kit") : TEXT("Plain slabs"), Best, Platforms));
+		AddInfo(FString::Printf(TEXT("%s: %.3f ms a beat over the last 1000 beats to %d platforms."), Setup.Name, Best, Platforms));
 	}
 
 	ReleaseRooted(Rooted);

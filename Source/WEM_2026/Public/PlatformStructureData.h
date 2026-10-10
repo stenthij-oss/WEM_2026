@@ -10,21 +10,22 @@ class UStaticMesh;
 class UStructureCategory;
 
 /**
- * Which faces of a segment a structure may fill, by the way the face looks: up from a floor, down
- * from a ceiling, or out from either side of a wall. Any number may be set.
+ * Which faces of a segment a structure may fill, by what the face is in the segment's own frame (see
+ * FGridPlatform::Up), not by the way it looks in the world: the face a floor is walked on, the face
+ * under it, or either side of a wall. Any number may be set.
  */
 UENUM(BlueprintType, meta = (Bitflags, UseEnumValuesAsMaskValuesInEditor = "true"))
 enum class EStructureType : uint8
 {
 	None = 0 UMETA(Hidden),
 
-	/** The top of a horizontal segment. */
+	/** A floor's face looking along its Up: the one it is walked on, however it lies in the world. */
 	Ground = 1 << 0,
 
-	/** The underside of a horizontal segment. */
+	/** A floor's face looking against its Up. */
 	Ceiling = 1 << 1,
 
-	/** Either face of a vertical segment. */
+	/** Either face of a wall: a segment whose Up lies in its plane. */
 	Wall = 1 << 2
 };
 ENUM_CLASS_FLAGS(EStructureType);
@@ -38,7 +39,7 @@ ENUM_CLASS_FLAGS(EStructureType);
  *
  * Modelled in Blender at real size, lying on the ground face up, centred on the origin with its
  * transforms applied: its back on Z = 0, its width along X and its length along Y. On a wall X runs
- * along the ground and +Y points up. Width and length are counted beam to beam, like a tile's, so a
+ * across the wall's Up and +Y points along it. Width and length are counted beam to beam, like a tile's, so a
  * structure of 8 x 16 cells is 1.40 m by 3.00 m - the opening between the beams. Its edges are
  * closed, since they show wherever a beam is not built.
  */

@@ -9,6 +9,9 @@ structures is in `SourceArt/Structures/README.md`.
 
 ![Overview](Screenshots/overview.png)
 
+Since then, floor, wall and ceiling have become relative to each segment's own Up, with three turns
+and three growth rules on the room manager: see `RELATIVE_ROLES.md`.
+
 ## What was built
 
 | Phase | Commit | What |
@@ -110,7 +113,8 @@ All from one Simulate of NewMap with the test kit, seed 7, paused at 2982 platfo
 
 - **A two-sided fill faces the positive normal** (up on a floor, +X or +Y on a wall). The platform stores
   only the asset on each face, so the facing is not saved; the 50/50 first face on a wall only decides
-  which face's neighbours pull first.
+  which face's neighbours pull first. Since relative roles, on a floor it faces the Ground face, which is
+  up unless the floor is turned (`RELATIVE_ROLES.md`).
 - **A structure that fits as authored is not turned**: a square structure on a square opening keeps its
   orientation. "Turned" means the structure's length runs along the segment's first axis.
 - **An end that reaches a panel of its own fence is closed.** Following the brief's rules alone, a
