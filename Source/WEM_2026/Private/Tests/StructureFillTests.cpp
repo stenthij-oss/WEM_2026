@@ -20,7 +20,7 @@ namespace StructureFillTestsPrivate
 	/** The tile sizes SpawnRoomManager lays: 16 x 16, 8 x 8, and 8 x 16 that may turn. */
 	const FIntPoint TileSizes[] = { FIntPoint(16, 16), FIntPoint(8, 8), FIntPoint(8, 16) };
 
-	/** Per size: a one-sided ground, ceiling and wall structure, the wall free to lie sideways. */
+	/** Per size: a one-sided ground, roof, ceiling and wall structure, the wall free to lie sideways. */
 	TArray<TObjectPtr<UPlatformStructureData>> MakeOneSided(TArray<UObject*>& OutRooted, const bool bCeilingHoldsItems = true)
 	{
 		TArray<TObjectPtr<UPlatformStructureData>> Structures;
@@ -28,12 +28,13 @@ namespace StructureFillTestsPrivate
 		for (const FIntPoint& Size : TileSizes)
 		{
 			UPlatformStructureData* Ground = MakeStructure(TEXT("TestGround"), Size.X, Size.Y, EStructureType::Ground, false);
+			UPlatformStructureData* Roof = MakeStructure(TEXT("TestRoof"), Size.X, Size.Y, EStructureType::Roof, false);
 			UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestCeiling"), Size.X, Size.Y, EStructureType::Ceiling, false);
 			UPlatformStructureData* Wall = MakeStructure(TEXT("TestWall"), Size.X, Size.Y, EStructureType::Wall, false, /*bMayLieSideways=*/true);
 			Ceiling->bHoldsItems = bCeilingHoldsItems;
 
-			Structures.Append({ Ground, Ceiling, Wall });
-			OutRooted.Append({ Ground, Ceiling, Wall });
+			Structures.Append({ Ground, Roof, Ceiling, Wall });
+			OutRooted.Append({ Ground, Roof, Ceiling, Wall });
 		}
 
 		return Structures;
@@ -62,7 +63,8 @@ namespace StructureFillTestsPrivate
 
 	/**
 	 * Why a platform's fill is not a complete one that fits, or an empty string when it is: a structure
-	 * on each face that fits that face, the same one on both when it is two-sided.
+	 * on each face that fits that face, the two pairing back to back, the same one on both when it is
+	 * two-sided.
 	 */
 	FString CheckFill(const FGridPlatform& Platform)
 	{
@@ -93,6 +95,11 @@ namespace StructureFillTestsPrivate
 		if (!WEMStructures::FitsFace(*Negative, NormalAxis, -1, Platform.Up, SpanFirst, SpanSecond, bTurned))
 		{
 			return FString::Printf(TEXT("%s does not fit the negative face"), *Negative->GetName());
+		}
+
+		if (!WEMStructures::PairsBackToBack(*Positive, *Negative, NormalAxis, 1, Platform.Up))
+		{
+			return FString::Printf(TEXT("%s and %s do not pair back to back"), *Positive->GetName(), *Negative->GetName());
 		}
 
 		return FString();
@@ -221,7 +228,12 @@ bool FStructureFillOneSidedTest::RunTest(const FString& Parameters)
 
 	TestTrue(TEXT("Growth takes off on one-sided structures alone"), Grow(*Manager, 200) > 80);
 
-	// With nothing two-sided to draw, every platform takes a pair: ground over ceiling, or wall back to wall.
+	// With nothing two-sided to draw, every platform takes a pair: roof or ground over ceiling, ground
+	// over ground, or wall back to wall. Never a roof over a ground.
+	int32 RoofsOverCeilings = 0;
+	int32 GroundsOverCeilings = 0;
+	int32 GroundsOverGrounds = 0;
+
 	for (const FGridPlatform& Platform : Manager->Platforms)
 	{
 		const FString Problem = CheckFill(Platform);
@@ -234,13 +246,28 @@ bool FStructureFillOneSidedTest::RunTest(const FString& Parameters)
 			break;
 		}
 
-		if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal
-			&& (!Platform.PositiveStructure->HasType(EStructureType::Ground) || !Platform.NegativeStructure->HasType(EStructureType::Ceiling)))
+		if (Platform.GetKind() != EPlatformKind::SurfaceHorizontal)
 		{
-			AddError(FString::Printf(TEXT("The floor at %s is not ground over ceiling"), *Describe(Platform)));
+			continue;
+		}
+
+		const bool bRoofOnTop = Platform.PositiveStructure->HasType(EStructureType::Roof);
+		const bool bCeilingUnder = Platform.NegativeStructure->HasType(EStructureType::Ceiling);
+
+		if (bRoofOnTop && !bCeilingUnder)
+		{
+			AddError(FString::Printf(TEXT("The floor at %s is a roof over a ground"), *Describe(Platform)));
 			break;
 		}
+
+		RoofsOverCeilings += bRoofOnTop ? 1 : 0;
+		GroundsOverCeilings += !bRoofOnTop && bCeilingUnder ? 1 : 0;
+		GroundsOverGrounds += !bRoofOnTop && !bCeilingUnder ? 1 : 0;
 	}
+
+	AddInfo(FString::Printf(TEXT("%d floor(s) roof over ceiling, %d ground over ceiling, %d ground over ground."),
+		RoofsOverCeilings, GroundsOverCeilings, GroundsOverGrounds));
+	TestTrue(TEXT("All three kinds of floor turn up"), RoofsOverCeilings > 0 && GroundsOverCeilings > 0 && GroundsOverGrounds > 0);
 
 	ReleaseRooted(Rooted);
 	return true;
@@ -255,7 +282,8 @@ bool FStructureFillHoldsItemsTest::RunTest(const FString& Parameters)
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
 
-	// Every ceiling holds nothing, and a two-sided wall slab that holds nothing either.
+	// Every ceiling holds nothing, and a two-sided wall slab that holds nothing either. Grounds, under
+	// grounds too, hold items.
 	TArray<TObjectPtr<UPlatformStructureData>> Structures = MakeOneSided(Rooted, /*bCeilingHoldsItems=*/false);
 	UPlatformStructureData* BareWall = MakeStructure(TEXT("TestBareWall"), 16, 16, EStructureType::Wall, true);
 	BareWall->bHoldsItems = false;
@@ -280,10 +308,10 @@ bool FStructureFillHoldsItemsTest::RunTest(const FString& Parameters)
 		const ESurfaceCapacity Positive = Manager->GetSurfaceCapacity(Inside, WEMGrid::MakeFace(NormalAxis, 1));
 		const ESurfaceCapacity Negative = Manager->GetSurfaceCapacity(Inside, WEMGrid::MakeFace(NormalAxis, -1));
 
-		if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal)
+		if (Platform.GetKind() == EPlatformKind::SurfaceHorizontal && Platform.NegativeStructure->HasType(EStructureType::Ceiling))
 		{
 			++CheckedFloors;
-			TestEqual(*FString::Printf(TEXT("The underside of %s, under a ceiling that holds nothing, is not a surface"), *Describe(Platform)), Negative, ESurfaceCapacity::Empty);
+			TestEqual(*FString::Printf(TEXT("The underside of %s, a ceiling that holds nothing, is not a surface"), *Describe(Platform)), Negative, ESurfaceCapacity::Empty);
 			TestEqual(*FString::Printf(TEXT("The top of %s still carries anything"), *Describe(Platform)), Positive, ESurfaceCapacity::AllObject);
 		}
 		else if (Platform.PositiveStructure == BareWall)
@@ -294,7 +322,7 @@ bool FStructureFillHoldsItemsTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	TestTrue(TEXT("Floors were checked"), CheckedFloors > 10);
+	TestTrue(TEXT("Floors over ceilings were checked"), CheckedFloors > 10);
 	TestTrue(TEXT("Bare walls were checked"), CheckedWalls > 0);
 
 	// Nothing about it drifts from a full rebuild.

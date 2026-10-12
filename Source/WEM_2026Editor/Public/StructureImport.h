@@ -3,6 +3,9 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "PlatformStructureData.h"
+
+class UMaterial;
 
 /**
  * One structure's settings file, as the Blender add-on writes it beside the structure's .glb: what
@@ -28,8 +31,11 @@ struct FStructureSettings
 	/** Category asset names, such as DA_Category_ExteriorUrban. */
 	TArray<FString> Categories;
 
-	/** Ground, Ceiling and Wall. */
+	/** Ground, Ceiling, Wall and Roof. */
 	TArray<FString> Types;
+
+	/** Exterior, Interior or Both. A file without it is from before sides, and stands for an exterior. */
+	FString Side;
 
 	bool bLoadBearing = true;
 	bool bHoldsItems = true;
@@ -55,6 +61,7 @@ struct FStructureValues
 	int32 Length = 0;
 	bool bTwoSided = false;
 	int32 Types = 0;
+	EStructureSide Side = EStructureSide::Exterior;
 
 	/** Category asset names, in order. */
 	TArray<FString> Categories;
@@ -79,6 +86,9 @@ namespace WEMStructureImport
 
 	/** The type names as an EStructureType mask. Names it does not know are listed in OutUnknown. */
 	WEM_2026EDITOR_API int32 MakeTypeMask(TConstArrayView<FString> Types, TArray<FString>& OutUnknown);
+
+	/** The side a settings file names: Interior, Both, or Exterior for "Exterior" and for none. False, and Exterior, for a name it does not know. */
+	WEM_2026EDITOR_API bool MakeSide(const FString& Side, EStructureSide& OutSide);
 
 	/**
 	 * Cells beam to beam for an opening ExtentCm across: one more than the cells it spans, since each
@@ -107,4 +117,14 @@ namespace WEMStructureImport
 
 	/** One hash of several files' bytes, in order. Empty when one cannot be read. */
 	WEM_2026EDITOR_API FString HashFiles(TConstArrayView<FString> Paths);
+
+	/**
+	 * Turns a translucent material into a masked one whose mask is dithered, driven by whatever drove
+	 * its opacity. The room manager draws every structure instanced, and translucency is sorted per
+	 * draw, not per instance or face, so overlapping see-through faces come out in no fixed order.
+	 * Dithered, each pixel is drawn with the chance its alpha gives: cut-outs stay cut, glass stays
+	 * see-through, and both write depth and cast shadows. False, and the material untouched, when it
+	 * is not translucent. The caller rebuilds the material.
+	 */
+	WEM_2026EDITOR_API bool MaskTranslucency(UMaterial& Material);
 }

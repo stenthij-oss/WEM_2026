@@ -15,8 +15,8 @@ enum class EGridFace : uint8;
  * A segment is named here the way the room manager names a platform: the axis it faces along, its
  * spans beam to beam along its first and second in-plane axes (see WEMGrid::GetInPlaneAxes), and
  * its Up - the way up in its own frame, which need not be the world's. Up along its normal makes it
- * a floor, its Ground face the one looking along Up and its Ceiling face the other; Up in its plane
- * makes it a wall, whose structures stand with their tops along Up.
+ * a floor - a roof or a ground over a ceiling, or a ground over a ground - the roof or the first
+ * ground on the face looking along Up; Up in its plane makes it a wall, whose structures stand with their tops along Up.
  *
  * The category pull is here too, with categories as the room manager numbers them: which structure
  * a face is filled with, given what the faces around it were filled with.
@@ -51,8 +51,27 @@ namespace WEMStructures
 	/** Whether a segment facing along NormalAxis is a wall in its own frame: its Up lies in its plane. */
 	WEM_2026_API bool IsWall(int32 NormalAxis, EGridFace Up);
 
-	/** The type of the face a segment facing along NormalAxis, with its Up, shows on the side FaceSign looks out from. */
-	WEM_2026_API EStructureType GetFaceType(int32 NormalAxis, int32 FaceSign, EGridFace Up);
+	/**
+	 * The types that may fill the face a segment facing along NormalAxis, with its Up, shows on the side
+	 * FaceSign looks out from: Ground or Roof on a floor's face looking along Up, Ceiling or Ground on
+	 * the one looking against it, Wall on either face of a wall.
+	 */
+	WEM_2026_API EStructureType GetFaceTypes(int32 NormalAxis, int32 FaceSign, EGridFace Up);
+
+	/**
+	 * The types that pair back to back with any of Types across a segment: Roof with Ceiling, Ceiling with
+	 * Roof or Ground, Ground with Ceiling or Ground, Wall with Wall.
+	 */
+	WEM_2026_API EStructureType GetBackTypes(EStructureType Types);
+
+	/** The types a structure may be on one face of a segment: those of its own that the face takes. */
+	WEM_2026_API EStructureType GetTypesOnFace(const UPlatformStructureData& Structure, int32 NormalAxis, int32 FaceSign, EGridFace Up);
+
+	/**
+	 * Whether Back may fill the face behind Front's, Front on the side FrontSign looks out from: one of
+	 * Back's types there pairs with one of Front's.
+	 */
+	WEM_2026_API bool PairsBackToBack(const UPlatformStructureData& Front, const UPlatformStructureData& Back, int32 NormalAxis, int32 FrontSign, EGridFace Up);
 
 	/**
 	 * Whether a structure of Width x Length cells fits a segment's opening. Across a floor or ceiling
@@ -62,8 +81,9 @@ namespace WEMStructures
 	WEM_2026_API bool FitsShape(int32 Width, int32 Length, bool bMayLieSideways, int32 NormalAxis, EGridFace Up, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
 
 	/**
-	 * Whether a structure may fill one face of a segment: its types take in the face's, and the other
-	 * face's too when it is two-sided, and its shape fits the opening.
+	 * Whether a structure may fill one face of a segment: one of its types is one the face takes - and
+	 * when it is two-sided, one that pairs with one of its types on the other face, since it is both -
+	 * and its shape fits the opening. A one-sided structure still needs a back it pairs with.
 	 */
 	WEM_2026_API bool FitsFace(const UPlatformStructureData& Structure, int32 NormalAxis, int32 FaceSign, EGridFace Up, int32 SpanFirst, int32 SpanSecond, bool& bOutTurned);
 

@@ -124,47 +124,39 @@ namespace
 		return static_cast<uint8>(1 << Axis);
 	}
 
-	/**
-	 * Which side of an enclosure a structure stands for, read from its categories' names: Interior for
-	 * one with a category named for the inside and none for the outside, Exterior the other way round,
-	 * and neither for anything else - a structure of both, or of neither.
-	 */
-	enum class EEnclosureSide : uint8
+	/** Faces as GetFacesOverInteriorGround reports them, one bit each. */
+	constexpr uint8 PositiveFaceBit = 1 << 0;
+	constexpr uint8 NegativeFaceBit = 1 << 1;
+
+	FORCEINLINE uint8 FaceBit(const int32 FaceSign)
 	{
-		Neither,
-		Interior,
-		Exterior
-	};
+		return FaceSign > 0 ? PositiveFaceBit : NegativeFaceBit;
+	}
 
-	EEnclosureSide GetEnclosureSide(const UPlatformStructureData* Structure)
+	/** The sign of a direction round a module edge, as an index in turning order: +A and +B, then -A and -B. */
+	FORCEINLINE int32 TurnSign(const int32 Turn)
 	{
-		bool bInterior = false;
-		bool bExterior = false;
+		return Turn % 4 < 2 ? 1 : -1;
+	}
 
-		if (Structure)
+	/** Whether a structure is an interior and nothing else, the only kind the rules bind by. */
+	FORCEINLINE bool IsInterior(const UPlatformStructureData* Structure)
+	{
+		return Structure && Structure->Side == EStructureSide::Interior;
+	}
+
+	/** Keeps the options that stand for one side, those of both sides among them, where any does; otherwise leaves them all. */
+	void KeepSide(TArray<UPlatformStructureData*>& Options, const EStructureSide Side)
+	{
+		TArray<UPlatformStructureData*> Kept = Options.FilterByPredicate([Side](const UPlatformStructureData* Option)
 		{
-			for (const UStructureCategory* Category : Structure->Categories)
-			{
-				if (!Category)
-				{
-					continue;
-				}
+			return Option->StandsFor(Side);
+		});
 
-				// The asset's name, and the name it shows, either of which may say it.
-				const FString Name = Category->GetName();
-				const FString DisplayName = Category->DisplayName.ToString();
-
-				bInterior = bInterior || Name.Contains(TEXT("Interior")) || DisplayName.Contains(TEXT("Interior"));
-				bExterior = bExterior || Name.Contains(TEXT("Exterior")) || DisplayName.Contains(TEXT("Exterior"));
-			}
-		}
-
-		if (bInterior == bExterior)
+		if (!Kept.IsEmpty())
 		{
-			return EEnclosureSide::Neither;
+			Options = MoveTemp(Kept);
 		}
-
-		return bInterior ? EEnclosureSide::Interior : EEnclosureSide::Exterior;
 	}
 
 	/** The face looking the other way along the same axis. */
@@ -2588,8 +2580,9 @@ TArray<int32> ARoomManager::GetPatchLabels()
 
 bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const EGridFace Up, const int32 SpanFirst, const int32 SpanSecond, const bool bLoadBearingOnly) const
 {
-	bool bFrontFits = false;
-	bool bBackFits = false;
+	// What a one-sided structure on the front asks behind it, and what those on the back can be there.
+	EStructureType FrontAsks = EStructureType::None;
+	EStructureType BackOffers = EStructureType::None;
 
 	for (const UPlatformStructureData* Structure : UsableStructures)
 	{
@@ -2611,11 +2604,19 @@ bool ARoomManager::HasCompleteFill(const int32 NormalAxis, const EGridFace Up, c
 			continue;
 		}
 
-		bFrontFits = bFrontFits || WEMStructures::FitsFace(*Structure, NormalAxis, 1, Up, SpanFirst, SpanSecond, bTurned);
-		bBackFits = bBackFits || WEMStructures::FitsFace(*Structure, NormalAxis, -1, Up, SpanFirst, SpanSecond, bTurned);
+		if (WEMStructures::FitsFace(*Structure, NormalAxis, 1, Up, SpanFirst, SpanSecond, bTurned))
+		{
+			FrontAsks |= WEMStructures::GetBackTypes(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, 1, Up));
+		}
+
+		if (WEMStructures::FitsFace(*Structure, NormalAxis, -1, Up, SpanFirst, SpanSecond, bTurned))
+		{
+			BackOffers |= WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -1, Up);
+		}
 	}
 
-	return bFrontFits && bBackFits;
+	// Pairing back to back goes both ways, so some front pairs with some back whenever this holds.
+	return EnumHasAnyFlags(FrontAsks, BackOffers);
 }
 
 uint8 ARoomManager::GetFillableWays(const int32 TileIndex, const EPlatformKind Kind) const
@@ -2628,7 +2629,7 @@ uint8 ARoomManager::GetFillableWays(const int32 TileIndex, const EPlatformKind K
 void ARoomManager::GatherFillOptions(
 	const FGridPlatform& Platform,
 	const int32 FaceSign,
-	const bool bSecondFace,
+	const UPlatformStructureData* Front,
 	const bool bLoadBearingOnly,
 	TArray<UPlatformStructureData*>& OutOptions) const
 {
@@ -2649,18 +2650,37 @@ void ARoomManager::GatherFillOptions(
 			&& WEMStructures::FitsFace(*Structure, NormalAxis, Sign, Platform.Up, SpanU, SpanV, bTurned);
 	};
 
-	// A one-sided structure leaves the face behind it to another, so it is only offered when there
-	// is one that could fill it. The second face has nothing behind it to leave.
-	bool bBackCanBeFilled = bSecondFace;
-
-	for (int32 Index = 0; !bBackCanBeFilled && Index < UsableStructures.Num(); ++Index)
+	// The face behind the front takes one-sided structures that pair with it.
+	if (Front)
 	{
-		bBackCanBeFilled = !UsableStructures[Index]->bTwoSided && Fits(UsableStructures[Index], -FaceSign);
+		for (UPlatformStructureData* Structure : UsableStructures)
+		{
+			if (!Structure->bTwoSided && Fits(Structure, FaceSign)
+				&& WEMStructures::PairsBackToBack(*Front, *Structure, NormalAxis, -FaceSign, Platform.Up))
+			{
+				OutOptions.Add(Structure);
+			}
+		}
+
+		return;
+	}
+
+	// A one-sided structure leaves the face behind it to another, so it is only offered when one that
+	// pairs with it could fill that face.
+	EStructureType BackOffers = EStructureType::None;
+
+	for (const UPlatformStructureData* Structure : UsableStructures)
+	{
+		if (!Structure->bTwoSided && Fits(Structure, -FaceSign))
+		{
+			BackOffers |= WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -FaceSign, Platform.Up);
+		}
 	}
 
 	for (UPlatformStructureData* Structure : UsableStructures)
 	{
-		const bool bOffered = Structure->bTwoSided ? !bSecondFace : bBackCanBeFilled;
+		const bool bOffered = Structure->bTwoSided
+			|| EnumHasAnyFlags(WEMStructures::GetBackTypes(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, FaceSign, Platform.Up)), BackOffers);
 
 		if (bOffered && Fits(Structure, FaceSign))
 		{
@@ -2674,12 +2694,41 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
 
-	// A floor or ceiling is filled from its Ground face, the one it is walked on. A wall has no such
-	// side, so either face goes first, evenly.
-	const int32 FirstSign = !Platform.IsWall() ? FaceSign(Platform.Up) : (StructureStream.FRand() < 0.5f ? 1 : -1);
+	// A wall's face over an interior ground it stands on is drawn from the interiors, with the rule's chance.
+	const uint8 OverInteriorGround = bWallsFaceInteriorGrounds ? GetFacesOverInteriorGround(Platform) : 0;
+
+	auto KeepInteriorOverGround = [&](TArray<UPlatformStructureData*>& Options, const int32 Sign)
+	{
+		if ((OverInteriorGround & FaceBit(Sign)) == 0 || StructureStream.FRand() >= WallsFaceInteriorGroundsChance)
+		{
+			return false;
+		}
+
+		KeepSide(Options, EStructureSide::Interior);
+		return true;
+	};
+
+	// A floor is filled from the face looking along its Up, its roof or the ground it is walked on. A
+	// wall over an interior ground on one side only is filled from that side, so what goes behind it
+	// follows from it; any other wall from either face, evenly.
+	int32 FirstSign = 1;
+
+	if (!Platform.IsWall())
+	{
+		FirstSign = FaceSign(Platform.Up);
+	}
+	else if (OverInteriorGround == PositiveFaceBit || OverInteriorGround == NegativeFaceBit)
+	{
+		FirstSign = OverInteriorGround == PositiveFaceBit ? 1 : -1;
+	}
+	else
+	{
+		FirstSign = StructureStream.FRand() < 0.5f ? 1 : -1;
+	}
 
 	TArray<UPlatformStructureData*> Options;
-	GatherFillOptions(Platform, FirstSign, /*bSecondFace=*/false, bLoadBearingOnly, Options);
+	GatherFillOptions(Platform, FirstSign, /*Front=*/nullptr, bLoadBearingOnly, Options);
+	KeepInteriorOverGround(Options, FirstSign);
 
 	UPlatformStructureData* First = DrawStructure(Options, Platform, FirstSign);
 
@@ -2695,25 +2744,15 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 		return true;
 	}
 
-	GatherFillOptions(Platform, -FirstSign, /*bSecondFace=*/true, bLoadBearingOnly, Options);
+	GatherFillOptions(Platform, -FirstSign, First, bLoadBearingOnly, Options);
 
-	// Behind an inside, with InteriorBacksExteriorChance, an outside, and behind an outside an inside -
-	// where any of the options is one.
-	const EEnclosureSide FirstSide = GetEnclosureSide(First);
-
-	if (bInteriorBacksExterior && FirstSide != EEnclosureSide::Neither && StructureStream.FRand() < InteriorBacksExteriorChance)
+	// Over an interior ground the back is an inside too. Otherwise, behind an inside, with
+	// InteriorBacksExteriorChance, an outside - where any of the options is one. Behind an outside,
+	// anything.
+	if (!KeepInteriorOverGround(Options, -FirstSign)
+		&& bInteriorBacksExterior && IsInterior(First) && StructureStream.FRand() < InteriorBacksExteriorChance)
 	{
-		const EEnclosureSide Wanted = FirstSide == EEnclosureSide::Interior ? EEnclosureSide::Exterior : EEnclosureSide::Interior;
-
-		TArray<UPlatformStructureData*> Backs = Options.FilterByPredicate([Wanted](const UPlatformStructureData* Option)
-		{
-			return GetEnclosureSide(Option) == Wanted;
-		});
-
-		if (!Backs.IsEmpty())
-		{
-			Options = MoveTemp(Backs);
-		}
+		KeepSide(Options, EStructureSide::Exterior);
 	}
 
 	UPlatformStructureData* Second = DrawStructure(Options, Platform, -FirstSign);
@@ -2726,6 +2765,81 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	Platform.PositiveStructure = FirstSign > 0 ? First : Second;
 	Platform.NegativeStructure = FirstSign > 0 ? Second : First;
 	return true;
+}
+
+uint8 ARoomManager::GetFacesOverInteriorGround(const FGridPlatform& Wall) const
+{
+	int32 SpanU, SpanV;
+	if (!Wall.IsWall() || !GetPlatformSpans(Wall, SpanU, SpanV))
+	{
+		return 0;
+	}
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Wall.Normal);
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// Whether a module face is one of the wall's own, which is not recorded yet.
+	auto IsOwnFace = [&](const FModuleFace& Face)
+	{
+		return Face.Normal == NormalAxis
+			&& Face.MinNode[NormalAxis] == Wall.MinNode[NormalAxis]
+			&& Face.MinNode[U] >= Wall.MinNode[U] && Face.MinNode[U] < Wall.MinNode[U] + SpanU
+			&& Face.MinNode[V] >= Wall.MinNode[V] && Face.MinNode[V] < Wall.MinNode[V] + SpanV;
+	};
+
+	uint8 Faces = 0;
+
+	ForEachModuleEdge(Wall, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		// Only its rim can be shared, and only where a platform already runs around the same edge.
+		if (!bRim || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		{
+			return;
+		}
+
+		FModuleFace EdgeFaces[4];
+		GetEdgeFaces(Edge, Module, EdgeFaces);
+
+		int32 Own = INDEX_NONE;
+
+		for (int32 Turn = 0; Turn < 4 && Own == INDEX_NONE; ++Turn)
+		{
+			Own = IsOwnFace(EdgeFaces[TurningOrder[Turn]]) ? Turn : INDEX_NONE;
+		}
+
+		if (Own == INDEX_NONE)
+		{
+			return;
+		}
+
+		// A floor a quarter turn round the edge either way meets the wall in a corner. Into it the wall
+		// looks toward the floor's direction, and the floor toward the wall's.
+		for (const int32 Step : { 1, 3 })
+		{
+			const int32 Turn = (Own + Step) % 4;
+			const FModuleFace& Face = EdgeFaces[TurningOrder[Turn]];
+			const int32* Owner = ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal));
+
+			if (!Owner || BuiltPlatforms[*Owner].IsWall())
+			{
+				continue;
+			}
+
+			const FGridPlatform& Floor = BuiltPlatforms[*Owner];
+			const int32 FloorSign = TurnSign(Own);
+
+			// Its face looking at the wall has to be the Ground it is walked on, and an interior.
+			if (FloorSign == FaceSign(Floor.Up) && IsInterior(FloorSign > 0 ? Floor.PositiveStructure : Floor.NegativeStructure))
+			{
+				Faces |= FaceBit(TurnSign(Turn));
+			}
+		}
+	});
+
+	return Faces;
 }
 
 UPlatformStructureData* ARoomManager::DrawStructure(
@@ -3925,10 +4039,34 @@ void ARoomManager::UpdateDebugReadouts()
 	DebugProbeStructure = FaceSign(DebugProbeSurface.Face) > 0 ? OwnerPlatform.PositiveStructure : OwnerPlatform.NegativeStructure;
 	bDebugProbeInFenceRun = IsFencePanel(OwnerPlatform);
 
-	// As the structure types name the face: a floor's Ground face looks along its Up.
-	const TCHAR* RoleName = OwnerPlatform.IsWall() ? TEXT("wall")
-		: (FaceSign(DebugProbeSurface.Face) == FaceSign(OwnerPlatform.Up) ? TEXT("ground") : TEXT("ceiling"));
-	DebugProbeRole = FString::Printf(TEXT("%s, up %s"), RoleName, *StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString());
+	// What its fill makes the face: those of its structure's types there that pair with the structure behind it.
+	const int32 ProbeSign = FaceSign(DebugProbeSurface.Face);
+	const int32 OwnerNormal = AxisIndex(OwnerPlatform.Normal);
+	const UPlatformStructureData* Behind = ProbeSign > 0 ? OwnerPlatform.NegativeStructure : OwnerPlatform.PositiveStructure;
+	EStructureType FaceRole = EStructureType::None;
+
+	if (DebugProbeStructure && Behind)
+	{
+		FaceRole = WEMStructures::GetTypesOnFace(*DebugProbeStructure, OwnerNormal, ProbeSign, OwnerPlatform.Up)
+			& WEMStructures::GetBackTypes(WEMStructures::GetTypesOnFace(*Behind, OwnerNormal, -ProbeSign, OwnerPlatform.Up));
+	}
+
+	TArray<FString> RoleNames;
+	for (const TPair<EStructureType, const TCHAR*>& Name : { MakeTuple(EStructureType::Ground, TEXT("ground")), MakeTuple(EStructureType::Ceiling, TEXT("ceiling")),
+		MakeTuple(EStructureType::Wall, TEXT("wall")), MakeTuple(EStructureType::Roof, TEXT("roof")) })
+	{
+		if (EnumHasAnyFlags(FaceRole, Name.Key))
+		{
+			RoleNames.Add(Name.Value);
+		}
+	}
+
+	const EStructureSide ProbeSide = DebugProbeStructure ? DebugProbeStructure->Side : EStructureSide::Exterior;
+
+	DebugProbeRole = FString::Printf(TEXT("%s, %s, up %s"),
+		RoleNames.IsEmpty() ? TEXT("none") : *FString::Join(RoleNames, TEXT(" or ")),
+		ProbeSide == EStructureSide::Interior ? TEXT("interior") : ProbeSide == EStructureSide::Both ? TEXT("interior or exterior") : TEXT("exterior"),
+		*StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString());
 
 	TArray<FString> Streaks;
 	for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)

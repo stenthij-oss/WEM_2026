@@ -23,6 +23,7 @@
 #include "MeshDescription.h"
 #include "ObjectTools.h"
 #include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Misc/UObjectToken.h"
@@ -127,6 +128,7 @@ namespace StructureImporterPrivate
 		Values.Length = Structure.Length;
 		Values.bTwoSided = Structure.bTwoSided;
 		Values.Types = Structure.Types;
+		Values.Side = Structure.Side;
 		Values.bLoadBearing = Structure.bLoadBearing;
 		Values.bHoldsItems = Structure.bHoldsItems;
 		Values.bFence = Structure.bFence;
@@ -354,6 +356,7 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 
 	if (Previous && Previous->Mesh && !Hash.IsEmpty() && Previous->ImportHash == Hash && !bReimportAll)
 	{
+		PrepareMaterials(*Previous->Mesh, Result);
 		Result.Structure = Previous;
 		Result.Outcome = TEXT("unchanged");
 		return;
@@ -409,6 +412,7 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 	}
 
 	MapMaterials(*Mesh, Result);
+	PrepareMaterials(*Mesh, Result);
 
 	// Dense relief is drawn with Nanite; a plain slab is cheaper without it.
 	const int32 Triangles = Description.Triangles().Num();
@@ -437,7 +441,14 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 
 	for (const FString& Type : UnknownTypes)
 	{
-		Result.Notes.Add(FString::Printf(TEXT("type '%s' is not Ground, Ceiling or Wall, and is ignored"), *Type));
+		Result.Notes.Add(FString::Printf(TEXT("type '%s' is not Ground, Ceiling, Wall or Roof, and is ignored"), *Type));
+	}
+
+	EStructureSide Side = EStructureSide::Exterior;
+
+	if (!WEMStructureImport::MakeSide(Settings.Side, Side))
+	{
+		Result.Notes.Add(FString::Printf(TEXT("side '%s' is not Exterior, Interior or Both, so it stands for an exterior"), *Settings.Side));
 	}
 
 	TMap<FString, UStructureCategory*> KnownCategories;
@@ -480,6 +491,7 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 	Structure->bTwoSided = Settings.bTwoSided;
 	Structure->Categories = Categories;
 	Structure->Types = Types;
+	Structure->Side = Side;
 	Structure->bLoadBearing = Settings.bLoadBearing;
 	Structure->bHoldsItems = Settings.bHoldsItems;
 	Structure->bFence = Settings.bFence;
@@ -529,12 +541,40 @@ void UStructureImporter::MapMaterials(UStaticMesh& Mesh, FImportResult& Result) 
 			Mesh.SetMaterial(Slot, Material);
 			Result.Notes.Add(FString::Printf(TEXT("slot %s takes %s"), *SlotName, *Material->GetPathName()));
 		}
+	}
+}
+
+void UStructureImporter::PrepareMaterials(UStaticMesh& Mesh, FImportResult& Result) const
+{
+	const FString MeshFolder = FPackageName::GetLongPackagePath(Mesh.GetPackage()->GetName());
+	const TArray<FStaticMaterial>& Slots = Mesh.GetStaticMaterials();
+
+	for (int32 Slot = 0; Slot < Slots.Num(); ++Slot)
+	{
+		const FString SlotName = Slots[Slot].MaterialSlotName.ToString();
+		UMaterial* Base = Mesh.GetMaterial(Slot) ? Mesh.GetMaterial(Slot)->GetMaterial() : nullptr;
+
+		// glTF's blended alpha comes in translucent, which instanced drawing cannot sort. A material
+		// that came in with the mesh is changed; one chosen in Unreal is only reported.
+		if (Base && Base->BlendMode == BLEND_Translucent)
+		{
+			if (FPackageName::GetLongPackagePath(Base->GetPackage()->GetName()) == MeshFolder)
+			{
+				WEMStructureImport::MaskTranslucency(*Base);
+				Base->PostEditChange();
+				Base->MarkPackageDirty();
+				Result.Notes.Add(FString::Printf(TEXT("slot %s's material %s is drawn masked and dithered rather than translucent"), *SlotName, *Base->GetName()));
+			}
+			else
+			{
+				Result.Notes.Add(FString::Printf(TEXT("slot %s's material %s is translucent, which the room manager cannot sort when it draws instanced; make it masked"),
+					*SlotName, *Base->GetPathName()));
+			}
+		}
 
 		// The room manager draws every structure instanced, which a material has to allow, or the
 		// default material is drawn in its place. A material of the project's own is given that; one
 		// from elsewhere cannot be changed here, so it is reported.
-		UMaterial* Base = Mesh.GetMaterial(Slot) ? Mesh.GetMaterial(Slot)->GetMaterial() : nullptr;
-
 		if (Base && !Base->GetUsageByFlag(MATUSAGE_InstancedStaticMeshes))
 		{
 			if (Base->GetPackage()->GetName().StartsWith(TEXT("/Game/")))

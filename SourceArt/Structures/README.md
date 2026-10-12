@@ -15,7 +15,7 @@ exporting from the command line, and how to organise a thousand panels - see `TU
 | Lying | On the ground, face up (+Z). The back is on Z = 0. |
 | Centre | Centred on the origin in X and Y. Transforms applied: location 0, rotation 0, scale 1. |
 | Width, length | X is the width, Y the length. On a wall, X runs along the ground and +Y points up: the top of a facade is at +Y, the top of the screen in Blender's top view. |
-| Thickness | One-sided: Z 0 to 0.10 (from the segment's mid-plane to its face). Two-sided: Z 0 to 0.20 (both faces). |
+| Thickness | One-sided: Z 0 to 0.10 (from the segment's mid-plane to its face). Two-sided: back on Z 0, any thickness; thinner than 0.20 it is centred between both faces on export. |
 | Relief | May rise beyond a face (grass, stones). Nothing of a one-sided structure may go below Z = 0, where its partner is. A structure that holds items keeps its walkable face at the face plane. |
 | Edges | Closed: they show wherever a beam is not built. |
 
@@ -41,8 +41,8 @@ sidebar (N) for the active object:
 
 - **Folder**: this folder (`SourceArt/Structures`). Left empty, it is looked for beside the add-on
   and the .blend.
-- **Types**, **Categories** (click to toggle; the reload button reads `categories.json` again),
-  **Two-sided**, **Fence** (only shown for two-sided), **Load-bearing**, **Holds items**,
+- **Types**, **Side**, **Categories** (click to toggle; the reload button reads `categories.json`
+  again), **Two-sided**, **Fence** (only shown for two-sided), **Load-bearing**, **Holds items**,
   **May lie sideways**, **Weight**. They are stored on the object, so they live in the .blend.
 - **Export** checks the convention - origin, applied transforms, back on Z = 0 and nothing below it
   for one-sided, a tile's opening either way round within 1 cm, fence only when two-sided, the .blend
@@ -60,12 +60,13 @@ Open `/Game/Structures/DA_StructureImporter` and press **Import**. It:
    beside it, and checks its bounds again;
 3. makes or updates `DA_Structure_<Name>` from the settings file;
 4. turns Nanite on for a mesh with more than `NaniteTriangleThreshold` triangles;
-5. gives a material slot named after a material in `/Game/Structures/Materials` that material;
+5. gives a material slot named after a material in `/Game/Structures/Materials` that material, and
+   draws an imported see-through material masked and dithered rather than translucent (see Materials);
 6. adds new structures to every room manager in the open level, as one step you can undo;
 7. reports to the **Structure Import** message log and to `LastReport` on the importer.
 
 Save afterwards (File > Save All). A structure whose .glb and .json have not changed since its last
-import is left as it is.
+import is left as it is, but for step 5's materials.
 
 ## Adding a category
 
@@ -76,8 +77,16 @@ Import) on the importer, then the reload button in Blender's WEM tab.
 
 ## What each setting does
 
-- **Types**: which faces it may fill. Ground is the top of a floor, Ceiling its underside, Wall either
-  face of a wall. A two-sided structure fills both faces, so a floor needs Ground and Ceiling.
+- **Types**: what it may be. A floor is a **Roof** or a **Ground** on its top over a **Ceiling** on its
+  underside, or a **Ground** on both faces - the one underneath facing down, the world carrying on
+  upside down below it. A roof is never over a ground. **Wall** is either face of a wall. "Top" is the face looking
+  along the segment's own Up, which need not be the world's. A two-sided structure is both faces at
+  once, so a floor needs Ground, or Roof and Ceiling.
+- **Side**: **Exterior** (the default), **Interior** or **Both**. Behind an interior, growth reaches for
+  an exterior (four times in five, by default). Behind an exterior, anything may follow. A wall
+  standing on an interior ground is nearly always an interior on the side that looks over it. A
+  structure of **Both** fills a face asked to be either, and binds nothing itself: anything may follow
+  behind it, and a wall standing on a ground of both sides is drawn as usual.
 - **Two-sided**: fills the whole segment, both faces. Otherwise it fills one face, and another
   one-sided structure fills the other.
 - **Categories**: any number. A face is pulled toward the categories of the faces beside it, more
@@ -118,6 +127,16 @@ The room manager draws structures instanced, which a material has to allow. The 
 on for every material in the project a structure uses; a material from outside the project (an
 engine or plugin material) cannot be changed, and the report says so - the default checker is drawn
 in its place.
+
+**Alpha.** Linking an image's alpha to the BSDF's Alpha makes the material see-through: the exporter
+writes it as blended, which Unreal would draw translucent - and translucency cannot be sorted when it
+is drawn instanced, so overlapping faces flicker and show through each other. The importer draws such
+a material masked with a dithered mask instead, which matches Blender's Dithered render method: alpha 0
+is a hole, 1 is solid, and anything between is drawn as that share of pixels (glass, smoothed by
+anti-aliasing). Link the alpha only where it is meant as transparency - cut-outs and glass. Many game
+textures keep a shine or reflection mask in the alpha instead (grout lines, stains); linked, those
+surfaces come out speckled with holes. Leave their alpha unlinked. A material already imported keeps
+how it was drawn on a later import, so delete it in Unreal before importing a changed one again.
 
 ## In this folder
 

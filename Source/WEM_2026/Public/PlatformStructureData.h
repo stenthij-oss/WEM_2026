@@ -10,25 +10,45 @@ class UStaticMesh;
 class UStructureCategory;
 
 /**
- * Which faces of a segment a structure may fill, by what the face is in the segment's own frame (see
- * FGridPlatform::Up), not by the way it looks in the world: the face a floor is walked on, the face
- * under it, or either side of a wall. Any number may be set.
+ * What a structure may be on a segment, in the segment's own frame (see FGridPlatform::Up), not by the
+ * way it looks in the world. Any number may be set.
+ *
+ * A floor is a Roof or a Ground on the face looking along its Up, over a Ceiling on the other - or a
+ * Ground over a Ground, the world carrying on upside down beneath it. Never a roof over a ground. A
+ * wall is Wall on both faces.
  */
 UENUM(BlueprintType, meta = (Bitflags, UseEnumValuesAsMaskValuesInEditor = "true"))
 enum class EStructureType : uint8
 {
 	None = 0 UMETA(Hidden),
 
-	/** A floor's face looking along its Up: the one it is walked on, however it lies in the world. */
+	/** A floor's face that is walked on: the one looking along its Up, over a ceiling or a ground, or the one under a ground, looking the other way. */
 	Ground = 1 << 0,
 
-	/** A floor's face looking against its Up. */
+	/** A floor's face looking against its Up, under a roof or a ground. */
 	Ceiling = 1 << 1,
 
 	/** Either face of a wall: a segment whose Up lies in its plane. */
-	Wall = 1 << 2
+	Wall = 1 << 2,
+
+	/** A floor's face looking along its Up, over a ceiling. */
+	Roof = 1 << 3
 };
 ENUM_CLASS_FLAGS(EStructureType);
+
+/** Which side of an enclosure a structure stands for. */
+UENUM(BlueprintType)
+enum class EStructureSide : uint8
+{
+	/** Outside: a facade, a street, a roof. Anything may stand behind it. */
+	Exterior,
+
+	/** Inside a room. Behind it, growth reaches for an exterior (see ARoomManager::bInteriorBacksExterior). */
+	Interior,
+
+	/** Either: it fills a face asked to be an interior or an exterior, and binds nothing behind it or beside it. */
+	Both
+};
 
 /**
  * A mesh that fills the opening of a segment between its beams, and what it means for growth.
@@ -77,11 +97,21 @@ public:
 	TArray<TObjectPtr<UStructureCategory>> Categories;
 
 	/**
-	 * The faces the structure may fill. A two-sided structure fills both faces of a segment, so it
-	 * needs the types of both: Ground and Ceiling for a floor, Wall for a wall.
+	 * What the structure may be on a segment. A one-sided structure is backed by another that pairs with
+	 * it: a roof by a ceiling, a ceiling by a roof or a ground, a ground by a ceiling or a ground, a wall
+	 * by a wall. A two-sided structure is both faces of a segment at once, so it needs a pair of its
+	 * own: Ground for a floor, or Roof and Ceiling; Wall for a wall.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (Bitmask, BitmaskEnum = "/Script/WEM_2026.EStructureType"))
 	int32 Types = static_cast<int32>(EStructureType::Ground | EStructureType::Ceiling | EStructureType::Wall);
+
+	/**
+	 * Which side of an enclosure it stands for. Behind an interior, growth reaches for an exterior, and a
+	 * wall standing on an interior ground is an interior on that side (see ARoomManager's
+	 * bInteriorBacksExterior and bWallsFaceInteriorGrounds). Both serves either and binds nothing.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure")
+	EStructureSide Side = EStructureSide::Exterior;
 
 	/**
 	 * Whether anything may be built onto it. Off, the segment it fills blocks some of its beams: a
@@ -135,6 +165,12 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Source")
 	FString ImportHash;
 #endif
+
+	/** Whether it may fill a face asked to be Wanted: one of that side, or of both. */
+	bool StandsFor(const EStructureSide Wanted) const
+	{
+		return Side == Wanted || Side == EStructureSide::Both;
+	}
 
 	bool HasType(const EStructureType Type) const
 	{

@@ -271,11 +271,19 @@ bool FStructureFitTest::RunTest(const FString& Parameters)
 
 	bool bTurned = false;
 
-	// Face types follow from the segment alone.
-	TestEqual(TEXT("A floor's top is ground"), WEMStructures::GetFaceType(2, 1, EGridFace::PosZ), EStructureType::Ground);
-	TestEqual(TEXT("Its underside is ceiling"), WEMStructures::GetFaceType(2, -1, EGridFace::PosZ), EStructureType::Ceiling);
-	TestEqual(TEXT("Either face of a wall facing X is wall"), WEMStructures::GetFaceType(0, -1, EGridFace::PosZ), EStructureType::Wall);
-	TestEqual(TEXT("Either face of a wall facing Y is wall"), WEMStructures::GetFaceType(1, 1, EGridFace::PosZ), EStructureType::Wall);
+	// What a face takes follows from the segment alone.
+	TestEqual(TEXT("A floor's top takes ground or roof"), WEMStructures::GetFaceTypes(2, 1, EGridFace::PosZ), EStructureType::Ground | EStructureType::Roof);
+	TestEqual(TEXT("Its underside ceiling or ground"), WEMStructures::GetFaceTypes(2, -1, EGridFace::PosZ), EStructureType::Ceiling | EStructureType::Ground);
+	TestEqual(TEXT("Either face of a wall facing X takes wall"), WEMStructures::GetFaceTypes(0, -1, EGridFace::PosZ), EStructureType::Wall);
+	TestEqual(TEXT("Either face of a wall facing Y takes wall"), WEMStructures::GetFaceTypes(1, 1, EGridFace::PosZ), EStructureType::Wall);
+
+	// And what may stand back to back.
+	TestEqual(TEXT("A roof is backed by a ceiling"), WEMStructures::GetBackTypes(EStructureType::Roof), EStructureType::Ceiling);
+	TestEqual(TEXT("A ceiling by a roof or a ground"), WEMStructures::GetBackTypes(EStructureType::Ceiling), EStructureType::Roof | EStructureType::Ground);
+	TestEqual(TEXT("A ground by a ceiling or a ground"), WEMStructures::GetBackTypes(EStructureType::Ground), EStructureType::Ceiling | EStructureType::Ground);
+	TestEqual(TEXT("A wall by a wall"), WEMStructures::GetBackTypes(EStructureType::Wall), EStructureType::Wall);
+	TestEqual(TEXT("Several types, by all their partners"),
+		WEMStructures::GetBackTypes(EStructureType::Ground | EStructureType::Roof), EStructureType::Ground | EStructureType::Ceiling);
 
 	// Shape: floors turn freely, walls only when the structure may lie sideways.
 	TestTrue(TEXT("An 8 x 16 fits an 8 x 16 floor as it is"), WEMStructures::FitsShape(8, 16, false, 2, EGridFace::PosZ, 8, 16, bTurned) && !bTurned);
@@ -286,18 +294,36 @@ bool FStructureFitTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("A square fits a square wall without turning"), WEMStructures::FitsShape(16, 16, true, 0, EGridFace::PosZ, 16, 16, bTurned) && !bTurned);
 	TestFalse(TEXT("A 16 x 16 does not fit an 8 x 16"), WEMStructures::FitsShape(16, 16, true, 2, EGridFace::PosZ, 8, 16, bTurned));
 
-	// Types: one-sided needs the face's own, two-sided both faces'.
+	// Types: one-sided needs one the face takes, two-sided a pair of its own.
 	UPlatformStructureData* GroundOnly = MakeStructure(16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* RoofOnly = MakeStructure(16, 16, EStructureType::Roof, false);
+	UPlatformStructureData* CeilingOnly = MakeStructure(16, 16, EStructureType::Ceiling, false);
 	UPlatformStructureData* FloorSlab = MakeStructure(16, 16, EStructureType::Ground | EStructureType::Ceiling, true);
 	UPlatformStructureData* GroundSlab = MakeStructure(16, 16, EStructureType::Ground, true);
+	UPlatformStructureData* RoofSlab = MakeStructure(16, 16, EStructureType::Roof | EStructureType::Ceiling, true);
+	UPlatformStructureData* CeilingSlab = MakeStructure(16, 16, EStructureType::Ceiling, true);
 	UPlatformStructureData* WallSlab = MakeStructure(16, 16, EStructureType::Wall, true);
 
 	TestTrue(TEXT("A one-sided ground structure fits a floor's top"), WEMStructures::FitsFace(*GroundOnly, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
-	TestFalse(TEXT("But not its underside"), WEMStructures::FitsFace(*GroundOnly, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
-	TestFalse(TEXT("Nor a wall"), WEMStructures::FitsFace(*GroundOnly, 0, 1, EGridFace::PosZ, 16, 16, bTurned));
-	TestTrue(TEXT("A two-sided ground-and-ceiling slab fits a floor from either face"),
+	TestTrue(TEXT("And its underside, under another ground"), WEMStructures::FitsFace(*GroundOnly, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not a wall"), WEMStructures::FitsFace(*GroundOnly, 0, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestTrue(TEXT("A roof fits a floor's top"), WEMStructures::FitsFace(*RoofOnly, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not its underside"), WEMStructures::FitsFace(*RoofOnly, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestTrue(TEXT("A ceiling fits a floor's underside"), WEMStructures::FitsFace(*CeilingOnly, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not its top"), WEMStructures::FitsFace(*CeilingOnly, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+
+	TestTrue(TEXT("A roof pairs with a ceiling behind it"), WEMStructures::PairsBackToBack(*RoofOnly, *CeilingOnly, 2, 1, EGridFace::PosZ));
+	TestTrue(TEXT("And the other way round"), WEMStructures::PairsBackToBack(*CeilingOnly, *RoofOnly, 2, -1, EGridFace::PosZ));
+	TestTrue(TEXT("A ground pairs with a ground"), WEMStructures::PairsBackToBack(*GroundOnly, *GroundOnly, 2, 1, EGridFace::PosZ));
+	TestTrue(TEXT("A ground pairs with a ceiling under it"), WEMStructures::PairsBackToBack(*GroundOnly, *CeilingOnly, 2, 1, EGridFace::PosZ));
+	TestFalse(TEXT("But a roof does not pair with a ground under it"), WEMStructures::PairsBackToBack(*RoofOnly, *GroundOnly, 2, 1, EGridFace::PosZ));
+	TestFalse(TEXT("Nor a ground under it with a roof"), WEMStructures::PairsBackToBack(*GroundOnly, *RoofOnly, 2, -1, EGridFace::PosZ));
+
+	TestTrue(TEXT("A two-sided ground-and-ceiling slab fits a floor from either face, as ground on both"),
 		WEMStructures::FitsFace(*FloorSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned) && WEMStructures::FitsFace(*FloorSlab, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
-	TestFalse(TEXT("A two-sided slab of ground alone fits no floor, since it would be a ceiling too"), WEMStructures::FitsFace(*GroundSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestTrue(TEXT("So does a two-sided slab of ground alone"), WEMStructures::FitsFace(*GroundSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
+	TestTrue(TEXT("And a two-sided roof-and-ceiling"), WEMStructures::FitsFace(*RoofSlab, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
+	TestFalse(TEXT("A two-sided ceiling alone fits no floor, since it would be a roof too"), WEMStructures::FitsFace(*CeilingSlab, 2, -1, EGridFace::PosZ, 16, 16, bTurned));
 	TestTrue(TEXT("A two-sided wall slab fits a wall"), WEMStructures::FitsFace(*WallSlab, 1, -1, EGridFace::PosZ, 16, 16, bTurned));
 	TestFalse(TEXT("But no floor"), WEMStructures::FitsFace(*WallSlab, 2, 1, EGridFace::PosZ, 16, 16, bTurned));
 
@@ -313,11 +339,13 @@ bool FStructureFitRelativeTest::RunTest(const FString& Parameters)
 	bool bTurned = false;
 
 	// The types follow the segment's own Up, not the world's.
-	TestEqual(TEXT("Upside down, a floor's underside is its ground"), WEMStructures::GetFaceType(2, -1, EGridFace::NegZ), EStructureType::Ground);
-	TestEqual(TEXT("And its top its ceiling"), WEMStructures::GetFaceType(2, 1, EGridFace::NegZ), EStructureType::Ceiling);
-	TestEqual(TEXT("A segment lying flat with Up along X is a wall"), WEMStructures::GetFaceType(2, 1, EGridFace::PosX), EStructureType::Wall);
-	TestEqual(TEXT("One standing up facing X with Up along X is a floor"), WEMStructures::GetFaceType(0, 1, EGridFace::PosX), EStructureType::Ground);
-	TestEqual(TEXT("Whose other face is its ceiling"), WEMStructures::GetFaceType(0, -1, EGridFace::PosX), EStructureType::Ceiling);
+	constexpr EStructureType AlongUp = EStructureType::Ground | EStructureType::Roof;
+	constexpr EStructureType AgainstUp = EStructureType::Ceiling | EStructureType::Ground;
+	TestEqual(TEXT("Upside down, a floor's underside takes its ground or roof"), WEMStructures::GetFaceTypes(2, -1, EGridFace::NegZ), AlongUp);
+	TestEqual(TEXT("And its top its ceiling, or the ground under a ground"), WEMStructures::GetFaceTypes(2, 1, EGridFace::NegZ), AgainstUp);
+	TestEqual(TEXT("A segment lying flat with Up along X is a wall"), WEMStructures::GetFaceTypes(2, 1, EGridFace::PosX), EStructureType::Wall);
+	TestEqual(TEXT("One standing up facing X with Up along X is a floor"), WEMStructures::GetFaceTypes(0, 1, EGridFace::PosX), AlongUp);
+	TestEqual(TEXT("Whose other face looks against its Up"), WEMStructures::GetFaceTypes(0, -1, EGridFace::PosX), AgainstUp);
 	TestTrue(TEXT("IsWall agrees"), WEMStructures::IsWall(2, EGridFace::PosX) && !WEMStructures::IsWall(0, EGridFace::NegX));
 
 	// Shape: a wall's structure stands with its length along the wall's Up, wherever that is.
@@ -331,13 +359,13 @@ bool FStructureFitRelativeTest::RunTest(const FString& Parameters)
 		WEMStructures::FitsShape(8, 16, false, 2, EGridFace::PosX, 16, 8, bTurned) && bTurned);
 	TestTrue(TEXT("A floor standing up in the world turns freely"), WEMStructures::FitsShape(8, 16, false, 0, EGridFace::NegX, 16, 8, bTurned) && bTurned);
 
-	// One-sided ground goes on the Ground face, whichever way that looks.
-	UPlatformStructureData* GroundOnly = MakeStructure(16, 16, EStructureType::Ground, false);
+	// A one-sided roof goes on the face looking along Up, whichever way that looks.
+	UPlatformStructureData* RoofOnly = MakeStructure(16, 16, EStructureType::Roof, false);
 	UPlatformStructureData* WallSlab = MakeStructure(16, 16, EStructureType::Wall, true);
 
-	TestTrue(TEXT("Ground fits the underside of an upside-down floor"), WEMStructures::FitsFace(*GroundOnly, 2, -1, EGridFace::NegZ, 16, 16, bTurned));
-	TestFalse(TEXT("But not its top"), WEMStructures::FitsFace(*GroundOnly, 2, 1, EGridFace::NegZ, 16, 16, bTurned));
-	TestTrue(TEXT("Ground fits a world wall that is a floor in its own frame"), WEMStructures::FitsFace(*GroundOnly, 1, 1, EGridFace::PosY, 16, 16, bTurned));
+	TestTrue(TEXT("A roof fits the underside of an upside-down floor"), WEMStructures::FitsFace(*RoofOnly, 2, -1, EGridFace::NegZ, 16, 16, bTurned));
+	TestFalse(TEXT("But not its top"), WEMStructures::FitsFace(*RoofOnly, 2, 1, EGridFace::NegZ, 16, 16, bTurned));
+	TestTrue(TEXT("A roof fits a world wall that is a floor in its own frame"), WEMStructures::FitsFace(*RoofOnly, 1, 1, EGridFace::PosY, 16, 16, bTurned));
 	TestTrue(TEXT("A wall slab fits a world floor that is a wall in its own frame"), WEMStructures::FitsFace(*WallSlab, 2, 1, EGridFace::NegY, 16, 16, bTurned));
 	TestFalse(TEXT("But not a world wall that is a floor"), WEMStructures::FitsFace(*WallSlab, 0, 1, EGridFace::PosX, 16, 16, bTurned));
 

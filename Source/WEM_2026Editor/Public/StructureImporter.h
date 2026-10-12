@@ -20,7 +20,7 @@ struct FStructureSettings;
  * report lists each value that changed, so nothing set in Unreal is lost without a word. The weight
  * is the exception - it is tuned in Unreal while watching growth, so the file only gives a new
  * structure its first. A structure whose two files have not changed since its last import is left
- * as it is.
+ * as it is, but for readying its materials for instanced drawing.
  *
  * Editor only. It is never cooked, and nothing at runtime reads it - the room manager reads the
  * structure assets.
@@ -109,11 +109,16 @@ private:
 	/** The structure asset of that name, made in Folder when there is none yet. */
 	UPlatformStructureData* FindOrCreateStructure(const FString& Folder, const FString& AssetName, bool& bOutCreated) const;
 
-	/**
-	 * Gives material slots named after a material in MaterialFolder that material, and lets every
-	 * material of the project's own on the mesh be drawn instanced.
-	 */
+	/** Gives material slots named after a material in MaterialFolder that material. */
 	void MapMaterials(UStaticMesh& Mesh, FImportResult& Result) const;
+
+	/**
+	 * Readies the mesh's materials for the room manager, which draws every structure instanced: the
+	 * ones that came in with the mesh are drawn masked rather than translucent, and every material of
+	 * the project's own is let be drawn instanced. Run on every import, so a structure imported before
+	 * a rule was added takes it without coming in again.
+	 */
+	void PrepareMaterials(UStaticMesh& Mesh, FImportResult& Result) const;
 
 	/**
 	 * Adds structures to every room manager in the open level that does not list them yet, as one

@@ -132,6 +132,12 @@ struct FRoomManagerTestAccess
 		return Manager.DrawFill(Platform, /*bLoadBearingOnly=*/false);
 	}
 
+	/** Which faces of a wall about to be placed look over an interior ground it stands on: 1 positive, 2 negative. */
+	static uint8 GetFacesOverInteriorGround(const ARoomManager& Manager, const FGridPlatform& Wall)
+	{
+		return Manager.GetFacesOverInteriorGround(Wall);
+	}
+
 	/** The axis a fence panel's run goes along. */
 	static int32 GetRunAxis(const ARoomManager& Manager, const FGridPlatform& Panel)
 	{

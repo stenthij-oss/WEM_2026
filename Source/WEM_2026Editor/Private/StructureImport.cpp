@@ -3,6 +3,8 @@
 #include "StructureImport.h"
 
 #include "Dom/JsonObject.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpression.h"
 #include "Misc/FileHelper.h"
 #include "Misc/SecureHash.h"
 #include "PlatformStructureData.h"
@@ -80,7 +82,13 @@ namespace StructureImportPrivate
 		if (Types & static_cast<int32>(EStructureType::Ground)) { Names.Add(TEXT("Ground")); }
 		if (Types & static_cast<int32>(EStructureType::Ceiling)) { Names.Add(TEXT("Ceiling")); }
 		if (Types & static_cast<int32>(EStructureType::Wall)) { Names.Add(TEXT("Wall")); }
+		if (Types & static_cast<int32>(EStructureType::Roof)) { Names.Add(TEXT("Roof")); }
 		return Names.IsEmpty() ? TEXT("none") : FString::Join(Names, TEXT(", "));
+	}
+
+	FString DescribeSide(const EStructureSide Side)
+	{
+		return Side == EStructureSide::Interior ? TEXT("Interior") : Side == EStructureSide::Both ? TEXT("Both") : TEXT("Exterior");
 	}
 
 	FString DescribeBool(const bool bValue)
@@ -151,6 +159,7 @@ bool WEMStructureImport::ParseSettings(const FString& Json, FStructureSettings& 
 	Object->TryGetStringField(TEXT("exported"), OutSettings.Exported);
 	OutSettings.Categories = ReadStrings(Object, TEXT("categories"));
 	OutSettings.Types = ReadStrings(Object, TEXT("types"));
+	Object->TryGetStringField(TEXT("side"), OutSettings.Side);
 
 	return true;
 }
@@ -174,6 +183,10 @@ int32 WEMStructureImport::MakeTypeMask(const TConstArrayView<FString> Types, TAr
 		{
 			Mask |= static_cast<int32>(EStructureType::Wall);
 		}
+		else if (Type == TEXT("Roof"))
+		{
+			Mask |= static_cast<int32>(EStructureType::Roof);
+		}
 		else
 		{
 			OutUnknown.Add(Type);
@@ -181,6 +194,12 @@ int32 WEMStructureImport::MakeTypeMask(const TConstArrayView<FString> Types, TAr
 	}
 
 	return Mask;
+}
+
+bool WEMStructureImport::MakeSide(const FString& Side, EStructureSide& OutSide)
+{
+	OutSide = Side == TEXT("Interior") ? EStructureSide::Interior : Side == TEXT("Both") ? EStructureSide::Both : EStructureSide::Exterior;
+	return Side.IsEmpty() || Side == TEXT("Interior") || Side == TEXT("Both") || Side == TEXT("Exterior");
 }
 
 bool WEMStructureImport::MeasureCells(const double ExtentCm, const double CellSize, int32& OutCells)
@@ -269,6 +288,7 @@ TArray<FString> WEMStructureImport::DescribeChanges(const FStructureValues& Old,
 	Add(TEXT("Length"), FString::FromInt(Old.Length), FString::FromInt(New.Length));
 	Add(TEXT("Two-sided"), DescribeBool(Old.bTwoSided), DescribeBool(New.bTwoSided));
 	Add(TEXT("Types"), DescribeTypes(Old.Types), DescribeTypes(New.Types));
+	Add(TEXT("Side"), DescribeSide(Old.Side), DescribeSide(New.Side));
 	Add(TEXT("Categories"),
 		Old.Categories.IsEmpty() ? TEXT("none") : FString::Join(Old.Categories, TEXT(", ")),
 		New.Categories.IsEmpty() ? TEXT("none") : FString::Join(New.Categories, TEXT(", ")));
@@ -302,4 +322,32 @@ FString WEMStructureImport::HashFiles(const TConstArrayView<FString> Paths)
 	uint8 Digest[16];
 	Hash.Final(Digest);
 	return BytesToHex(Digest, UE_ARRAY_COUNT(Digest));
+}
+
+bool WEMStructureImport::MaskTranslucency(UMaterial& Material)
+{
+	UMaterialEditorOnlyData* Inputs = Material.GetEditorOnlyData();
+
+	if (Material.BlendMode != BLEND_Translucent || !Inputs)
+	{
+		return false;
+	}
+
+	Material.Modify();
+
+	// A mask already wired is kept; masked, the opacity input is never read, so it is let go.
+	if (!Inputs->OpacityMask.IsConnected() && Inputs->Opacity.Expression)
+	{
+		Inputs->OpacityMask.Connect(Inputs->Opacity.OutputIndex, Inputs->Opacity.Expression);
+	}
+
+	Inputs->Opacity.Expression = nullptr;
+
+	Material.BlendMode = BLEND_Masked;
+	Material.DitherOpacityMask = true;
+
+	// Dithered, a pixel is drawn with the chance Mask - Clip + 0.5, so at 0.5 that chance is the alpha itself.
+	Material.OpacityMaskClipValue = 0.5f;
+
+	return true;
 }

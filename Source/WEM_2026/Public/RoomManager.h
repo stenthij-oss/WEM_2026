@@ -337,10 +337,9 @@ struct FSurfaceMarkLayer
  * ----------
  * A platform is built as beams around an opening, and the opening is filled by structures - meshes
  * made for it: one two-sided structure, filling both of its faces, or two one-sided ones, one per
- * face. A face takes a structure whose types include its own: ground on a floor's Ground face,
- * ceiling on its Ceiling face, wall either side of a wall. The fill is drawn in the same beat as the
- * platform, from a
- * stream of its own, since what fills a platform can change where growth may go next. A tile that
+ * face. The two faces pair back to back: a floor is a roof or a ground (on the face looking along its
+ * Up) over a ceiling, or a ground over a ground, and a wall is wall on both faces. The fill is drawn in the same
+ * beat as the platform, from a stream of its own, since what fills a platform can change where growth may go next. A tile that
  * no structures could fill completely, laid a given way, is not laid that way, and the platform
  * that starts growth is always filled with load-bearing structures.
  *
@@ -354,8 +353,9 @@ struct FSurfaceMarkLayer
  * (ContinueChance, rising to MaxContinueChance at StreakForMaxChance).
  *
  * The two faces of a one-sided pair are not beside each other, but they are back to back: behind an
- * interior, growth reaches for an exterior, and behind an exterior for an interior
- * (bInteriorBacksExterior), read from the categories' names.
+ * interior, growth reaches for an exterior (bInteriorBacksExterior), each structure's Side saying which
+ * it is. A wall standing on an interior ground is an interior on the face that looks over it
+ * (bWallsFaceInteriorGrounds).
  *
  * A platform filled with anything not load-bearing blocks some of its beams: a wall the ones along
  * its top - the side its Up points to - so nothing is built onto it while more panels can still join beside it, and a floor or
@@ -532,18 +532,31 @@ public:
 	int32 StreakForMaxChance = 4;
 
 	/**
-	 * Draws the back of a one-sided face from the other side of an enclosure, with
-	 * InteriorBacksExteriorChance: behind a structure whose category is named for an interior, one named
-	 * for an exterior, and the other way round - where any structure that fits the back is one. Read from
-	 * the categories' names, so a category with "Interior" or "Exterior" in it takes part as soon as it is
-	 * made; a structure carrying both, or neither, is left to the usual draw.
+	 * Draws the back of an interior face from the exteriors, with InteriorBacksExteriorChance - where
+	 * any structure that fits the back is one. Each structure's Side says which it is; one of both sides
+	 * counts as an exterior here, and binds nothing behind itself. Behind an exterior, anything that
+	 * fits may follow.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures")
 	bool bInteriorBacksExterior = true;
 
-	/** The chance the back of an interior face is drawn from the exteriors, and the other way round, when that is on. */
+	/** The chance the back of an interior face is drawn from the exteriors, when that is on. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bInteriorBacksExterior"))
 	float InteriorBacksExteriorChance = 0.8f;
+
+	/**
+	 * Draws a wall's face from the interiors (those of both sides among them), with
+	 * WallsFaceInteriorGroundsChance, where it looks over an interior ground the wall stands on: a floor
+	 * meeting it in a corner whose Ground face, filled with an interior - not one of both sides - looks
+	 * back at the wall. That face is drawn first, so what goes behind it follows from it.
+	 * It outranks bInteriorBacksExterior, so a wall between two interior grounds is inside on both faces.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures")
+	bool bWallsFaceInteriorGrounds = true;
+
+	/** The chance a wall's face over an interior ground is drawn from the interiors, when that is on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Structures", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bWallsFaceInteriorGrounds"))
+	float WallsFaceInteriorGroundsChance = 0.95f;
 
 	/**
 	 * The chance each end of a fence panel, with room beyond it, carries its run on by another panel.
@@ -808,7 +821,7 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	bool bDebugProbeInFenceRun = false;
 
-	/** What that surface's platform is in its own frame, and its Up, as in "wall, up -Z". Readout only. */
+	/** What its fill makes that face, which side its structure stands for, and its platform's Up, as in "roof, exterior, up -Z". Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Coordinates")
 	FString DebugProbeRole;
 
@@ -1255,25 +1268,34 @@ private:
 	uint8 GetFillableWays(int32 TileIndex, EPlatformKind Kind) const;
 
 	/**
-	 * The usable structures that may fill one face of a platform: every two-sided one that fits it,
-	 * and every one-sided one that fits this face - but those only when some one-sided structure
-	 * fits the face behind, so a draw never leaves a face empty. The second face of a one-sided fill
-	 * takes one-sided structures alone.
+	 * The usable structures that may fill one face of a platform. For the first face, Front null:
+	 * every two-sided one that fits it, and every one-sided one that fits this face - but those only
+	 * when a one-sided structure that pairs with it fits the face behind, so a draw never leaves a face
+	 * empty. For the face behind Front: the one-sided structures that fit it and pair with Front.
 	 */
 	void GatherFillOptions(
 		const FGridPlatform& Platform,
 		int32 FaceSign,
-		bool bSecondFace,
+		const UPlatformStructureData* Front,
 		bool bLoadBearingOnly,
 		TArray<UPlatformStructureData*>& OutOptions) const;
 
 	/**
 	 * Draws the structures filling a platform that is about to be placed, from the structure
-	 * stream: a face first - a floor's Ground face, either face of a wall - then a structure for it,
-	 * and when that is one-sided, one for the face behind, from the other side of an enclosure where
-	 * bInteriorBacksExterior says so. False when nothing fits.
+	 * stream: a face first - a floor's face looking along its Up, a wall's face over an interior ground
+	 * where only one is, else either - then a structure for it, and when that is one-sided, one for the
+	 * face behind that pairs with it. Interiors and exteriors are drawn where bWallsFaceInteriorGrounds
+	 * and bInteriorBacksExterior say so. False when nothing fits.
 	 */
 	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
+
+	/**
+	 * Which faces of a wall about to be placed look over an interior ground it stands on, as bits:
+	 * 1 for its positive face, 2 for its negative one. Such a ground is a floor's Ground face, filled
+	 * with an interior, meeting the wall in a corner around an edge they share and looking at the wall,
+	 * so that the wall's face looking back into the corner looks over it. 0 for a floor.
+	 */
+	uint8 GetFacesOverInteriorGround(const FGridPlatform& Wall) const;
 
 	/**
 	 * Draws one of the options for one face of a platform about to be placed, from the structure

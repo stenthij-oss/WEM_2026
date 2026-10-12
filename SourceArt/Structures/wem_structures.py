@@ -1,15 +1,15 @@
 # WEM structures: a Blender add-on for authoring the structures that fill WEM_2026's segments.
 #
 # A structure is a mesh that fills the opening of a segment between its beams. This add-on keeps the
-# settings Unreal needs on the object itself - categories, types, two-sided, load-bearing, holds
-# items, fence, may lie sideways and weight - and exports the object as a .glb with a settings .json
+# settings Unreal needs on the object itself - categories, types, side, two-sided, load-bearing,
+# holds items, fence, may lie sideways and weight - and exports the object as a .glb with a settings .json
 # beside it, which the structure importer in Unreal reads. Install it as an add-on, or open it in the
 # Text Editor and press Run Script. See README.md beside it.
 
 bl_info = {
     "name": "WEM Structures",
     "author": "WEM_2026",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar (N) > WEM",
     "description": "Settings and export for WEM_2026 segment structures",
@@ -43,13 +43,25 @@ TOLERANCE = 0.01
 ONE_SIDED_DEPTH = 0.10
 TWO_SIDED_DEPTH = 0.20
 
+# A floor is a roof or a ground over a ceiling, or a ground over a ground (the second one upside down),
+# never a roof over a ground; a wall is wall on both faces. In that order, so files from before roofs
+# read the same.
 TYPE_ITEMS = [
-    ("GROUND", "Ground", "The top of a floor"),
-    ("CEILING", "Ceiling", "The underside of a floor"),
+    ("GROUND", "Ground", "A floor's walked face: its top, or its underside under another ground"),
+    ("CEILING", "Ceiling", "The underside of a floor, under a roof or a ground"),
     ("WALL", "Wall", "Either face of a wall"),
+    ("ROOF", "Roof", "The top of a floor, over a ceiling"),
 ]
 
-TYPE_NAMES = {"GROUND": "Ground", "CEILING": "Ceiling", "WALL": "Wall"}
+TYPE_NAMES = {"GROUND": "Ground", "CEILING": "Ceiling", "WALL": "Wall", "ROOF": "Roof"}
+
+SIDE_ITEMS = [
+    ("EXTERIOR", "Exterior", "Outside: anything may stand behind it"),
+    ("INTERIOR", "Interior", "Inside a room: growth reaches for an exterior behind it"),
+    ("BOTH", "Both", "Inside or outside: it fills a face asked to be either, and binds nothing behind it"),
+]
+
+SIDE_NAMES = {"EXTERIOR": "Exterior", "INTERIOR": "Interior", "BOTH": "Both"}
 
 # Category asset name -> display name, as last read from categories.json.
 _categories = {}
@@ -126,10 +138,17 @@ class WEMStructureSettings(bpy.types.PropertyGroup):
 
     types: bpy.props.EnumProperty(
         name="Types",
-        description="The faces the structure may fill. A two-sided one needs the types of both faces: Ground and Ceiling for a floor",
+        description="What the structure may be. A two-sided one is both faces: Ground for a floor, or Roof and Ceiling; Wall for a wall",
         items=TYPE_ITEMS,
         options={"ENUM_FLAG"},
         default={"GROUND", "CEILING", "WALL"},
+    )
+
+    side: bpy.props.EnumProperty(
+        name="Side",
+        description="Which side of an enclosure it stands for",
+        items=SIDE_ITEMS,
+        default="EXTERIOR",
     )
 
     two_sided: bpy.props.BoolProperty(
@@ -246,7 +265,9 @@ def check(obj, context):
     elif settings.two_sided and low.z > 0.0005:
         problems.append(f"The back has to lie on Z = 0: the lowest point is at Z = {low.z:.4f} m.")
 
-    if high.z < depth - TOLERANCE:
+    # A two-sided structure thinner than the segment is centred in it on export, so only a
+    # one-sided one has to reach its face.
+    if not settings.two_sided and high.z < depth - TOLERANCE:
         side = "two-sided" if settings.two_sided else "one-sided"
         problems.append(f"A {side} structure reaches Z = {depth:.2f} m, its face: the highest point is at Z = {high.z:.4f} m.")
 
@@ -268,8 +289,8 @@ def check(obj, context):
 
     if not settings.types:
         problems.append("Choose at least one type.")
-    elif settings.two_sided and "WALL" not in settings.types and not {"GROUND", "CEILING"} <= set(settings.types):
-        problems.append("A two-sided structure covers both faces: as a floor it needs Ground and Ceiling, or else Wall.")
+    elif settings.two_sided and not ({"WALL", "GROUND"} & set(settings.types) or {"ROOF", "CEILING"} <= set(settings.types)):
+        problems.append("A two-sided structure covers both faces: as a floor it needs Ground, or Roof and Ceiling; or else Wall.")
 
     if not bpy.data.filepath:
         problems.append("Save the .blend first, so the settings file can say where the structure came from.")
@@ -295,6 +316,7 @@ def write_settings(path, obj, width, length, low, high):
         "twoSided": settings.two_sided,
         "categories": settings.get_categories(),
         "types": [TYPE_NAMES[key] for key, _, _ in TYPE_ITEMS if key in settings.types],
+        "side": SIDE_NAMES[settings.side],
         "loadBearing": settings.load_bearing,
         "holdsItems": settings.holds_items,
         "fence": settings.fence and settings.two_sided,
@@ -343,6 +365,29 @@ def format_settings(data):
     return "\n".join(lines) + "\n"
 
 
+def two_sided_lift(obj, low, high):
+    """How far to raise a two-sided structure thinner than the segment so it sits centred in it."""
+    if not get_settings(obj).two_sided or high.z >= TWO_SIDED_DEPTH - TOLERANCE:
+        return 0.0
+    return (TWO_SIDED_DEPTH - (high.z + low.z)) / 2.0
+
+
+def export_gltf(filepath):
+    bpy.ops.export_scene.gltf(
+        filepath=filepath,
+        export_format="GLB",
+        use_selection=True,
+        # Only this scene: otherwise whatever is selected in the file's other scenes comes along.
+        use_active_scene=True,
+        export_apply=True,
+        export_yup=True,
+        export_normals=True,
+        export_tangents=True,
+        export_materials="EXPORT",
+        export_animations=False,
+    )
+
+
 def export_structure(obj, context, changed=None):
     """
     Checks the object and exports it. Returns the problems that stopped it, or an empty list. When
@@ -379,17 +424,21 @@ def export_structure(obj, context, changed=None):
     target = os.path.join(folder, obj.name + ".glb")
     fresh = os.path.join(folder, obj.name + ".new.glb")
 
-    bpy.ops.export_scene.gltf(
-        filepath=fresh,
-        export_format="GLB",
-        use_selection=True,
-        export_apply=True,
-        export_yup=True,
-        export_normals=True,
-        export_tangents=True,
-        export_materials="EXPORT",
-        export_animations=False,
-    )
+    # A two-sided structure thinner than the segment is raised so it sits centred between both faces.
+    lift = two_sided_lift(obj, low, high)
+    if lift:
+        low, high = low.copy(), high.copy()
+        low.z += lift
+        high.z += lift
+        obj.location.z += lift
+        context.view_layer.update()
+
+    try:
+        export_gltf(fresh)
+    finally:
+        if lift:
+            obj.location.z -= lift
+            context.view_layer.update()
 
     mesh_changed = True
     if os.path.isfile(target):
@@ -500,7 +549,7 @@ class WEM_OT_export_selected(bpy.types.Operator):
 class WEM_OT_copy_settings(bpy.types.Operator):
     bl_idname = "wem.copy_settings"
     bl_label = "Copy Settings to Selected"
-    bl_description = "Give every selected mesh the active object's WEM settings: types, categories, two-sided, fence, load-bearing, holds items, may lie sideways and weight"
+    bl_description = "Give every selected mesh the active object's WEM settings: types, side, categories, two-sided, fence, load-bearing, holds items, may lie sideways and weight"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -508,7 +557,7 @@ class WEM_OT_copy_settings(bpy.types.Operator):
         targets = [o for o in context.selected_objects if o.type == "MESH" and o != context.active_object]
         for obj in targets:
             settings = get_settings(obj)
-            for name in ("categories", "types", "two_sided", "load_bearing", "holds_items", "fence", "may_lie_sideways", "weight"):
+            for name in ("categories", "types", "side", "two_sided", "load_bearing", "holds_items", "fence", "may_lie_sideways", "weight"):
                 setattr(settings, name, getattr(source, name))
         self.report({"INFO"}, f"Settings copied to {len(targets)} object(s).")
         return {"FINISHED"}
@@ -541,6 +590,7 @@ class WEM_PT_structure(bpy.types.Panel):
 
         layout.label(text="Types")
         layout.row().prop(settings, "types", expand=True)
+        layout.row().prop(settings, "side", expand=True)
 
         row = layout.row()
         row.label(text="Categories")

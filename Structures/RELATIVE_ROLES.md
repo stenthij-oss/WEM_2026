@@ -6,7 +6,7 @@ Planned and approved 2026-10-09, built 2026-10-09/10 on branch `segment-structur
 
 Ground, wall and ceiling stop being world directions. Every segment carries its own **Up** (`FGridPlatform::Up`), one of the six lattice directions, and its role follows from that:
 
-- **Floor** (ground and ceiling): Up lies along the segment's normal. The face looking along Up is its **Ground** and the other one its **Ceiling**.
+- **Floor**: Up lies along the segment's normal. The face looking along Up is its **Ground** (or, since roofs, its **Roof**) and the other one its **Ceiling** (or the ground under a ground) - see [Roofs and sides](#roofs-and-sides).
 - **Wall:** Up lies in the segment's plane. Both faces are Wall, and Up is the way its structures stand.
 
 So Ground always means "the face pointing up" - up in the segment's own frame, which need not be the world's.
@@ -24,11 +24,12 @@ The first segment is a floor with Up = +Z, and so is every segment saved before 
 | Grid \| Up: **Quarter-Turn** + Quarter Turn Chance | `bQuarterTurn`, `QuarterTurnChance` | off, 0.15 | A segment carrying a wall on in the wall's own plane becomes a floor whose Ground looks out of one of the wall's holding faces. Floors open out of walls. |
 | Grid \| Up: **Walls Stand On Grounds** + Walls Stand Chance | `bWallsStandOnGrounds`, `WallsStandChance` | on, 0.8 | Rule 1. Off a ground that holds items, a wall about to hang below it is drawn again with the chance. |
 | Grid \| Up: **Floor Or Ceiling By Opposite Edge** + Floors Close Rooms Chance | `bFloorsCloseRooms`, `FloorsCloseRoomsChance` | on, 0.8 | Rule 2. Off a wall's holding face, a floor goes to the end the room on that side still needs: the foot when a ceiling closes the top, the top when a ground runs along the foot, the foot when it has neither. A floor about to go to the other end is drawn again with the chance. |
-| Grid \| Structures: **Interior Backs Exterior** + chance | `bInteriorBacksExterior`, `InteriorBacksExteriorChance` | on, 0.8 | Rule 3. With the chance, the back of a one-sided `Interior…` face is drawn only from `Exterior…` structures that fit, and the other way round. |
+| Grid \| Structures: **Interior Backs Exterior** + chance | `bInteriorBacksExterior`, `InteriorBacksExteriorChance` | on, 0.8 | Rule 3. With the chance, the back of a one-sided interior face is drawn only from the exteriors that fit. Behind an exterior, anything. Each structure's **Side** says which it is. |
+| Grid \| Structures: **Walls Face Interior Grounds** + chance | `bWallsFaceInteriorGrounds`, `WallsFaceInteriorGroundsChance` | on, 0.95 | Rule 4. A wall's face looking over an interior ground the wall stands on is drawn from the interiors. |
 
 "Holds items" is the structure's *Holds items* on that face. A face with no structure holds items. Both faces of a two-sided structure count.
 
-Readout: **Debug Probe Role** (Grid \| Coordinates) names what the probed face is and its segment's Up, as in `ceiling, up -Z`.
+Readout: **Debug Probe Role** (Grid \| Coordinates) names what the probed face's fill makes it, which side its structure stands for, and its segment's Up, as in `roof, exterior, up -Z`.
 
 ## What reads the segment's Up instead of world Z
 
@@ -61,7 +62,7 @@ What stays the world's: tiles' *Horizontal only / Vertical only*, `VerticalPlace
 - **When a turned Up can't be filled** by any structure, the segment takes the Up it would have inherited, then the Up of another segment it touches (in index order), then +Z. The candidate lists are still kept for the world's Up (+Z), so a placement that *only* a turned Up could fill is never drawn.
 - **The rules redraw** from the same tile and kind, at most four times a beat (`MaxRuleRedraws`), and only roll when a placement goes against a rule, so a beat where no rule applies draws exactly as before. The chance is the chance a placement going against the rule is sent back. Where standing and hanging are equally on offer, 0.8 gives about five standing walls to every hanging one; 1.0 makes the rule nearly strict.
 - **Rule 2's "ceiling" and "ground"** are any floor (a segment whose Up lies along its normal) running along that edge on the same side of the wall. A wall lying there doesn't count. A room closed at both ends wants nothing, and a face that holds no items faces no room.
-- **Rule 3** reads "Interior" and "Exterior" from each category's asset name and display name. A structure carrying both is neither. The back is still pulled by its neighbours among the structures left. The test kit has no interior categories yet, so in NewMap the rule does nothing until some arrive.
+- **Rule 3** first read "Interior" and "Exterior" from each category's name, both ways round. Since roofs and sides it reads each structure's **Side** and binds only interiors (below). The back is still pulled by its neighbours among the structures left.
 - **Fence corners** use the same tile laid the same way round when that keeps the panel as tall along Up (always, for a wall standing upright in the world), else turned when the tile may turn, else there is no corner to turn.
 - **Hang from ceilings** reads a floor's Ceiling face, whichever way it points: a wall standing on an upside-down floor in the world hangs from it, and so comes out the right way up.
 
@@ -119,6 +120,91 @@ objects hanging from the ceilings overhead, standing on those faces as on any ot
 
 - With the turns on, structures that may not lie sideways can't fill some sideways walls. Those segments fall back to their parent's Up or +Z, so a turned region can snap back to the world's up where the kit doesn't fit it.
 - Tile orientation stays the world's (decision 2): a horizontal-only tile can be a wall upside down.
-- `SourceArt/Structures/README.md` and the Blender add-on still describe Ground and Ceiling as a floor's top and underside. They weren't touched, since both have uncommitted edits of yours.
+- `SourceArt/Structures/README.md` and the Blender add-on now describe the four types and the side (roofs and sides, below), edited on top of your uncommitted changes there.
 - On a wall's faces objects stand out sideways, as they always did on world walls.
 - The rules make growth depend a little on fills (through *holds items*), as load-bearing already did. A seed grows differently from 981bf29 wherever a rule applies.
+
+## Roofs and sides
+
+Asked 2026-10-10: a **Roof** type, and every structure saying whether it is **interior or exterior**.
+Behind an interior an exterior; a ceiling has a roof on its other side, and an interior ground an
+exterior ground.
+
+**The user's decisions:**
+
+- A floor is **a roof over a ceiling, a ground over a ceiling, or a ground over a ground**. Never a roof
+  over a ground. (First asked as only roof over ceiling and ground over ground; corrected the same day:
+  "ceiling has either ground or roof on top of it, not necessarily roof".)
+- **Only interiors are bound.** Behind an exterior, anything that pairs may follow: exteriors back to back
+  (a garden wall, earth on both sides of a slab, a porch roof over a porch ceiling) or an interior.
+- **Rule 3 keeps its chance** (0.8), now reading the new property.
+- New: **interior grounds almost always raise interior walls** on the side facing the ground (rule 4).
+- Some structures are **both interior and exterior** (asked the same day): Side has a third value, Both.
+
+**What changed:**
+
+- `EStructureType::Roof`, and `UPlatformStructureData::Side` (`EStructureSide`: Exterior, the default,
+  Interior, or Both). The old category-name reading is gone; a category named `Interior…` no longer makes
+  a structure an interior.
+- What a face takes (`WEMStructures::GetFaceTypes`): the face looking along Up takes Ground or Roof, the
+  other one Ceiling or Ground, a wall's faces Wall. What pairs back to back (`GetBackTypes`,
+  `PairsBackToBack`): Roof with Ceiling, Ceiling with Roof or Ground, Ground with Ceiling or Ground,
+  Wall with Wall. A one-sided structure is
+  offered only where one that pairs with it fits behind; the face behind takes only those. A two-sided
+  structure has to pair with itself: Ground for a floor (ground both faces), or Roof and Ceiling.
+- Rule 4 (`GetFacesOverInteriorGround`): a floor meeting the wall in a corner around an edge they
+  share, whose face looking into that corner is its Ground (the one along its Up) and an interior. The
+  wall's face looking back into the corner is drawn from the interiors with the chance. Where only one
+  face of a wall is over an interior ground, that face is drawn first, so rule 3 then puts an exterior
+  behind it. Rule 4 outranks rule 3, so a wall between two rooms is inside on both faces.
+- The importer reads `"side"` and `"Roof"`; the add-on has a Side switch and a Roof type and writes
+  `"side"` into every file it exports. A file without `"side"` stands for an exterior.
+- The probe readout names the face by its fill (`roof`, `ground`, ...) and its side.
+
+**My calls:**
+
+- "Perpendicular, facing where the ground tile is" is read in the floor's own frame: the wall stands on
+  the ground's walked face. Off an upside-down interior ground, the wall below it counts; a wall hanging
+  under a floor does not, and neither does an interior ground facing down that is the back of another.
+- A structure that is several types fills any face one of them fits, and pairs with whatever pairs with
+  any of them.
+- The default for **Types** stays Ground, Ceiling and Wall, so assets saved with the default keep it.
+  Roof has to be ticked.
+- **Both** counts as either wherever a rule asks for a side (an exterior behind an interior, an
+  interior over an interior ground), but binds nothing itself: behind it anything follows, and a ground
+  of both sides does not make the walls on it interiors.
+- Rule 4 only acts on the wall's draw. A floor growing at the foot of an interior wall is not made an
+  interior by it; the category pull still leans it that way where the categories match.
+
+**Consequences to know about:**
+
+- Your `ExtRural_Ground_RoofTile_*` are typed Ground, so they grow as walkable grounds, under ceilings
+  as well as over them. Ticking Roof instead of Ground on them in Blender, and exporting them again,
+  keeps them to tops over ceilings.
+- An interior ground may have a ceiling under it as well as a ground; rule 3 makes that back an
+  exterior four times in five.
+- The underside of a ground-over-ground floor faces down and holds items unless its structure says
+  otherwise, so objects stand on it upside down, as on any face.
+- Rules 1, 2 and Hang From Ceilings still read a floor's faces by position: the face along Up is its
+  ground, the other its ceiling, even where that other face is filled with an upside-down ground.
+
+**Measured** (headless: all 77 WEM product tests pass, `Roles.WallsFaceInteriorGrounds` new among them):
+
+| Test | Result |
+|---|---|
+| `Fill.OneSidedPairs` (200 beats, one-sided ground, roof, ceiling and wall per size) | 55 floors roof over ceiling, 18 ground over ceiling, 23 ground over ground, no roof over a ground |
+| `Roles.Fill` (64 fills each way up) | upside down: 32 roof over ceiling with the roof underneath, 15 ground over ceiling, 17 ground over ground |
+| `Roles.InteriorBacksExterior` at 1.0 (an interior, two exteriors and a wall of both sides) | 101 interior faces, 0 with an interior behind; behind exteriors 101 interiors and 258 exteriors; the wall of both sides goes behind interiors and has interiors behind it |
+| same, rule off | 120 interior faces, 32 with an interior behind |
+| `Roles.WallsFaceInteriorGrounds` at 1.0 | 100 of 100 walls on a room's edge inside over the room and outside behind; 100 of 100 between two rooms inside both faces; rule off, 43 of 100 inside over the room |
+| `Roles.TurnedGrowth` (all three turns at 0.3, roofs in the kit) | 400 placements, 0 drift, every fill pairs |
+
+Stress tests, all pass (run with the editor open): `Fill.VerifyEvery1000` 1000 placements, 0 drift;
+`Fence.RunLength` mean run 9.08 panels, as before; `LoadBearing.Stall` median 3466 platforms all
+load-bearing, 3348 with 5% light, as before. `Perf.Beat` (one best-of-three run, no like-for-like
+baseline): plain slabs 1.316 ms, test kit 1.470 ms, test kit turned 1.560 ms a beat.
+
+`Perf.CategoryPatches` moved: default pull median 11.2 (6.8 to 17.3 over four seeds), strong 60.7.
+`NOTES.md` has 22.0 and 125.6 from 2026-10-09, before relative roles as well, so it is not a
+like-for-like comparison. The test kit has no roofs, so its floors are now ground over ceiling or
+ground over ground, and some undersides draw from its grounds' categories instead of its ceilings'.

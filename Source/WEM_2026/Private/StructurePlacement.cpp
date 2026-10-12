@@ -32,14 +32,57 @@ bool WEMStructures::IsWall(const int32 NormalAxis, const EGridFace Up)
 	return FaceAxis(Up) != NormalAxis;
 }
 
-EStructureType WEMStructures::GetFaceType(const int32 NormalAxis, const int32 FaceSign, const EGridFace Up)
+EStructureType WEMStructures::GetFaceTypes(const int32 NormalAxis, const int32 FaceSign, const EGridFace Up)
 {
 	if (IsWall(NormalAxis, Up))
 	{
 		return EStructureType::Wall;
 	}
 
-	return FaceSign == WEMGrid::FaceSign(Up) ? EStructureType::Ground : EStructureType::Ceiling;
+	return FaceSign == WEMGrid::FaceSign(Up)
+		? EStructureType::Ground | EStructureType::Roof
+		: EStructureType::Ceiling | EStructureType::Ground;
+}
+
+EStructureType WEMStructures::GetBackTypes(const EStructureType Types)
+{
+	EStructureType Back = EStructureType::None;
+
+	// A roof is over a ceiling, and a ceiling under a roof or a ground.
+	if (EnumHasAnyFlags(Types, EStructureType::Roof))
+	{
+		Back |= EStructureType::Ceiling;
+	}
+
+	if (EnumHasAnyFlags(Types, EStructureType::Ceiling))
+	{
+		Back |= EStructureType::Roof | EStructureType::Ground;
+	}
+
+	// A ground is over a ceiling or over another ground, upside down beneath it.
+	if (EnumHasAnyFlags(Types, EStructureType::Ground))
+	{
+		Back |= EStructureType::Ceiling | EStructureType::Ground;
+	}
+
+	return Back | (Types & EStructureType::Wall);
+}
+
+EStructureType WEMStructures::GetTypesOnFace(const UPlatformStructureData& Structure, const int32 NormalAxis, const int32 FaceSign, const EGridFace Up)
+{
+	return static_cast<EStructureType>(Structure.Types) & GetFaceTypes(NormalAxis, FaceSign, Up);
+}
+
+bool WEMStructures::PairsBackToBack(
+	const UPlatformStructureData& Front,
+	const UPlatformStructureData& Back,
+	const int32 NormalAxis,
+	const int32 FrontSign,
+	const EGridFace Up)
+{
+	return EnumHasAnyFlags(
+		GetBackTypes(GetTypesOnFace(Front, NormalAxis, FrontSign, Up)),
+		GetTypesOnFace(Back, NormalAxis, -FrontSign, Up));
 }
 
 bool WEMStructures::FitsShape(
@@ -101,13 +144,13 @@ bool WEMStructures::FitsFace(
 {
 	bOutTurned = false;
 
-	if (!Structure.HasType(GetFaceType(NormalAxis, FaceSign, Up)))
+	if (GetTypesOnFace(Structure, NormalAxis, FaceSign, Up) == EStructureType::None)
 	{
 		return false;
 	}
 
-	// A two-sided structure is both faces at once, so it has to be allowed on the other one as well.
-	if (Structure.bTwoSided && !Structure.HasType(GetFaceType(NormalAxis, -FaceSign, Up)))
+	// A two-sided structure is both faces at once, so it has to pair with itself back to back.
+	if (Structure.bTwoSided && !PairsBackToBack(Structure, Structure, NormalAxis, FaceSign, Up))
 	{
 		return false;
 	}

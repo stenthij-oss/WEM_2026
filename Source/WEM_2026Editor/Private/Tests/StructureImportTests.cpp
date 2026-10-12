@@ -7,6 +7,8 @@
 #include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
 #include "HAL/FileManager.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialExpressionConstant.h"
 #include "MeshDescription.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -69,9 +71,23 @@ bool FStructureImportSettingsTest::RunTest(const FString& Parameters)
 
 	TArray<FString> Unknown;
 	TestEqual(TEXT("Wall alone"), WEMStructureImport::MakeTypeMask(Settings.Types, Unknown), static_cast<int32>(EStructureType::Wall));
-	TestEqual(TEXT("All three types"), WEMStructureImport::MakeTypeMask({ TEXT("Ground"), TEXT("Ceiling"), TEXT("Wall"), TEXT("Roof") }, Unknown),
-		static_cast<int32>(EStructureType::Ground | EStructureType::Ceiling | EStructureType::Wall));
+	TestEqual(TEXT("All four types"), WEMStructureImport::MakeTypeMask({ TEXT("Ground"), TEXT("Ceiling"), TEXT("Wall"), TEXT("Roof"), TEXT("Stair") }, Unknown),
+		static_cast<int32>(EStructureType::Ground | EStructureType::Ceiling | EStructureType::Wall | EStructureType::Roof));
 	TestEqual(TEXT("A type it does not know is reported"), Unknown.Num(), 1);
+
+	// The side: a file from before sides stands for an exterior.
+	EStructureSide Side = EStructureSide::Interior;
+	TestTrue(TEXT("A file without a side is known"), Settings.Side.IsEmpty() && WEMStructureImport::MakeSide(Settings.Side, Side));
+	TestEqual(TEXT("And stands for an exterior"), Side, EStructureSide::Exterior);
+
+	FString Inside = FacadeSettings;
+	Inside.ReplaceInline(TEXT("\"types\": [\"Wall\"],"), TEXT("\"types\": [\"Wall\"],\n  \"side\": \"Interior\","));
+	TestTrue(TEXT("A file with a side reads"), WEMStructureImport::ParseSettings(Inside, Settings, Error));
+	TestTrue(TEXT("And says Interior"), WEMStructureImport::MakeSide(Settings.Side, Side) && Side == EStructureSide::Interior);
+	TestTrue(TEXT("Exterior is known"), WEMStructureImport::MakeSide(TEXT("Exterior"), Side) && Side == EStructureSide::Exterior);
+	TestTrue(TEXT("And so is Both"), WEMStructureImport::MakeSide(TEXT("Both"), Side) && Side == EStructureSide::Both);
+	TestFalse(TEXT("A side it does not know is reported"), WEMStructureImport::MakeSide(TEXT("Inside"), Side));
+	TestEqual(TEXT("And stands for an exterior"), Side, EStructureSide::Exterior);
 
 	// A file of another format, or one missing what the importer needs, is refused rather than guessed at.
 	FString Newer = FacadeSettings;
@@ -236,18 +252,20 @@ bool FStructureImportChangesTest::RunTest(const FString& Parameters)
 
 	TestEqual(TEXT("Nothing changed, nothing reported"), WEMStructureImport::DescribeChanges(Before, Before).Num(), 0);
 
-	// A user who switched load-bearing off in Unreal, and a file that adds a category and a type: the
-	// report says what the file put back and what it changed.
+	// A user who switched load-bearing off in Unreal, and a file that adds a category and two types and
+	// makes it an interior: the report says what the file put back and what it changed.
 	FStructureValues Edited = Before;
 	Edited.bLoadBearing = false;
 
 	FStructureValues FromFile = Before;
-	FromFile.Types |= static_cast<int32>(EStructureType::Ground);
+	FromFile.Types |= static_cast<int32>(EStructureType::Ground | EStructureType::Roof);
+	FromFile.Side = EStructureSide::Interior;
 	FromFile.Categories.Add(TEXT("DA_Category_NaturalSand"));
 
 	const TArray<FString> Changes = WEMStructureImport::DescribeChanges(Edited, FromFile);
-	TestEqual(TEXT("Three values changed"), Changes.Num(), 3);
-	TestTrue(TEXT("The types"), Changes.Contains(TEXT("Types: Wall -> Ground, Wall")));
+	TestEqual(TEXT("Four values changed"), Changes.Num(), 4);
+	TestTrue(TEXT("The types"), Changes.Contains(TEXT("Types: Wall -> Ground, Wall, Roof")));
+	TestTrue(TEXT("The side"), Changes.Contains(TEXT("Side: Exterior -> Interior")));
 	TestTrue(TEXT("The categories"), Changes.Contains(TEXT("Categories: DA_Category_ExteriorUrban -> DA_Category_ExteriorUrban, DA_Category_NaturalSand")));
 	TestTrue(TEXT("And the setting made in Unreal that the file overwrote"), Changes.Contains(TEXT("Load-bearing: off -> on")));
 
@@ -275,6 +293,31 @@ bool FStructureImportHashTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("A missing file gives no hash"), WEMStructureImport::HashFiles({ Folder / TEXT("Missing.glb") }).IsEmpty());
 
 	IFileManager::Get().DeleteDirectory(*Folder, /*RequireExists=*/false, /*Tree=*/true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureImportMaskTranslucencyTest, "WEM.Structures.Import.MaskTranslucency", StructureImportTestsPrivate::TestFlags)
+
+bool FStructureImportMaskTranslucencyTest::RunTest(const FString& Parameters)
+{
+	// As glTF's blended alpha comes in: translucent, the alpha wired to the opacity.
+	UMaterial* Material = NewObject<UMaterial>(GetTransientPackage());
+	UMaterialExpressionConstant* Alpha = NewObject<UMaterialExpressionConstant>(Material);
+	Material->BlendMode = BLEND_Translucent;
+	Material->GetEditorOnlyData()->Opacity.Connect(0, Alpha);
+
+	TestTrue(TEXT("A translucent material is changed"), WEMStructureImport::MaskTranslucency(*Material));
+	TestTrue(TEXT("It is masked"), Material->BlendMode == BLEND_Masked);
+	TestTrue(TEXT("Its mask is dithered"), Material->DitherOpacityMask != 0);
+	TestEqual(TEXT("Clipped at a half, so the share of pixels drawn is the alpha"), Material->OpacityMaskClipValue, 0.5f);
+	TestTrue(TEXT("The alpha drives the mask"), Material->GetEditorOnlyData()->OpacityMask.Expression == Alpha);
+	TestNull(TEXT("and no longer the opacity"), Material->GetEditorOnlyData()->Opacity.Expression);
+	TestFalse(TEXT("Once masked, it is left alone"), WEMStructureImport::MaskTranslucency(*Material));
+
+	UMaterial* Opaque = NewObject<UMaterial>(GetTransientPackage());
+	TestFalse(TEXT("An opaque material is left alone"), WEMStructureImport::MaskTranslucency(*Opaque));
+	TestTrue(TEXT("and stays opaque"), Opaque->BlendMode == BLEND_Opaque);
+
 	return true;
 }
 

@@ -4,9 +4,11 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "GridMath.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/AutomationTest.h"
 #include "RoomManagerTestHelpers.h"
+#include "StructureCategory.h"
 #include "StructurePlacement.h"
 
 namespace StructureRoleTestsPrivate
@@ -59,7 +61,8 @@ namespace StructureRoleTestsPrivate
 
 	/**
 	 * Why a platform's fill does not fit it as it stands, its Up included, or an empty string when it
-	 * does: a structure on each face fitting that face, the same one on both when it is two-sided.
+	 * does: a structure on each face fitting that face, the two pairing back to back, the same one on
+	 * both when it is two-sided.
 	 */
 	FString CheckFill(const FGridPlatform& Platform)
 	{
@@ -91,7 +94,21 @@ namespace StructureRoleTestsPrivate
 			return FString::Printf(TEXT("%s does not fit the negative face"), *Negative->GetName());
 		}
 
+		if (!WEMStructures::PairsBackToBack(*Positive, *Negative, NormalAxis, 1, Platform.Up))
+		{
+			return FString::Printf(TEXT("%s and %s do not pair back to back"), *Positive->GetName(), *Negative->GetName());
+		}
+
 		return FString();
+	}
+
+	/** A one-sided structure of one type, standing for one side of an enclosure. */
+	UPlatformStructureData* MakeSided(const TCHAR* Name, const EStructureType Type, const EStructureSide Side, TArray<UObject*>& OutRooted)
+	{
+		UPlatformStructureData* Structure = MakeStructure(Name, 16, 16, Type, false);
+		Structure->Side = Side;
+		OutRooted.Add(Structure);
+		return Structure;
 	}
 }
 
@@ -187,22 +204,51 @@ bool FStructureRoleFillTest::RunTest(const FString& Parameters)
 	TArray<UObject*> Rooted;
 
 	UPlatformStructureData* Ground = MakeStructure(TEXT("TestRoleGround"), 16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* Roof = MakeStructure(TEXT("TestRoleRoof"), 16, 16, EStructureType::Roof, false);
 	UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestRoleCeiling"), 16, 16, EStructureType::Ceiling, false);
 	UPlatformStructureData* Wall = MakeStructure(TEXT("TestRoleWall"), 16, 16, EStructureType::Wall, false);
-	Rooted.Append({ Ground, Ceiling, Wall });
+	Rooted.Append({ Ground, Roof, Ceiling, Wall });
 
-	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, TArray<TObjectPtr<UPlatformStructureData>>{ Ground, Ceiling, Wall });
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, TArray<TObjectPtr<UPlatformStructureData>>{ Ground, Roof, Ceiling, Wall });
 	UPlatformTileData* Square = Manager->Tiles[0];
 
-	// Upside down, a floor's ground goes on its underside and its ceiling on its top.
-	FGridPlatform UpsideDown = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr, EGridFace::NegZ);
-	TestTrue(TEXT("An upside-down floor is filled"), FRoomManagerTestAccess::DrawFill(*Manager, UpsideDown));
-	TestEqual(TEXT("Its underside takes the ground"), UpsideDown.NegativeStructure.Get(), Ground);
-	TestEqual(TEXT("Its top takes the ceiling"), UpsideDown.PositiveStructure.Get(), Ceiling);
+	// Filled again and again, a floor is a roof or a ground over a ceiling, or a ground over a ground,
+	// the roof on the face looking along its Up: upside down, on its underside.
+	auto TallyFloors = [&](const EGridFace Up, int32& OutRoofs, int32& OutGroundsOverCeilings, int32& OutGrounds)
+	{
+		OutRoofs = 0;
+		OutGroundsOverCeilings = 0;
+		OutGrounds = 0;
 
-	FGridPlatform RightWayUp = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr, EGridFace::PosZ);
-	TestTrue(TEXT("The right way up it is filled"), FRoomManagerTestAccess::DrawFill(*Manager, RightWayUp));
-	TestEqual(TEXT("Its top takes the ground"), RightWayUp.PositiveStructure.Get(), Ground);
+		for (int32 Fill = 0; Fill < 64; ++Fill)
+		{
+			FGridPlatform Floor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr, Up);
+
+			if (!FRoomManagerTestAccess::DrawFill(*Manager, Floor))
+			{
+				AddError(TEXT("A floor is not filled"));
+				return;
+			}
+
+			const bool bUpPositive = WEMGrid::FaceSign(Up) > 0;
+			const UPlatformStructureData* AlongUp = bUpPositive ? Floor.PositiveStructure.Get() : Floor.NegativeStructure.Get();
+			const UPlatformStructureData* AgainstUp = bUpPositive ? Floor.NegativeStructure.Get() : Floor.PositiveStructure.Get();
+
+			OutRoofs += AlongUp == Roof && AgainstUp == Ceiling ? 1 : 0;
+			OutGroundsOverCeilings += AlongUp == Ground && AgainstUp == Ceiling ? 1 : 0;
+			OutGrounds += AlongUp == Ground && AgainstUp == Ground ? 1 : 0;
+		}
+	};
+
+	int32 Roofs, GroundsOverCeilings, Grounds;
+	TallyFloors(EGridFace::NegZ, Roofs, GroundsOverCeilings, Grounds);
+	AddInfo(FString::Printf(TEXT("Upside down: %d of 64 roof over ceiling, %d ground over ceiling, %d ground over ground."), Roofs, GroundsOverCeilings, Grounds));
+	TestEqual(TEXT("Upside down, every floor is a roof or a ground over a ceiling, or a ground over a ground, the top on its underside"),
+		Roofs + GroundsOverCeilings + Grounds, 64);
+	TestTrue(TEXT("All three turn up"), Roofs > 0 && GroundsOverCeilings > 0 && Grounds > 0);
+
+	TallyFloors(EGridFace::PosZ, Roofs, GroundsOverCeilings, Grounds);
+	TestEqual(TEXT("The right way up, the top is on its top"), Roofs + GroundsOverCeilings + Grounds, 64);
 
 	// A floor in the world whose Up lies in its plane is a wall, both faces.
 	FGridPlatform LyingWall = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr, EGridFace::NegX);
@@ -212,8 +258,9 @@ bool FStructureRoleFillTest::RunTest(const FString& Parameters)
 	// And a wall in the world whose Up runs along its normal is a floor: ground along Up.
 	FGridPlatform StandingFloor = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr, EGridFace::NegX);
 	TestTrue(TEXT("A floor standing up in the world is filled"), FRoomManagerTestAccess::DrawFill(*Manager, StandingFloor));
-	TestEqual(TEXT("Its face looking along -X takes the ground"), StandingFloor.NegativeStructure.Get(), Ground);
-	TestEqual(TEXT("And its face looking along +X the ceiling"), StandingFloor.PositiveStructure.Get(), Ceiling);
+	TestTrue(TEXT("Its face looking along -X takes the roof or the ground"),
+		StandingFloor.NegativeStructure.Get() == Roof || StandingFloor.NegativeStructure.Get() == Ground);
+	TestTrue(TEXT("And its face looking along +X what pairs with that"), CheckFill(StandingFloor).IsEmpty());
 
 	ReleaseRooted(Rooted);
 	return true;
@@ -399,13 +446,13 @@ bool FStructureRoleHangTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Below it, one stands on its ground, upside down like it"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::NegZ);
 
 	// A ceiling that holds nothing has nothing to hang from.
-	UPlatformStructureData* Ground = MakeStructure(TEXT("TestRoleGround"), 16, 16, EStructureType::Ground, false);
+	UPlatformStructureData* Roof = MakeStructure(TEXT("TestRoleRoof"), 16, 16, EStructureType::Roof, false);
 	UPlatformStructureData* BareCeiling = MakeStructure(TEXT("TestRoleBareCeiling"), 16, 16, EStructureType::Ceiling, false);
 	BareCeiling->bHoldsItems = false;
-	Rooted.Append({ Ground, BareCeiling });
+	Rooted.Append({ Roof, BareCeiling });
 
 	FGridPlatform BareFloor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr);
-	BareFloor.PositiveStructure = Ground;
+	BareFloor.PositiveStructure = Roof;
 	BareFloor.NegativeStructure = BareCeiling;
 	FRoomManagerTestAccess::Rebuild(*Manager, { BareFloor });
 	TestEqual(TEXT("Below a ceiling that holds nothing, a wall stands the right way up"), FRoomManagerTestAccess::ChooseUp(*Manager, Below), EGridFace::PosZ);
@@ -554,13 +601,13 @@ bool FStructureRoleWallsStandTest::RunTest(const FString& Parameters)
 
 	// A ground that holds nothing asks nothing.
 	UPlatformStructureData* BareGround = MakeStructure(TEXT("TestRoleBareGround"), 16, 16, EStructureType::Ground, false);
-	UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestRoleCeiling"), 16, 16, EStructureType::Ceiling, false);
+	UPlatformStructureData* UnderGround = MakeStructure(TEXT("TestRoleUnderGround"), 16, 16, EStructureType::Ground, false);
 	BareGround->bHoldsItems = false;
-	Rooted.Append({ BareGround, Ceiling });
+	Rooted.Append({ BareGround, UnderGround });
 
 	FGridPlatform BareFloor = MakeFilled(FIntVector(16, 16, 32), EGridAxis::Z, Square, nullptr);
 	BareFloor.PositiveStructure = BareGround;
-	BareFloor.NegativeStructure = Ceiling;
+	BareFloor.NegativeStructure = UnderGround;
 	FRoomManagerTestAccess::Rebuild(*Manager, { BareFloor });
 	TestEqual(TEXT("Below a ground that holds nothing, hanging is not redrawn"), FRoomManagerTestAccess::GetRuleRedrawChance(*Manager, Below), 0.0f);
 
@@ -729,39 +776,38 @@ bool FStructureRoleInteriorBacksExteriorTest::RunTest(const FString& Parameters)
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
 
-	auto MakeCategory = [&Rooted](const TCHAR* Name)
-	{
-		UStructureCategory* Category = NewObject<UStructureCategory>(GetTransientPackage(),
-			MakeUniqueObjectName(GetTransientPackage(), UStructureCategory::StaticClass(), Name));
-		Category->AddToRoot();
-		Rooted.Add(Category);
-		return Category;
-	};
+	// One-sided walls standing for an interior and two exteriors, equally weighted. The categories say
+	// nothing: a category named for an interior does not make one.
+	UStructureCategory* Office = NewObject<UStructureCategory>(GetTransientPackage(),
+		MakeUniqueObjectName(GetTransientPackage(), UStructureCategory::StaticClass(), TEXT("TestCategory_InteriorOffice")));
+	Office->AddToRoot();
+	Rooted.Add(Office);
 
-	// One-sided walls of an interior, an exterior, and a category that is neither, equally weighted.
-	UStructureCategory* Interior = MakeCategory(TEXT("TestCategory_InteriorOffice"));
-	UStructureCategory* Exterior = MakeCategory(TEXT("TestCategory_ExteriorUrban"));
-	UStructureCategory* Natural = MakeCategory(TEXT("TestCategory_NaturalStone"));
-
-	UPlatformStructureData* InsideWall = MakeStructure(TEXT("TestInsideWall"), 16, 16, EStructureType::Wall, false);
-	UPlatformStructureData* OutsideWall = MakeStructure(TEXT("TestOutsideWall"), 16, 16, EStructureType::Wall, false);
-	UPlatformStructureData* StoneWall = MakeStructure(TEXT("TestStoneWall"), 16, 16, EStructureType::Wall, false);
-	InsideWall->Categories = { Interior };
-	OutsideWall->Categories = { Exterior };
-	StoneWall->Categories = { Natural };
-	Rooted.Append({ InsideWall, OutsideWall, StoneWall });
+	UPlatformStructureData* InsideWall = MakeSided(TEXT("TestInsideWall"), EStructureType::Wall, EStructureSide::Interior, Rooted);
+	UPlatformStructureData* OutsideWall = MakeSided(TEXT("TestOutsideWall"), EStructureType::Wall, EStructureSide::Exterior, Rooted);
+	UPlatformStructureData* OfficeWall = MakeSided(TEXT("TestOfficeWall"), EStructureType::Wall, EStructureSide::Exterior, Rooted);
+	UPlatformStructureData* EitherWall = MakeSided(TEXT("TestEitherWall"), EStructureType::Wall, EStructureSide::Both, Rooted);
+	OfficeWall->Categories = { Office };
 
 	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted,
-		TArray<TObjectPtr<UPlatformStructureData>>{ InsideWall, OutsideWall, StoneWall, MakeSlab(16, 16, true, Rooted) });
+		TArray<TObjectPtr<UPlatformStructureData>>{ InsideWall, OutsideWall, OfficeWall, EitherWall, MakeSlab(16, 16, true, Rooted) });
 	UPlatformTileData* Square = Manager->Tiles[0];
 
 	// Filled again and again, a wall with nothing beside it: tally what goes behind each kind of face.
-	auto Tally = [&](int32& OutInsideBehindInside, int32& OutOutsideBehindInside, int32& OutInsideBehindOutside, int32& OutInsideFaces)
+	struct FTally
 	{
-		OutInsideBehindInside = 0;
-		OutOutsideBehindInside = 0;
-		OutInsideBehindOutside = 0;
-		OutInsideFaces = 0;
+		int32 InsideFaces = 0;
+		int32 InsideBehindInside = 0;
+		int32 OutsideBehindInside = 0;
+		int32 InsideBehindOutside = 0;
+		int32 OutsideBehindOutside = 0;
+		int32 EitherBehindInside = 0;
+		int32 InsideBehindEither = 0;
+	};
+
+	auto Tally = [&]()
+	{
+		FTally Result;
 
 		for (int32 Fill = 0; Fill < 300; ++Fill)
 		{
@@ -775,30 +821,156 @@ bool FStructureRoleInteriorBacksExteriorTest::RunTest(const FString& Parameters)
 			for (const TPair<UPlatformStructureData*, UPlatformStructureData*>& Pair :
 				{ MakeTuple(Wall.PositiveStructure.Get(), Wall.NegativeStructure.Get()), MakeTuple(Wall.NegativeStructure.Get(), Wall.PositiveStructure.Get()) })
 			{
-				OutInsideFaces += Pair.Key == InsideWall ? 1 : 0;
-				OutInsideBehindInside += Pair.Key == InsideWall && Pair.Value == InsideWall ? 1 : 0;
-				OutOutsideBehindInside += Pair.Key == InsideWall && Pair.Value == OutsideWall ? 1 : 0;
-				OutInsideBehindOutside += Pair.Key == OutsideWall && Pair.Value == InsideWall ? 1 : 0;
+				const bool bInside = Pair.Key->Side == EStructureSide::Interior;
+				const bool bBehindInside = Pair.Value->Side == EStructureSide::Interior;
+
+				Result.InsideFaces += bInside ? 1 : 0;
+				Result.InsideBehindInside += bInside && bBehindInside ? 1 : 0;
+				Result.OutsideBehindInside += bInside && !bBehindInside ? 1 : 0;
+				Result.InsideBehindOutside += !bInside && bBehindInside ? 1 : 0;
+				Result.OutsideBehindOutside += !bInside && !bBehindInside ? 1 : 0;
+				Result.EitherBehindInside += bInside && Pair.Value == EitherWall ? 1 : 0;
+				Result.InsideBehindEither += Pair.Key == EitherWall && bBehindInside ? 1 : 0;
+			}
+		}
+
+		return Result;
+	};
+
+	Manager->InteriorBacksExteriorChance = 1.0f;
+	FTally Always = Tally();
+	AddInfo(FString::Printf(TEXT("Always: %d interior faces, %d with an interior behind, %d with an exterior behind; behind exteriors, %d interiors and %d exteriors."),
+		Always.InsideFaces, Always.InsideBehindInside, Always.OutsideBehindInside, Always.InsideBehindOutside, Always.OutsideBehindOutside));
+	TestTrue(TEXT("Interiors are drawn"), Always.InsideFaces > 20);
+	TestEqual(TEXT("Sure to, an interior never has an interior behind it"), Always.InsideBehindInside, 0);
+	TestTrue(TEXT("It has an exterior"), Always.OutsideBehindInside > 0);
+	TestTrue(TEXT("Exteriors meet back to back, since nothing binds them"), Always.OutsideBehindOutside > 0);
+	TestTrue(TEXT("A wall of both sides may go behind an interior"), Always.EitherBehindInside > 0);
+	TestTrue(TEXT("And binds nothing behind itself: interiors follow it too"), Always.InsideBehindEither > 0);
+
+	// Off, the back is drawn like any other face, and interiors turn up back to back.
+	Manager->bInteriorBacksExterior = false;
+	FTally Off = Tally();
+	AddInfo(FString::Printf(TEXT("Off: %d interior faces, %d with an interior behind, %d with an exterior behind."),
+		Off.InsideFaces, Off.InsideBehindInside, Off.OutsideBehindInside));
+	TestTrue(TEXT("Off, interiors turn up back to back"), Off.InsideBehindInside > 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureRoleWallsFaceInteriorGroundsTest, "WEM.Structures.Roles.WallsFaceInteriorGrounds", WEMRoomManagerTests::TestFlags)
+
+bool FStructureRoleWallsFaceInteriorGroundsTest::RunTest(const FString& Parameters)
+{
+	using namespace StructureRoleTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	UPlatformStructureData* InsideGround = MakeSided(TEXT("TestInsideGround"), EStructureType::Ground, EStructureSide::Interior, Rooted);
+	UPlatformStructureData* OutsideGround = MakeSided(TEXT("TestOutsideGround"), EStructureType::Ground, EStructureSide::Exterior, Rooted);
+	UPlatformStructureData* EitherGround = MakeSided(TEXT("TestEitherGround"), EStructureType::Ground, EStructureSide::Both, Rooted);
+	UPlatformStructureData* InsideWall = MakeSided(TEXT("TestInsideWall"), EStructureType::Wall, EStructureSide::Interior, Rooted);
+	UPlatformStructureData* OutsideWall = MakeSided(TEXT("TestOutsideWall"), EStructureType::Wall, EStructureSide::Exterior, Rooted);
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted,
+		TArray<TObjectPtr<UPlatformStructureData>>{ InsideGround, OutsideGround, InsideWall, OutsideWall });
+	UPlatformTileData* Square = Manager->Tiles[0];
+
+	auto MakeFloor = [&](const FIntVector& MinNode, UPlatformStructureData* AlongUp, UPlatformStructureData* AgainstUp, const EGridFace Up)
+	{
+		FGridPlatform Floor = MakeFilled(MinNode, EGridAxis::Z, Square, nullptr, Up);
+		Floor.PositiveStructure = WEMGrid::FaceSign(Up) > 0 ? AlongUp : AgainstUp;
+		Floor.NegativeStructure = WEMGrid::FaceSign(Up) > 0 ? AgainstUp : AlongUp;
+		return Floor;
+	};
+
+	auto Faces = [Manager](const FGridPlatform& Wall)
+	{
+		return static_cast<int32>(FRoomManagerTestAccess::GetFacesOverInteriorGround(*Manager, Wall));
+	};
+
+	// A floor X 16 to 32 at Z 32, its walked face interior. A wall standing on its east edge looks over
+	// it with its -X face; one hanging below it, or folding off its far side, does not.
+	const FGridPlatform Above = MakeFilled(FIntVector(32, 16, 32), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Below = MakeFilled(FIntVector(32, 16, 16), EGridAxis::X, Square, nullptr);
+	const FGridPlatform Side = MakeFilled(FIntVector(16, 32, 32), EGridAxis::Y, Square, nullptr);
+
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ) });
+	TestEqual(TEXT("A wall standing on an interior ground looks over it with the face toward it"), Faces(Above), 2);
+	TestEqual(TEXT("One hanging below it does not"), Faces(Below), 0);
+	TestEqual(TEXT("A wall along its north edge looks over it with its -Y face"), Faces(Side), 2);
+
+	// Upside down, its walked face looks down: the wall below stands on it.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::NegZ) });
+	TestEqual(TEXT("Below an upside-down interior ground, a wall stands on it"), Faces(Below), 2);
+	TestEqual(TEXT("And above it, none does"), Faces(Above), 0);
+
+	// An exterior ground asks nothing, nor does the interior underneath it.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), OutsideGround, InsideGround, EGridFace::PosZ) });
+	TestEqual(TEXT("On an exterior ground, nothing"), Faces(Above), 0);
+	TestEqual(TEXT("Below it, by an interior ground facing down that is not its walked face, nothing"), Faces(Below), 0);
+
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), EitherGround, OutsideGround, EGridFace::PosZ) });
+	TestEqual(TEXT("On a ground of both sides, nothing"), Faces(Above), 0);
+
+	// Between two rooms, both faces.
+	FRoomManagerTestAccess::Rebuild(*Manager, {
+		MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ),
+		MakeFloor(FIntVector(32, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ) });
+	TestEqual(TEXT("Between two interior grounds, both faces"), Faces(Above), 3);
+
+	// Drawn, with the rule sure to apply: inside over the room, and behind it, also sure, outside.
+	Manager->WallsFaceInteriorGroundsChance = 1.0f;
+	Manager->InteriorBacksExteriorChance = 1.0f;
+
+	auto Tally = [&](int32& OutInsideOverRoom, int32& OutOutsideBehind, int32& OutFills)
+	{
+		OutInsideOverRoom = 0;
+		OutOutsideBehind = 0;
+		OutFills = 0;
+
+		for (int32 Fill = 0; Fill < 100; ++Fill)
+		{
+			FGridPlatform Wall = Above;
+
+			if (FRoomManagerTestAccess::DrawFill(*Manager, Wall))
+			{
+				++OutFills;
+				OutInsideOverRoom += Wall.NegativeStructure == InsideWall ? 1 : 0;
+				OutOutsideBehind += Wall.PositiveStructure == OutsideWall ? 1 : 0;
 			}
 		}
 	};
 
-	int32 InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces;
+	int32 InsideOverRoom, OutsideBehind, Fills;
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ) });
+	Tally(InsideOverRoom, OutsideBehind, Fills);
+	TestEqual(TEXT("Every wall on the room's edge is filled"), Fills, 100);
+	TestEqual(TEXT("Sure to, its face over the room is always an interior"), InsideOverRoom, 100);
+	TestEqual(TEXT("And its back always an exterior"), OutsideBehind, 100);
 
-	Manager->InteriorBacksExteriorChance = 1.0f;
-	Tally(InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces);
-	AddInfo(FString::Printf(TEXT("Always: %d interior faces, %d with an interior behind, %d with an exterior behind; %d exteriors with an interior behind."),
-		InsideFaces, InsideBehindInside, OutsideBehindInside, InsideBehindOutside));
-	TestTrue(TEXT("Interiors are drawn"), InsideFaces > 20);
-	TestEqual(TEXT("Sure to, an interior never has an interior behind it"), InsideBehindInside, 0);
-	TestTrue(TEXT("It has an exterior"), OutsideBehindInside > 0);
+	// Between two rooms both faces are inside, the rule outranking what goes behind an interior.
+	FRoomManagerTestAccess::Rebuild(*Manager, {
+		MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ),
+		MakeFloor(FIntVector(32, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ) });
+	int32 BothInside = 0;
 
-	// Off, the back is drawn like any other face, and interiors turn up back to back.
-	Manager->bInteriorBacksExterior = false;
-	Tally(InsideBehindInside, OutsideBehindInside, InsideBehindOutside, InsideFaces);
-	AddInfo(FString::Printf(TEXT("Off: %d interior faces, %d with an interior behind, %d with an exterior behind."),
-		InsideFaces, InsideBehindInside, OutsideBehindInside));
-	TestTrue(TEXT("Off, interiors turn up back to back"), InsideBehindInside > 0);
+	for (int32 Fill = 0; Fill < 100; ++Fill)
+	{
+		FGridPlatform Wall = Above;
+		BothInside += FRoomManagerTestAccess::DrawFill(*Manager, Wall) && Wall.PositiveStructure == InsideWall && Wall.NegativeStructure == InsideWall ? 1 : 0;
+	}
+
+	TestEqual(TEXT("Between two rooms, a wall is inside on both faces"), BothInside, 100);
+
+	// Off, the face over the room is drawn like any other.
+	Manager->bWallsFaceInteriorGrounds = false;
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeFloor(FIntVector(16, 16, 32), InsideGround, OutsideGround, EGridFace::PosZ) });
+	Tally(InsideOverRoom, OutsideBehind, Fills);
+	AddInfo(FString::Printf(TEXT("Off: of %d walls, %d inside over the room."), Fills, InsideOverRoom));
+	TestTrue(TEXT("Off, some walls are outside over the room"), InsideOverRoom < Fills && InsideOverRoom > 0);
 
 	ReleaseRooted(Rooted);
 	return true;
@@ -813,17 +985,18 @@ bool FStructureRoleTurnedGrowthTest::RunTest(const FString& Parameters)
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
 
-	// Per size, a slab and a one-sided ground, ceiling and wall, so the fill has to follow each platform's
-	// Up to be right.
+	// Per size, a slab and a one-sided ground, roof, ceiling and wall, so the fill has to follow each
+	// platform's Up to be right.
 	TArray<TObjectPtr<UPlatformStructureData>> Structures;
 
 	for (const FIntPoint Size : { FIntPoint(16, 16), FIntPoint(8, 8), FIntPoint(8, 16) })
 	{
 		UPlatformStructureData* Ground = MakeStructure(TEXT("TestRoleGround"), Size.X, Size.Y, EStructureType::Ground, false);
+		UPlatformStructureData* Roof = MakeStructure(TEXT("TestRoleRoof"), Size.X, Size.Y, EStructureType::Roof, false);
 		UPlatformStructureData* Ceiling = MakeStructure(TEXT("TestRoleCeiling"), Size.X, Size.Y, EStructureType::Ceiling, false);
 		UPlatformStructureData* Wall = MakeStructure(TEXT("TestRoleWall"), Size.X, Size.Y, EStructureType::Wall, false, /*bMayLieSideways=*/true);
-		Rooted.Append({ Ground, Ceiling, Wall });
-		Structures.Append({ Ground, Ceiling, Wall, MakeSlab(Size.X, Size.Y, true, Rooted) });
+		Rooted.Append({ Ground, Roof, Ceiling, Wall });
+		Structures.Append({ Ground, Roof, Ceiling, Wall, MakeSlab(Size.X, Size.Y, true, Rooted) });
 	}
 
 	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
