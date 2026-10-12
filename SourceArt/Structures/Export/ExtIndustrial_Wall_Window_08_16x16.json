@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "name": "ExtIndustrial_Wall_Window_08_16x16",
+  "blend": "Tiles_HL2.blend",
+  "object": "ExtIndustrial_Wall_Window_08_16x16",
+  "width": 16,
+  "length": 16,
+  "twoSided": false,
+  "categories": ["DA_Category_ExteriorIndustrial"],
+  "types": ["Wall"],
+  "side": "Exterior",
+  "loadBearing": true,
+  "holdsItems": true,
+  "fence": false,
+  "mayLieSideways": false,
+  "weight": 1.0,
+  "bounds": { "min": [-1.5, -1.5, 0.0], "max": [1.5, 1.5, 0.1] },
+  "exported": "2026-10-10T02:02:47"
+}
