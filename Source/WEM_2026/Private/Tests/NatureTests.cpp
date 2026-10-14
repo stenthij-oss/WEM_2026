@@ -501,4 +501,283 @@ bool FNatureFlatPiecesTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+namespace NatureTestsPrivate
+{
+	/** The nature on a platform's nature face, and that face, or false for one of the city. */
+	bool GetNature(const FGridPlatform& Platform, ENatureForm& OutForm, int32& OutSign)
+	{
+		for (const int32 Sign : { 1, -1 })
+		{
+			const UPlatformStructureData* Structure = Sign > 0 ? Platform.PositiveStructure.Get() : Platform.NegativeStructure.Get();
+
+			if (Structure && Structure->IsNature())
+			{
+				OutForm = Structure->NatureForm;
+				OutSign = Sign;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** Sets the nature beat to start only one form, each field spilling out to exactly Size pieces. */
+	void KeepToForm(ARoomManager& Manager, const ENatureForm Form, const int32 Size)
+	{
+		Manager.GroundWeight = Form == ENatureForm::Ground ? 1.0f : 0.0f;
+		Manager.CliffWeight = Form == ENatureForm::Cliff ? 1.0f : 0.0f;
+		Manager.WaterWeight = Form == ENatureForm::Water ? 1.0f : 0.0f;
+		Manager.GroundSpillMin = Size;
+		Manager.GroundSpillMax = Size;
+		Manager.WaterSpillMin = Size;
+		Manager.WaterSpillMax = Size;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureSpillTest, "WEM.Nature.Spill", WEMRoomManagerTests::TestFlags)
+
+bool FNatureSpillTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+	UPlatformTileData* Square = Manager->Tiles[0];
+	KeepToForm(*Manager, ENatureForm::Ground, 4);
+
+	// Four roofs, X and Y 16 to 48, with room around them.
+	TArray<FGridPlatform> Roofs;
+	for (const FIntVector& MinNode : { FIntVector(16, 16, 32), FIntVector(32, 16, 32), FIntVector(16, 32, 32), FIntVector(32, 32, 32) })
+	{
+		Roofs.Add(MakeSegment(MinNode, EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior));
+	}
+
+	FRoomManagerTestAccess::Rebuild(*Manager, Roofs);
+
+	// Each beat lays one piece: a field started against the roofs, then spilling out three more, a piece a beat.
+	TArray<FGridPlatform> Field;
+
+	for (int32 Beat = 0; Beat < 4; ++Beat)
+	{
+		const int32 Before = Manager->GetPlatformCount();
+		TestTrue(FString::Printf(TEXT("Beat %d lays nature"), Beat), Manager->PlaceNextNature());
+		TestEqual(FString::Printf(TEXT("Beat %d lays one piece"), Beat), Manager->GetPlatformCount(), Before + 1);
+
+		const FGridPlatform Laid = FRoomManagerTestAccess::GetBuilt(*Manager).Last();
+		ENatureForm Form = ENatureForm::Water;
+		int32 Sign = 0;
+		TestTrue(TEXT("It is ground"), GetNature(Laid, Form, Sign) && Form == ENatureForm::Ground);
+		Field.Add(Laid);
+
+		int32 Remaining = 0;
+		const int32 Spilling = FRoomManagerTestAccess::GetSpillingFields(*Manager, Remaining);
+		TestEqual(FString::Printf(TEXT("After beat %d, the field is still spilling until it has four pieces"), Beat), Spilling, Beat < 3 ? 1 : 0);
+	}
+
+	// The field lies in one sheet, with one Up.
+	bool bOneSheet = true;
+	for (const FGridPlatform& Piece : Field)
+	{
+		const int32 NormalAxis = static_cast<int32>(Piece.Normal);
+		bOneSheet = bOneSheet && Piece.Normal == Field[0].Normal && Piece.Up == Field[0].Up && Piece.MinNode[NormalAxis] == Field[0].MinNode[NormalAxis];
+	}
+
+	TestTrue(TEXT("The field lies in one plane with one Up"), bOneSheet);
+	TestEqual(TEXT("The counts follow"), Manager->GroundCount, 4);
+
+	// The next beat starts another field, spilling out in turn.
+	TestTrue(TEXT("The fifth beat lays nature"), Manager->PlaceNextNature());
+	int32 Remaining = 0;
+	TestEqual(TEXT("A new field is spilling"), FRoomManagerTestAccess::GetSpillingFields(*Manager, Remaining), 1);
+	TestEqual(TEXT("With three pieces to go"), Remaining, 3);
+
+	TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// With no nature among the structures, the beat lays nothing.
+	ARoomManager* Bare = SpawnRoomManager(TestWorld.World, Rooted, TArray<TObjectPtr<UPlatformStructureData>>{ Kit.RoofExterior, Kit.CeilingInterior });
+	FRoomManagerTestAccess::Rebuild(*Bare, Roofs);
+	TestFalse(TEXT("No nature, nothing laid"), Bare->PlaceNextNature());
+	TestEqual(TEXT("And nothing placed"), Bare->GetPlatformCount(), 4);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureCliffBeatTest, "WEM.Nature.CliffBeat", WEMRoomManagerTests::TestFlags)
+
+bool FNatureCliffBeatTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+	UPlatformTileData* Square = Manager->Tiles[0];
+
+	// A field of four pieces, X and Y 16 to 48 at Z 32.
+	TArray<FGridPlatform> Field;
+	for (const FIntVector& MinNode : { FIntVector(16, 16, 32), FIntVector(32, 16, 32), FIntVector(16, 32, 32), FIntVector(32, 32, 32) })
+	{
+		Field.Add(MakeSegment(MinNode, EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior));
+	}
+
+	FRoomManagerTestAccess::Rebuild(*Manager, Field);
+
+	// Cliffs alone: each beat raises one off the field's outline or carries one on.
+	KeepToForm(*Manager, ENatureForm::Cliff, 1);
+
+	for (int32 Beat = 0; Beat < 8; ++Beat)
+	{
+		const int32 Before = Manager->GetPlatformCount();
+		TestTrue(FString::Printf(TEXT("Beat %d raises a cliff"), Beat), Manager->PlaceNextNature());
+		TestEqual(FString::Printf(TEXT("Beat %d lays one piece"), Beat), Manager->GetPlatformCount(), Before + 1);
+	}
+
+	TestEqual(TEXT("Eight cliffs stand"), Manager->CliffCount, 8);
+
+	int32 Walls = 0;
+	for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		ENatureForm Form = ENatureForm::Ground;
+		int32 Sign = 0;
+
+		if (GetNature(Platform, Form, Sign) && Form == ENatureForm::Cliff)
+		{
+			// A cliff is a wall in the field's frame: standing across the field, with the field's Up.
+			Walls += Platform.Normal != EGridAxis::Z && Platform.Up == EGridFace::PosZ ? 1 : 0;
+		}
+	}
+
+	TestEqual(TEXT("Every cliff stands across the field, with its Up"), Walls, 8);
+	TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+
+	// Water beside the field, or at a cliff's top or foot.
+	KeepToForm(*Manager, ENatureForm::Water, 1);
+	TestTrue(TEXT("A pool is laid"), Manager->PlaceNextNature());
+
+	ENatureForm Form = ENatureForm::Ground;
+	int32 Sign = 0;
+	const FGridPlatform Pool = FRoomManagerTestAccess::GetBuilt(*Manager).Last();
+	TestTrue(TEXT("It is water"), GetNature(Pool, Form, Sign) && Form == ENatureForm::Water);
+	TestTrue(TEXT("Looking out along its Up"), Pool.Up == WEMGrid::MakeFace(static_cast<int32>(Pool.Normal), Sign));
+	TestEqual(TEXT("Still no two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureTerraceTest, "WEM.Nature.Terrace", WEMRoomManagerTests::TestFlags)
+
+bool FNatureTerraceTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	// No exterior in the city at all, so ground can only start at a cliff's top or foot.
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted,
+		TArray<TObjectPtr<UPlatformStructureData>>{ Kit.CeilingInterior, Kit.GroundInterior, Kit.WallInterior, Kit.Ground, Kit.Cliff, Kit.Water });
+	UPlatformTileData* Square = Manager->Tiles[0];
+	KeepToForm(*Manager, ENatureForm::Ground, 1);
+
+	// A field at Z 32, X 16 to 32, and a cliff rising off its edge, facing over it, X 32, Z 32 to 48.
+	const FGridPlatform Field = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
+	const FGridPlatform Rise = MakeSegment(FIntVector(32, 16, 32), EGridAxis::X, Square, EGridFace::PosZ, Kit.WallInterior, Kit.Cliff);
+	FRoomManagerTestAccess::Rebuild(*Manager, { Field, Rise });
+
+	TestTrue(TEXT("Ground starts at the cliff"), Manager->PlaceNextNature());
+	TestEqual(TEXT("Two of ground stand"), Manager->GroundCount, 2);
+
+	const FGridPlatform Terrace = FRoomManagerTestAccess::GetBuilt(*Manager).Last();
+	TestEqual(TEXT("On the cliff's top, beyond it"), Terrace.MinNode, FIntVector(32, 16, 48));
+	TestEqual(TEXT("Lying flat"), Terrace.Normal, EGridAxis::Z);
+	TestEqual(TEXT("Looking up"), Terrace.Up, EGridFace::PosZ);
+
+	TestFalse(TEXT("Nowhere else for ground to start"), Manager->PlaceNextNature());
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureGrowthTest, "WEM.Nature.Growth", WEMRoomManagerTests::TestFlags)
+
+bool FNatureGrowthTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	// Two room managers on the same seed in a larger cube: the city growing, nature beating once every third beat.
+	auto Grow = [&](TArray<FGridPlatform>& OutPlatforms) -> ARoomManager*
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+		Manager->GridSize = 129;
+		Manager->ClearPlatforms();
+
+		for (int32 Beat = 0; Beat < 150; ++Beat)
+		{
+			Manager->PlaceNextPlatform();
+		}
+
+		for (int32 Beat = 0; Beat < 600; ++Beat)
+		{
+			if (Beat % 3 == 2)
+			{
+				const int32 Before = Manager->GetPlatformCount();
+				const bool bLaid = Manager->PlaceNextNature();
+
+				if (Manager->GetPlatformCount() != Before + (bLaid ? 1 : 0))
+				{
+					AddError(FString::Printf(TEXT("Nature beat %d laid %d pieces"), Beat, Manager->GetPlatformCount() - Before));
+				}
+			}
+			else
+			{
+				Manager->PlaceNextPlatform();
+			}
+		}
+
+		OutPlatforms = FRoomManagerTestAccess::GetBuilt(*Manager);
+		return Manager;
+	};
+
+	TArray<FGridPlatform> First;
+	TArray<FGridPlatform> Second;
+	ARoomManager* Manager = Grow(First);
+	Grow(Second);
+
+	AddInfo(FString::Printf(TEXT("%d platforms: %d ground, %d cliff, %d water."),
+		Manager->GetPlatformCount(), Manager->GroundCount, Manager->CliffCount, Manager->WaterCount));
+
+	TestTrue(TEXT("Ground grows"), Manager->GroundCount > 0);
+	TestTrue(TEXT("Cliffs grow"), Manager->CliffCount > 0);
+	TestTrue(TEXT("Water grows"), Manager->WaterCount > 0);
+	TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	bool bSame = First.Num() == Second.Num();
+	for (int32 Index = 0; bSame && Index < First.Num(); ++Index)
+	{
+		bSame = First[Index].MinNode == Second[Index].MinNode && First[Index].Normal == Second[Index].Normal
+			&& First[Index].Up == Second[Index].Up && First[Index].PositiveStructure == Second[Index].PositiveStructure
+			&& First[Index].NegativeStructure == Second[Index].NegativeStructure;
+	}
+
+	TestTrue(TEXT("The same seed grows the same world, nature and all"), bSame);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 #endif

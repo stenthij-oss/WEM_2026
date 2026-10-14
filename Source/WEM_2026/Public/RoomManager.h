@@ -402,6 +402,16 @@ struct FSurfaceMarkLayer
  * it meets, nature or not: the city grows against ground only with exteriors facing it - the faces that
  * meet ground are drawn from exteriors - and never against water or a cliff.
  *
+ * Nature has a beat of its own (NaturePlacementInterval), and lays one piece a beat, drawn from a
+ * stream of its own. A field still spilling out takes the beat: ground and water are laid as fields,
+ * each spilling out, a piece a beat, to the size it drew when it started (GroundSpillMin and Max,
+ * WaterSpillMin and Max) - in its own plane, beside the pieces it has laid, likelier where it would
+ * meet more of them - and the oldest still spilling goes first. Otherwise the beat starts something,
+ * drawn by GroundWeight, CliffWeight and WaterWeight among what has somewhere to go: a field of ground,
+ * against an exterior or at a cliff's top or foot; a cliff, off a field's outline or carrying one on;
+ * or a pool of water, beside ground or at a cliff's top or foot. Where they could go is sampled
+ * rather than walked in full, so a beat costs the same however far nature has spread.
+ *
  * Surfaces
  * --------
  * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
@@ -658,6 +668,57 @@ public:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Structures")
 	double CategoryPatchSize = 0.0;
+
+	/** Whether the nature beat runs on its own once play begins. With no nature among Structures it lays nothing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature")
+	bool bAutoPlaceNature = true;
+
+	/** Seconds between nature beats. One piece of nature a beat. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
+	float NaturePlacementInterval = 1.0f;
+
+	/**
+	 * How often a nature beat with no field spilling starts a field of ground - against an exterior, or at
+	 * a cliff's top or foot - relative to the other two, among those with somewhere to go.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
+	float GroundWeight = 1.0f;
+
+	/** How often such a beat raises a cliff off a field's outline, or carries a cliff on. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
+	float CliffWeight = 1.0f;
+
+	/** How often such a beat starts a pool of water beside ground, or at a cliff's top or foot. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
+	float WaterWeight = 0.5f;
+
+	/** The fewest pieces a field of ground spills out to, the one it started from included. Drawn evenly up to GroundSpillMax. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
+	int32 GroundSpillMin = 4;
+
+	/** The most pieces a field of ground spills out to. It stops sooner where it has no room. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
+	int32 GroundSpillMax = 12;
+
+	/** The fewest pieces a pool of water spills out to, the one it started from included. Drawn evenly up to WaterSpillMax. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
+	int32 WaterSpillMin = 2;
+
+	/** The most pieces a pool of water spills out to. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
+	int32 WaterSpillMax = 6;
+
+	/** Platforms of ground standing. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
+	int32 GroundCount = 0;
+
+	/** Platforms of cliff standing. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
+	int32 CliffCount = 0;
+
+	/** Platforms of water standing. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
+	int32 WaterCount = 0;
 
 	/**
 	 * Every platform placed, in the order it was placed. This list alone is the simulation's
@@ -988,6 +1049,13 @@ public:
 	/** Drops every platform and every fence end waiting to grow, and re-seeds the streams. Back to an empty cube. */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Platforms")
 	void ClearPlatforms();
+
+	/**
+	 * One nature beat: the next piece of the oldest field still spilling out, or else a field of ground, a
+	 * cliff or a pool of water, started where one can go. Returns false when nothing was laid.
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Nature")
+	bool PlaceNextNature();
 
 	//~ Begin AActor Interface
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -1364,9 +1432,15 @@ private:
 
 	/**
 	 * Whether every face a filled platform about to be placed would meet is one the nature on either side
-	 * takes. bOutNatureMet says whether its own nature face, if it has one, meets anything at all.
+	 * takes. OutNatureMeets says what its own nature face, if it has one, meets: NatureMeetsCity for a face
+	 * of the city, and GetNatureMeetsBit for each form of nature.
 	 */
-	bool AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* bOutNatureMet = nullptr) const;
+	bool AreNatureMeetingsLegal(const FGridPlatform& Platform, uint8* OutNatureMeets = nullptr) const;
+
+	/** What a nature face meets, as AreNatureMeetingsLegal reports it: a face of the city, or nature of a form. */
+	static constexpr uint8 NatureMeetsCity = 1 << 0;
+
+	static uint8 GetNatureMeetsBit(ENatureForm Form);
 
 	/**
 	 * Whether a placement not yet filled would meet water or a cliff, which take no face of the city. The
@@ -1377,14 +1451,78 @@ private:
 
 	/**
 	 * Fills a platform about to be placed with nature of one form on the face NatureSign looks out from,
-	 * and one-sided urban structure behind it - any of the face's type there - both from Stream. Its Up has
-	 * to suit the form already: along its normal and looking out of the nature face for ground and water,
-	 * in its plane for a cliff. False when that is not so, or when nothing fits either face.
+	 * and one-sided urban structure behind it - any of the face's type there, an exterior where the back
+	 * meets ground - both from Stream. Its Up has to suit the form already: along its normal and looking
+	 * out of the nature face for ground and water, in its plane for a cliff. False when that is not so,
+	 * when the back would meet water or a cliff, or when nothing fits either face.
 	 */
 	bool DrawNatureFill(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, FRandomStream& Stream);
 
 	/** Where a nature structure with no mesh is drawn on one face of a platform: a slab across the opening, from the mid-plane out to the face. */
 	FTransform MakeFlatSlabTransform(const FGridPlatform& Platform, int32 FaceSign) const;
+
+	/**
+	 * The faces of a placement about to be placed, as FaceBit flags, that would meet nature: those meeting
+	 * ground, which only an exterior may fill, and those meeting water or a cliff, which nothing of the city may.
+	 */
+	void GetNatureNeighbourFaces(const FGridPlatform& Platform, uint8& OutOnGround, uint8& OutOnClosed) const;
+
+	/** How many nature forms there are: ground, cliff and water. */
+	static constexpr int32 NatureFormCount = 3;
+
+	/** One placement the nature beat could lay: the platform with its Up, the form, and which face is the nature. */
+	struct FNatureCandidate
+	{
+		FGridPlatform Platform;
+		ENatureForm Form{};
+		int32 NatureSign = 1;
+
+		/** How many module edges it was found growing off. A field's spill is drawn by it. */
+		int32 Weight = 1;
+	};
+
+	/** A placement as the nature beat tells them apart: its candidate key, its tile's index in UsableTiles, and its Up and nature face. */
+	using FNatureCandidateKey = TTuple<uint64, int32, int32>;
+
+	/** A field of ground or water still spilling out: its form, the pieces it has laid, and how many more it may. */
+	struct FNatureSpill
+	{
+		ENatureForm Form{};
+		TArray<FGridPlatform> Pieces;
+		int32 Remaining = 0;
+	};
+
+	/** The nature beat. It never stops its own timer: the city growing on can always give nature somewhere new. */
+	void AdvanceNature();
+
+	/** Lays the first piece of a field of ground, a cliff or a pool of water, among the places sampling finds. False when it finds none. */
+	bool PlaceNatureOfForm(ENatureForm Form);
+
+	/**
+	 * Every placement of Form that could grow off one module edge of a nature platform's rim, judged with
+	 * Starts (see JudgeNatureCandidate), added to Out each once - its weight counting how many such edges it
+	 * was found off. Seen holds what has been judged, as an index into Out or INDEX_NONE.
+	 */
+	void GatherNatureAround(const FGridPlatform& Anchor, const FIntVector& EdgeNode, int32 EdgeAxis, ENatureForm Form, uint8 Starts, TMap<FNatureCandidateKey, int32>& Seen, TArray<FNatureCandidate>& Out);
+
+	/**
+	 * Whether a placement, given its Up, could be laid as nature of Form on the face NatureSign looks out
+	 * from: its tile may lie that way, nature and something behind it fit, and it is free and legal to
+	 * place filled with them - its meetings included - with its nature face meeting one of Starts, as
+	 * AreNatureMeetingsLegal reports them: what it may start against, or the field it spills from. On
+	 * success it is left filled with stand-ins (see FindNatureFill).
+	 */
+	bool JudgeNatureCandidate(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, uint8 Starts);
+
+	/**
+	 * Stand-ins for what fills nature of a form on a placement, for judging it: the first nature of the
+	 * form that fits, and a back that fits - an exterior where one does, which any nature it meets takes if
+	 * it takes any of the city. False when either is missing. Cached by opening, Up and form.
+	 */
+	bool FindNatureFill(const FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, UPlatformStructureData*& OutFront, UPlatformStructureData*& OutBack);
+
+	/** Fills a candidate from the nature stream and places it. False when no fill can be drawn, or it is no longer legal. */
+	bool PlaceNatureCandidate(FNatureCandidate& Candidate);
 
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
@@ -1694,6 +1832,21 @@ private:
 	/** How many of BuiltPlatforms have nature on a face. Until there are any, nothing has to ask what a placement meets. */
 	int32 NaturePlatformCount = 0;
 
+	/** The platforms of each nature form, by ENatureForm, as indices into BuiltPlatforms in the order they were taken in. */
+	TArray<int32> NatureIndices[NatureFormCount];
+
+	/** Fields of ground and water still spilling out, oldest first. Beat state, like FenceQueue. */
+	TArray<FNatureSpill> SpillQueue;
+
+	/** Stand-ins for nature's fills (see FindNatureFill), by opening, Up and form. Cleared whenever the structures are resolved. */
+	struct FNatureFillStandIns
+	{
+		UPlatformStructureData* Front = nullptr;
+		UPlatformStructureData* Back = nullptr;
+	};
+
+	TMap<uint64, FNatureFillStandIns> NatureFillCache;
+
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
 
@@ -1804,6 +1957,11 @@ private:
 
 	/** Which way up each platform is, likewise from a stream of its own. */
 	FRandomStream RoleStream;
+
+	/** What the nature beat draws, where and with what, from a stream of its own. */
+	FRandomStream NatureStream;
+
+	FTimerHandle NatureTimerHandle;
 
 	/**
 	 * Fence ends waiting to grow, oldest first. Beat state, like the streams: never saved, kept by a

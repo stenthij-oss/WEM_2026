@@ -180,7 +180,10 @@ struct FRoomManagerTestAccess
 	/** Whether every face a filled platform about to be placed would meet is one the nature on either side takes. */
 	static bool AreNatureMeetingsLegal(const ARoomManager& Manager, const FGridPlatform& Platform, bool& bOutNatureMet)
 	{
-		return Manager.AreNatureMeetingsLegal(Platform, &bOutNatureMet);
+		uint8 NatureMeets = 0;
+		const bool bLegal = Manager.AreNatureMeetingsLegal(Platform, &NatureMeets);
+		bOutNatureMet = NatureMeets != 0;
+		return bLegal;
 	}
 
 	/** Whether a placement not yet filled would meet water or a cliff, and which of its faces would meet ground (1 positive, 2 negative). */
@@ -192,6 +195,13 @@ struct FRoomManagerTestAccess
 	static int32 GetUsableNatureCount(const ARoomManager& Manager)
 	{
 		return Manager.UsableNatureStructures.Num();
+	}
+
+	/** How many fields of nature are still spilling out, and how many pieces the oldest may still lay. */
+	static int32 GetSpillingFields(const ARoomManager& Manager, int32& OutOldestRemaining)
+	{
+		OutOldestRemaining = Manager.SpillQueue.IsEmpty() ? 0 : Manager.SpillQueue[0].Remaining;
+		return Manager.SpillQueue.Num();
 	}
 
 	/** How many pairs of faces among the platforms that stand meet where the nature on either side does not take the other. */

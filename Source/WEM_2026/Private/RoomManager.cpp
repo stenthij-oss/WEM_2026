@@ -104,6 +104,15 @@ namespace
 	 */
 	constexpr int32 MaxFillRedraws = 8;
 
+	/**
+	 * How many of the city's open placements a nature beat tries for a new field of ground, each looking
+	 * either way. Sampled rather than walked, so the beat costs the same however large the city grows.
+	 */
+	constexpr int32 NatureSampleSeeds = 48;
+
+	/** How many module edges of nature's rim a nature beat tries for what grows off nature: cliffs, pools and terraces. */
+	constexpr int32 NatureSampleEdges = 24;
+
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
@@ -753,6 +762,19 @@ void ARoomManager::BeginPlay()
 			PlacementTimerHandle, this, &ARoomManager::AdvancePlacement,
 			PlatformPlacementInterval, BeatParameters);
 	}
+
+	// Nature keeps a beat of its own, set up the same way.
+	if (bAutoPlaceNature && NaturePlacementInterval > 0.0f)
+	{
+		FTimerManagerTimerParameters NatureParameters;
+		NatureParameters.bLoop = true;
+		NatureParameters.FirstDelay = NaturePlacementInterval;
+		NatureParameters.bMaxOncePerFrame = true;
+
+		GetWorldTimerManager().SetTimer(
+			NatureTimerHandle, this, &ARoomManager::AdvanceNature,
+			NaturePlacementInterval, NatureParameters);
+	}
 }
 
 void ARoomManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -760,6 +782,7 @@ void ARoomManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(PlacementTimerHandle);
+		World->GetTimerManager().ClearTimer(NatureTimerHandle);
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -2015,6 +2038,7 @@ void ARoomManager::ClearPlatforms()
 {
 	Platforms.Reset();
 	FenceQueue.Reset();
+	SpillQueue.Reset();
 
 	ResetPlacementStream();
 	BeginNewGeneration();
@@ -2034,6 +2058,7 @@ void ARoomManager::ResetPlacementStream()
 	// whatever the structures draw in between.
 	StructureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Structures"))))));
 	RoleStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Roles"))))));
+	NatureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Nature"))))));
 }
 
 void ARoomManager::AdvancePlacement()
@@ -2363,6 +2388,7 @@ void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
 {
 	UsableStructures.Reset();
 	UsableNatureStructures.Reset();
+	NatureFillCache.Reset();
 	CategoryIndices.Reset();
 	CategoriesByIndex.Reset();
 
@@ -2613,10 +2639,15 @@ bool ARoomManager::AcceptsMeeting(const FGridPlatform& Nature, const int32 Natur
 	return Form == ENatureForm::Ground && (!OtherFace || OtherFace->StandsFor(EStructureSide::Exterior));
 }
 
-bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* bOutNatureMet) const
+uint8 ARoomManager::GetNatureMeetsBit(const ENatureForm Form)
+{
+	return static_cast<uint8>(1 << (1 + static_cast<int32>(Form)));
+}
+
+bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, uint8* OutNatureMeets) const
 {
 	bool bLegal = true;
-	bool bNatureMet = false;
+	uint8 NatureMeets = 0;
 
 	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
 	{
@@ -2627,7 +2658,7 @@ bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* b
 		// Each side's nature has its say, so a meeting stands only where both take it.
 		if (OwnFace && OwnFace->IsNature())
 		{
-			bNatureMet = true;
+			NatureMeets |= OtherFace && OtherFace->IsNature() ? GetNatureMeetsBit(OtherFace->NatureForm) : NatureMeetsCity;
 			bLegal = bLegal && AcceptsMeeting(Platform, OwnSign, Other, NeighbourSign);
 		}
 
@@ -2637,44 +2668,42 @@ bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* b
 		}
 	});
 
-	if (bOutNatureMet)
+	if (OutNatureMeets)
 	{
-		*bOutNatureMet = bNatureMet;
+		*OutNatureMeets = NatureMeets;
 	}
 
 	return bLegal;
 }
 
-bool ARoomManager::MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFacesOnGround) const
+void ARoomManager::GetNatureNeighbourFaces(const FGridPlatform& Platform, uint8& OutOnGround, uint8& OutOnClosed) const
 {
-	bool bClosed = false;
-	uint8 FacesOnGround = 0;
+	OutOnGround = 0;
+	OutOnClosed = 0;
 
 	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
 	{
 		const UPlatformStructureData* OtherFace = GetFaceStructure(BuiltPlatforms[Neighbour], NeighbourSign);
 
-		if (!OtherFace || !OtherFace->IsNature())
+		if (OtherFace && OtherFace->IsNature())
 		{
-			return;
-		}
-
-		if (OtherFace->NatureForm == ENatureForm::Ground)
-		{
-			FacesOnGround |= FaceBit(OwnSign);
-		}
-		else
-		{
-			bClosed = true;
+			(OtherFace->NatureForm == ENatureForm::Ground ? OutOnGround : OutOnClosed) |= FaceBit(OwnSign);
 		}
 	});
+}
+
+bool ARoomManager::MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFacesOnGround) const
+{
+	uint8 OnGround = 0;
+	uint8 OnClosed = 0;
+	GetNatureNeighbourFaces(Platform, OnGround, OnClosed);
 
 	if (OutFacesOnGround)
 	{
-		*OutFacesOnGround = FacesOnGround;
+		*OutFacesOnGround = OnGround;
 	}
 
-	return bClosed;
+	return OnClosed != 0;
 }
 
 bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, FRandomStream& Stream)
@@ -2722,7 +2751,18 @@ bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm For
 	}
 
 	// Behind it any one-sided urban structure of the face's type there: a ceiling under ground and water, a wall
-	// behind a cliff. Whatever it is, the platform holds up what grows off it.
+	// behind a cliff. Whatever it is, the platform holds up what grows off it. The back is the city's, so it meets
+	// nature the way the city does: an exterior where it meets ground, and never water or a cliff.
+	uint8 BackOnGround = 0;
+	uint8 BackOnClosed = 0;
+	GetNatureNeighbourFaces(Platform, BackOnGround, BackOnClosed);
+
+	if ((BackOnClosed & FaceBit(-NatureSign)) != 0)
+	{
+		return false;
+	}
+
+	const bool bExteriorBack = (BackOnGround & FaceBit(-NatureSign)) != 0;
 	const EStructureType BackType = bWall ? EStructureType::Wall : EStructureType::Ceiling;
 	Options.Reset();
 
@@ -2730,6 +2770,7 @@ bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm For
 	{
 		if (!Structure->bTwoSided
 			&& EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -NatureSign, Platform.Up), BackType)
+			&& (!bExteriorBack || Structure->StandsFor(EStructureSide::Exterior))
 			&& Fits(Structure))
 		{
 			Options.Add(Structure);
@@ -2768,6 +2809,497 @@ FTransform ARoomManager::MakeFlatSlabTransform(const FGridPlatform& Platform, co
 	Centre[NormalAxis] += (0.5 + 0.25 * FaceSign) * CellSize;
 
 	return FTransform(FRotator::ZeroRotator, Centre, Extent / UnitCubeSize);
+}
+
+bool ARoomManager::PlaceNextNature()
+{
+	if (BuiltPlatforms.IsEmpty() || UsableNatureStructures.IsEmpty())
+	{
+		return false;
+	}
+
+	// A field still spilling out takes the beat, a piece a beat, the oldest first. One with no room left stops
+	// where it is.
+	while (!SpillQueue.IsEmpty())
+	{
+		FNatureSpill& Spill = SpillQueue[0];
+		const int32 Module = GetModule();
+
+		TMap<FNatureCandidateKey, int32> Seen;
+		TArray<FNatureCandidate> Candidates;
+
+		for (const FGridPlatform& Piece : Spill.Pieces)
+		{
+			int32 SpanU, SpanV;
+			GetPlatformSpans(Piece, SpanU, SpanV);
+
+			ForEachModuleEdge(Piece, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+			{
+				if (bRim)
+				{
+					GatherNatureAround(Piece, Edge.Node, Edge.Axis, Spill.Form, GetNatureMeetsBit(Spill.Form), Seen, Candidates);
+				}
+			});
+		}
+
+		// Likelier where it would meet more of the field, so it spills out as a patch rather than a line.
+		while (!Candidates.IsEmpty())
+		{
+			int32 TotalWeight = 0;
+			for (const FNatureCandidate& Candidate : Candidates)
+			{
+				TotalWeight += Candidate.Weight;
+			}
+
+			int32 Roll = NatureStream.RandRange(0, TotalWeight - 1);
+			int32 Chosen = 0;
+
+			while (Roll >= Candidates[Chosen].Weight)
+			{
+				Roll -= Candidates[Chosen].Weight;
+				++Chosen;
+			}
+
+			FNatureCandidate Candidate = Candidates[Chosen];
+
+			if (PlaceNatureCandidate(Candidate))
+			{
+				Spill.Pieces.Add(Candidate.Platform);
+
+				if (--Spill.Remaining <= 0)
+				{
+					SpillQueue.RemoveAt(0);
+				}
+
+				return true;
+			}
+
+			Candidates.RemoveAt(Chosen);
+		}
+
+		SpillQueue.RemoveAt(0);
+	}
+
+	// Otherwise something new, its form drawn by weight - and another drawn in its place where the one drawn has
+	// nowhere to go, so a beat is only lost when nature has nowhere at all.
+	TArray<ENatureForm, TInlineAllocator<NatureFormCount>> Forms = { ENatureForm::Ground, ENatureForm::Cliff, ENatureForm::Water };
+
+	auto GetFormWeight = [this](const ENatureForm Form)
+	{
+		return FMath::Max(Form == ENatureForm::Ground ? GroundWeight : (Form == ENatureForm::Cliff ? CliffWeight : WaterWeight), 0.0f);
+	};
+
+	while (!Forms.IsEmpty())
+	{
+		float TotalWeight = 0.0f;
+		for (const ENatureForm Form : Forms)
+		{
+			TotalWeight += GetFormWeight(Form);
+		}
+
+		if (TotalWeight <= 0.0f)
+		{
+			return false;
+		}
+
+		float Roll = NatureStream.FRand() * TotalWeight;
+		ENatureForm Drawn = Forms.Last();
+
+		for (const ENatureForm Form : Forms)
+		{
+			const float Weight = GetFormWeight(Form);
+
+			if (Weight <= 0.0f)
+			{
+				continue;
+			}
+
+			Drawn = Form;
+
+			if (Roll < Weight)
+			{
+				break;
+			}
+
+			Roll -= Weight;
+		}
+
+		if (PlaceNatureOfForm(Drawn))
+		{
+			return true;
+		}
+
+		Forms.Remove(Drawn);
+	}
+
+	return false;
+}
+
+bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
+{
+	TMap<FNatureCandidateKey, int32> Seen;
+	TArray<FNatureCandidate> Candidates;
+
+	// What each starts against: ground an exterior or a cliff's top or foot, a cliff ground or another cliff, water
+	// ground or a cliff's top or foot. Only a field's own spill grows off more of itself.
+	const uint8 Starts = Form == ENatureForm::Ground
+		? (NatureMeetsCity | GetNatureMeetsBit(ENatureForm::Cliff))
+		: (GetNatureMeetsBit(ENatureForm::Ground) | GetNatureMeetsBit(ENatureForm::Cliff));
+
+	// Ground starts against an exterior: a sample of the city's own open placements, each looking either way.
+	if (Form == ENatureForm::Ground)
+	{
+		EnsurePlatformCandidates();
+
+		int32 Listed = 0;
+		for (const FTileCandidates& TileList : TileCandidates)
+		{
+			for (const TArray<FGridPlatform>& KindList : TileList.ByKind)
+			{
+				Listed += KindList.Num();
+			}
+		}
+
+		for (int32 Sample = 0; Listed > 0 && Sample < NatureSampleSeeds; ++Sample)
+		{
+			int32 Pick = NatureStream.RandRange(0, Listed - 1);
+			int32 PickedTile = INDEX_NONE;
+			FGridPlatform Placement;
+
+			for (int32 TileIndex = 0; PickedTile == INDEX_NONE && TileIndex < TileCandidates.Num(); ++TileIndex)
+			{
+				for (const TArray<FGridPlatform>& KindList : TileCandidates[TileIndex].ByKind)
+				{
+					if (Pick < KindList.Num())
+					{
+						Placement = KindList[Pick];
+						PickedTile = TileIndex;
+						break;
+					}
+
+					Pick -= KindList.Num();
+				}
+			}
+
+			const int32 FirstSign = NatureStream.FRand() < 0.5f ? 1 : -1;
+
+			for (const int32 Sign : { FirstSign, -FirstSign })
+			{
+				FGridPlatform Platform = Placement;
+				Platform.Up = MakeFace(AxisIndex(Platform.Normal), Sign);
+
+				const FNatureCandidateKey Key(MakeCandidateKey(Platform), PickedTile, static_cast<int32>(Platform.Up) * 2 + (Sign > 0 ? 0 : 1));
+
+				if (Seen.Contains(Key))
+				{
+					continue;
+				}
+
+				const bool bCandidate = JudgeNatureCandidate(Platform, Form, Sign, Starts);
+				Seen.Add(Key, bCandidate ? Candidates.Num() : INDEX_NONE);
+
+				if (bCandidate)
+				{
+					Candidates.Add(FNatureCandidate{ Platform, Form, Sign, 1 });
+				}
+			}
+		}
+	}
+
+	// What grows off nature, off a sample of nature's rim: ground at a cliff's top or foot; a cliff off ground or
+	// carrying a cliff on; water beside ground or at a cliff's top or foot.
+	TArray<int32> Anchors = NatureIndices[static_cast<int32>(ENatureForm::Cliff)];
+
+	if (Form != ENatureForm::Ground)
+	{
+		Anchors.Append(NatureIndices[static_cast<int32>(ENatureForm::Ground)]);
+	}
+
+	const int32 Module = GetModule();
+
+	for (int32 Sample = 0; !Anchors.IsEmpty() && Sample < NatureSampleEdges; ++Sample)
+	{
+		const FGridPlatform& Anchor = BuiltPlatforms[Anchors[NatureStream.RandRange(0, Anchors.Num() - 1)]];
+
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Anchor, SpanU, SpanV);
+
+		TArray<FLatticeEdge, TInlineAllocator<32>> RimEdges;
+		ForEachModuleEdge(Anchor, SpanU, SpanV, Module, [&RimEdges](const FLatticeEdge& Edge, const bool bRim)
+		{
+			if (bRim)
+			{
+				RimEdges.Add(Edge);
+			}
+		});
+
+		const FLatticeEdge& Edge = RimEdges[NatureStream.RandRange(0, RimEdges.Num() - 1)];
+		GatherNatureAround(Anchor, Edge.Node, Edge.Axis, Form, Starts, Seen, Candidates);
+	}
+
+	// Drawn evenly among what was found: anywhere it was found, it could start.
+	while (!Candidates.IsEmpty())
+	{
+		const int32 Chosen = NatureStream.RandRange(0, Candidates.Num() - 1);
+		FNatureCandidate Candidate = Candidates[Chosen];
+
+		if (PlaceNatureCandidate(Candidate))
+		{
+			// Ground and water spill out from here, to a size drawn now.
+			if (Form != ENatureForm::Cliff)
+			{
+				const int32 Fewest = FMath::Max(Form == ENatureForm::Ground ? GroundSpillMin : WaterSpillMin, 1);
+				const int32 Most = FMath::Max(Form == ENatureForm::Ground ? GroundSpillMax : WaterSpillMax, Fewest);
+				const int32 Size = NatureStream.RandRange(Fewest, Most);
+
+				if (Size > 1)
+				{
+					FNatureSpill& Spill = SpillQueue.AddDefaulted_GetRef();
+					Spill.Form = Form;
+					Spill.Pieces.Add(Candidate.Platform);
+					Spill.Remaining = Size - 1;
+				}
+			}
+
+			return true;
+		}
+
+		Candidates.RemoveAt(Chosen);
+	}
+
+	return false;
+}
+
+void ARoomManager::GatherNatureAround(
+	const FGridPlatform& Anchor,
+	const FIntVector& EdgeNode,
+	const int32 EdgeAxis,
+	const ENatureForm Form,
+	const uint8 Starts,
+	TMap<FNatureCandidateKey, int32>& Seen,
+	TArray<FNatureCandidate>& Out)
+{
+	int32 AnchorSign = 0;
+	ENatureForm AnchorForm = ENatureForm::Ground;
+
+	if (!GetNatureFace(Anchor, AnchorSign, AnchorForm))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+	const FLatticeEdge Edge{ EdgeNode, EdgeAxis };
+	const int32 AnchorNormal = AxisIndex(Anchor.Normal);
+	const int32 AnchorUpAxis = FaceAxis(Anchor.Up);
+
+	// How it grows off the anchor: a field carries a field on in its plane, and a cliff a cliff; a cliff stands on a
+	// field's outline, a field lies at a cliff's top or foot, and a cliff turns a corner round another's side.
+	const bool bFieldOffField = Form != ENatureForm::Cliff && AnchorForm != ENatureForm::Cliff;
+	const bool bCliffOffCliff = Form == ENatureForm::Cliff && AnchorForm == ENatureForm::Cliff;
+	const bool bInPlane = bFieldOffField || bCliffOffCliff;
+	const bool bAcross = !bFieldOffField && (!bCliffOffCliff || EdgeAxis == AnchorUpAxis);
+
+	// Nothing to judge where every half-plane it could take round the edge is already taken.
+	FModuleFace EdgeFaces[4];
+	GetEdgeFaces(Edge, Module, EdgeFaces);
+
+	bool bAnyFree = false;
+
+	for (const FModuleFace& Face : EdgeFaces)
+	{
+		const bool bWanted = Face.Normal == AnchorNormal ? bInPlane : bAcross;
+		bAnyFree = bAnyFree || (bWanted && !ModuleFaceOwners.Contains(MakeModuleFaceKey(Face.MinNode, Face.Normal)));
+	}
+
+	if (!bAnyFree)
+	{
+		return;
+	}
+
+	ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/true, [&](const int32 TileIndex, const FGridPlatform& Placement, bool)
+	{
+		const int32 NormalAxis = AxisIndex(Placement.Normal);
+		const bool bCoplanar = NormalAxis == AnchorNormal;
+
+		if (bCoplanar ? !bInPlane : !bAcross)
+		{
+			return;
+		}
+
+		// The Ups it could take, each with the face that would be nature. Carrying a field on, the field's own; at a
+		// cliff's top or foot, either way along its own normal. A cliff takes the Up of what it grows off, which lies
+		// in its plane.
+		TArray<TPair<EGridFace, int32>, TInlineAllocator<2>> Ways;
+
+		if (bFieldOffField)
+		{
+			Ways.Emplace(Anchor.Up, FaceSign(Anchor.Up));
+		}
+		else if (Form != ENatureForm::Cliff)
+		{
+			if (NormalAxis == AnchorUpAxis)
+			{
+				Ways.Emplace(MakeFace(NormalAxis, 1), 1);
+				Ways.Emplace(MakeFace(NormalAxis, -1), -1);
+			}
+		}
+		else if (AnchorUpAxis != NormalAxis)
+		{
+			Ways.Emplace(Anchor.Up, 1);
+			Ways.Emplace(Anchor.Up, -1);
+		}
+
+		for (const TPair<EGridFace, int32>& Way : Ways)
+		{
+			FGridPlatform Platform = Placement;
+			Platform.Up = Way.Key;
+
+			const FNatureCandidateKey Key(MakeCandidateKey(Platform), TileIndex, static_cast<int32>(Way.Key) * 2 + (Way.Value > 0 ? 0 : 1));
+
+			// Found again off another edge it would share: likelier to be drawn as a field's next piece.
+			if (const int32* Found = Seen.Find(Key))
+			{
+				if (*Found != INDEX_NONE)
+				{
+					++Out[*Found].Weight;
+				}
+
+				continue;
+			}
+
+			const bool bCandidate = JudgeNatureCandidate(Platform, Form, Way.Value, Starts);
+			Seen.Add(Key, bCandidate ? Out.Num() : INDEX_NONE);
+
+			if (bCandidate)
+			{
+				Out.Add(FNatureCandidate{ Platform, Form, Way.Value, 1 });
+			}
+		}
+	});
+}
+
+bool ARoomManager::JudgeNatureCandidate(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, const uint8 Starts)
+{
+	UPlatformStructureData* Front = nullptr;
+	UPlatformStructureData* Back = nullptr;
+
+	if (!Platform.Tile
+		|| !Platform.Tile->AllowsOrientation(Platform.GetKind() == EPlatformKind::SurfaceVertical)
+		|| !FindNatureFill(Platform, Form, NatureSign, Front, Back))
+	{
+		return false;
+	}
+
+	Platform.PositiveStructure = NatureSign > 0 ? Front : Back;
+	Platform.NegativeStructure = NatureSign > 0 ? Back : Front;
+
+	// Free, and legal to place filled so - which asks every face it would meet - with its nature face against what
+	// it may start against.
+	uint8 NatureMeets = 0;
+	return IsPlacementOpen(Platform) && AreNatureMeetingsLegal(Platform, &NatureMeets) && (NatureMeets & Starts) != 0;
+}
+
+bool ARoomManager::FindNatureFill(
+	const FGridPlatform& Platform,
+	const ENatureForm Form,
+	const int32 NatureSign,
+	UPlatformStructureData*& OutFront,
+	UPlatformStructureData*& OutBack)
+{
+	OutFront = nullptr;
+	OutBack = nullptr;
+
+	int32 SpanU, SpanV;
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	const bool bWall = Platform.IsWall();
+
+	// A cliff stands as a wall in its own frame; ground and water lie along their Up, looking out along it.
+	if (bWall != (Form == ENatureForm::Cliff) || (!bWall && NatureSign != FaceSign(Platform.Up)))
+	{
+		return false;
+	}
+
+	const uint64 Key = static_cast<uint64>(SpanU)
+		| (static_cast<uint64>(SpanV) << 12)
+		| (static_cast<uint64>(NormalAxis) << 24)
+		| (static_cast<uint64>(Platform.Up) << 28)
+		| (static_cast<uint64>(Form) << 32)
+		| (static_cast<uint64>(NatureSign > 0 ? 1 : 0) << 36);
+
+	if (const FNatureFillStandIns* Cached = NatureFillCache.Find(Key))
+	{
+		OutFront = Cached->Front;
+		OutBack = Cached->Back;
+		return OutFront && OutBack;
+	}
+
+	auto Fits = [&](const UPlatformStructureData* Structure)
+	{
+		bool bTurned = false;
+		return WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned);
+	};
+
+	FNatureFillStandIns StandIns;
+
+	for (UPlatformStructureData* Structure : UsableNatureStructures)
+	{
+		if (Structure->NatureForm == Form && (!Structure->Mesh || Fits(Structure)))
+		{
+			StandIns.Front = Structure;
+			break;
+		}
+	}
+
+	const EStructureType BackType = bWall ? EStructureType::Wall : EStructureType::Ceiling;
+
+	for (UPlatformStructureData* Structure : UsableStructures)
+	{
+		if (Structure->bTwoSided
+			|| !EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -NatureSign, Platform.Up), BackType)
+			|| !Fits(Structure))
+		{
+			continue;
+		}
+
+		// An exterior where one fits, since that is what the most nature takes.
+		if (!StandIns.Back || Structure->StandsFor(EStructureSide::Exterior))
+		{
+			StandIns.Back = Structure;
+		}
+
+		if (StandIns.Back->StandsFor(EStructureSide::Exterior))
+		{
+			break;
+		}
+	}
+
+	NatureFillCache.Add(Key, StandIns);
+
+	OutFront = StandIns.Front;
+	OutBack = StandIns.Back;
+	return OutFront && OutBack;
+}
+
+bool ARoomManager::PlaceNatureCandidate(FNatureCandidate& Candidate)
+{
+	// Its stand-ins only said it could be filled. What fills it is drawn now, and held to the rules again.
+	if (!DrawNatureFill(Candidate.Platform, Candidate.Form, Candidate.NatureSign, NatureStream) || !CanPlacePlatform(Candidate.Platform))
+	{
+		return false;
+	}
+
+	PlacePlatform(Candidate.Platform, /*JoinedSide=*/0);
+	return true;
+}
+
+void ARoomManager::AdvanceNature()
+{
+	PlaceNextNature();
 }
 
 void ARoomManager::RecordFill(const int32 PlatformIndex)
@@ -3242,6 +3774,14 @@ void ARoomManager::RebuildPlatformState()
 	PatchSizeSquares = 0;
 	CategoryPatchSize = 0.0;
 	NaturePlatformCount = 0;
+	GroundCount = 0;
+	CliffCount = 0;
+	WaterCount = 0;
+
+	for (TArray<int32>& Indices : NatureIndices)
+	{
+		Indices.Reset();
+	}
 
 	// The candidates follow from everything below, so they are gathered afresh on the next draw.
 	bPlatformCandidatesStale = true;
@@ -3621,9 +4161,17 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 	// What fills it follows from the faces placed before it, so it is recorded in the same order.
 	RecordFill(PlatformIndex);
 
-	if (IsNatureSegment(Platform))
+	int32 NatureSign = 0;
+	ENatureForm Form = ENatureForm::Ground;
+
+	if (GetNatureFace(Platform, NatureSign, Form))
 	{
 		++NaturePlatformCount;
+		NatureIndices[static_cast<int32>(Form)].Add(PlatformIndex);
+
+		GroundCount = NatureIndices[static_cast<int32>(ENatureForm::Ground)].Num();
+		CliffCount = NatureIndices[static_cast<int32>(ENatureForm::Cliff)].Num();
+		WaterCount = NatureIndices[static_cast<int32>(ENatureForm::Water)].Num();
 	}
 }
 
