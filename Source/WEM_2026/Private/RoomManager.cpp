@@ -614,6 +614,9 @@ ARoomManager::ARoomManager()
 	GridLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("GridLineBatcher"));
 	GridLineBatcher->SetupAttachment(SceneRoot);
 
+	AirLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("AirLineBatcher"));
+	AirLineBatcher->SetupAttachment(SceneRoot);
+
 	// Instanced rather than a component per piece: a cube fills with thousands of them. Each of
 	// these two is only the first chunk of its kind; SyncPieceLayer adds more as the structure
 	// grows, set up the way these are set up here. Each structure's layer starts from a chunk set up
@@ -2053,6 +2056,7 @@ void ARoomManager::ResetPlacementStream()
 	// A zero seed means "different every run"; any other value replays the same growth.
 	const int32 Seed = PlatformRandomSeed != 0 ? PlatformRandomSeed : FMath::Rand();
 	PlacementStream.Initialize(Seed);
+	RunSeed = Seed;
 
 	// The fills are drawn from the same seed but a stream apart, so a seed lays the same platforms
 	// whatever the structures draw in between.
@@ -3196,7 +3200,14 @@ bool ARoomManager::JudgeNatureCandidate(FGridPlatform& Platform, const ENatureFo
 	// Free, and legal to place filled so - which asks every face it would meet - with its nature face against what
 	// it may start against.
 	uint8 NatureMeets = 0;
-	return IsPlacementOpen(Platform) && AreNatureMeetingsLegal(Platform, &NatureMeets) && (NatureMeets & Starts) != 0;
+
+	if (!IsPlacementOpen(Platform) || !AreNatureMeetingsLegal(Platform, &NatureMeets) || (NatureMeets & Starts) == 0)
+	{
+		return false;
+	}
+
+	// Ground and water only go where the air above them is clear.
+	return Form == ENatureForm::Cliff || IsAirClear(Platform);
 }
 
 bool ARoomManager::FindNatureFill(
@@ -3300,6 +3311,227 @@ bool ARoomManager::PlaceNatureCandidate(FNatureCandidate& Candidate)
 void ARoomManager::AdvanceNature()
 {
 	PlaceNextNature();
+}
+
+bool ARoomManager::IsFieldPiece(const FGridPlatform& Platform)
+{
+	int32 Sign = 0;
+	ENatureForm Form = ENatureForm::Ground;
+	return GetNatureFace(Platform, Sign, Form) && Form != ENatureForm::Cliff;
+}
+
+int32 ARoomManager::GetAirHeight(const FGridPlatform& Platform) const
+{
+	const int32 Storey = FMath::Max(StoreyCells, 1);
+	const int32 Fewest = FMath::Max(MinAirStoreys, 0) * Storey;
+	const int32 Most = FMath::Max(FMath::Max(MaxAirStoreys, 0) * Storey, Fewest);
+
+	// From the piece itself, so the same piece keeps the same air however often it is rebuilt.
+	FRandomStream Stream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(MakePlatformKey(Platform)))));
+	return Stream.RandRange(Fewest, Most);
+}
+
+void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 PlatformIndex, const int32 Height, TArray<FAirBox>& OutBoxes) const
+{
+	OutBoxes.Reset();
+
+	int32 SpanU, SpanV;
+	if (Height <= 0 || !GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	const int32 Plane = Platform.MinNode[NormalAxis];
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// Out along its Up, which for a piece of a field is along its normal.
+	auto MakeBox = [&](FIntVector Min, FIntVector Max, const int32 BoxHeight) -> FAirBox
+	{
+		const bool bOutPositive = FaceSign(Platform.Up) > 0;
+		Min[NormalAxis] = bOutPositive ? Plane + 1 : Plane - BoxHeight;
+		Max[NormalAxis] = bOutPositive ? Plane + BoxHeight : Plane - 1;
+		return FAirBox{ Min, Max };
+	};
+
+	// Over its opening, between its beams.
+	{
+		FIntVector Min = Platform.MinNode;
+		FIntVector Max = Platform.MinNode;
+		Min[U] += 1;
+		Min[V] += 1;
+		Max[U] += SpanU - 1;
+		Max[V] += SpanV - 1;
+		OutBoxes.Add(MakeBox(Min, Max, Height));
+	}
+
+	// Over each run of seam it shares with a field beside it in its plane, laid before it with its Up - the lower
+	// of the two heights - leaving the nodes at either end of the run, which may be on the outline, open.
+	for (const int32 AcrossAxis : { U, V })
+	{
+		const int32 AlongAxis = AcrossAxis == U ? V : U;
+		const int32 Span = AcrossAxis == U ? SpanU : SpanV;
+		const int32 AlongSpan = AcrossAxis == U ? SpanV : SpanU;
+
+		for (const int32 Side : { -1, 1 })
+		{
+			const int32 Line = Platform.MinNode[AcrossAxis] + (Side > 0 ? Span : 0);
+			int32 RunStart = INDEX_NONE;
+			int32 RunHeight = Height;
+
+			auto CloseRun = [&](const int32 RunEnd)
+			{
+				if (RunStart == INDEX_NONE)
+				{
+					return;
+				}
+
+				FIntVector Min = Platform.MinNode;
+				FIntVector Max = Platform.MinNode;
+				Min[AcrossAxis] = Line;
+				Max[AcrossAxis] = Line;
+				Min[AlongAxis] = RunStart + 1;
+				Max[AlongAxis] = RunEnd - 1;
+				OutBoxes.Add(MakeBox(Min, Max, RunHeight));
+
+				RunStart = INDEX_NONE;
+				RunHeight = Height;
+			};
+
+			for (int32 Step = 0; Step < AlongSpan; Step += Module)
+			{
+				// The module face across this edge of its rim, in its plane.
+				FIntVector FaceMinNode = Platform.MinNode;
+				FaceMinNode[AcrossAxis] = Side > 0 ? Line : Line - Module;
+				FaceMinNode[AlongAxis] += Step;
+
+				const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+				const FGridPlatform* Neighbour = FaceOwner && *FaceOwner < PlatformIndex ? &BuiltPlatforms[*FaceOwner] : nullptr;
+				const bool bShared = Neighbour && Neighbour->Up == Platform.Up && IsFieldPiece(*Neighbour);
+
+				if (bShared)
+				{
+					if (RunStart == INDEX_NONE)
+					{
+						RunStart = Platform.MinNode[AlongAxis] + Step;
+					}
+
+					RunHeight = FMath::Min(RunHeight, GetAirHeight(*Neighbour));
+				}
+				else
+				{
+					CloseRun(Platform.MinNode[AlongAxis] + Step);
+				}
+			}
+
+			CloseRun(Platform.MinNode[AlongAxis] + AlongSpan);
+		}
+	}
+}
+
+bool ARoomManager::IsAirClear(const FGridPlatform& Platform) const
+{
+	const int32 Fewest = FMath::Max(MinAirStoreys, 0) * FMath::Max(StoreyCells, 1);
+
+	TArray<FAirBox> Boxes;
+	GatherAirBoxes(Platform, BuiltPlatforms.Num(), Fewest, Boxes);
+
+	bool bClear = true;
+
+	// Clear of every platform: no module face, module edge or node any of them takes in. Air may overlap air.
+	for (const FAirBox& Box : Boxes)
+	{
+		ForEachObstaclePiece(Box.Min, Box.Max, GetModule(),
+			[&](const FIntVector& FaceMinNode, const int32 NormalAxis) { bClear = bClear && !ModuleFaceOwners.Contains(MakeModuleFaceKey(FaceMinNode, NormalAxis)); },
+			[&](const FLatticeEdge& Edge) { bClear = bClear && !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)); },
+			[&](const FIntVector& Node) { bClear = bClear && !RimCellNormals.Contains(MakeCellKey(Node)); });
+
+		if (!bClear)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void ARoomManager::DropCandidatesCutBy(const FIntVector& MinCell, const FIntVector& MaxCell)
+{
+	// Lists that are going to be gathered afresh anyway hold nothing worth judging.
+	if (bPlatformCandidatesStale || TileCandidates.Num() != UsableTiles.Num())
+	{
+		return;
+	}
+
+	// A box can only cut a placement whose footprint it reaches into, so only those are judged again - in their
+	// lists' own order, which dropping some keeps.
+	for (FTileCandidates& TileList : TileCandidates)
+	{
+		for (TArray<FGridPlatform>& Candidates : TileList.ByKind)
+		{
+			for (int32 Index = Candidates.Num() - 1; Index >= 0; --Index)
+			{
+				const FGridPlatform& Candidate = Candidates[Index];
+
+				int32 SpanU, SpanV, U, V;
+				GetPlatformSpans(Candidate, SpanU, SpanV);
+				GetInPlaneAxes(AxisIndex(Candidate.Normal), U, V);
+
+				FIntVector CandidateMax = Candidate.MinNode;
+				CandidateMax[U] += SpanU;
+				CandidateMax[V] += SpanV;
+
+				const bool bReaches = MinCell.X <= CandidateMax.X && MaxCell.X >= Candidate.MinNode.X
+					&& MinCell.Y <= CandidateMax.Y && MaxCell.Y >= Candidate.MinNode.Y
+					&& MinCell.Z <= CandidateMax.Z && MaxCell.Z >= Candidate.MinNode.Z;
+
+				if (bReaches && !IsPlacementOpen(Candidate))
+				{
+					Candidates.RemoveAt(Index);
+				}
+			}
+		}
+	}
+}
+
+void ARoomManager::RebuildAirLines()
+{
+	if (!AirLineBatcher)
+	{
+		return;
+	}
+
+	AirLineBatcher->Flush();
+
+	if (!bShowAir || AirBoxes.IsEmpty())
+	{
+		return;
+	}
+
+	// Each box as far as it lies inside the cube, its outer faces on the cells' outer sides.
+	const int32 LastCell = ResolveGridSize() - 1;
+	const FLinearColor Color(AirColor);
+
+	TArray<FBatchedLine> Lines;
+	Lines.Reserve(AirBoxes.Num() * 12);
+
+	for (const FAirBox& Box : AirBoxes)
+	{
+		const FIntVector Min(FMath::Max(Box.Min.X, 0), FMath::Max(Box.Min.Y, 0), FMath::Max(Box.Min.Z, 0));
+		const FIntVector Max(FMath::Min(Box.Max.X, LastCell), FMath::Min(Box.Max.Y, LastCell), FMath::Min(Box.Max.Z, LastCell));
+
+		if (Min.X > Max.X || Min.Y > Max.Y || Min.Z > Max.Z)
+		{
+			continue;
+		}
+
+		AppendBoxLines(Lines, GetCellMinCorner(Min), GetCellMinCorner(Max) + FVector(CellSize), Color, GridLineThickness, SDPG_World, /*bWithDiagonals=*/false);
+	}
+
+	AirLineBatcher->DrawLines(Lines);
 }
 
 void ARoomManager::RecordFill(const int32 PlatformIndex)
@@ -3751,7 +3983,9 @@ void ARoomManager::RebuildPlatformState()
 	// The tiles first, since which of them fit the lattice decides which platforms do.
 	ResolveUsableTiles();
 
-	// And the obstacles, which every placement below is held against as well.
+	// And the obstacles, which every placement below is held against as well. The air nature keeps open
+	// follows from the platforms, so it is laid again with them below.
+	AirBoxes.Reset();
 	RebuildObstacleKeys();
 
 	++StructureRevision;
@@ -3925,6 +4159,7 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		bPlatformCandidatesStale = true;
 	}
 
+	const int32 AirBoxesBefore = AirBoxes.Num();
 	RecordPlatform(Platform);
 
 	++StructureRevision;
@@ -4094,6 +4329,12 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 			}
 		});
 	}
+
+	// Air it keeps open only takes room away, from anything listed that reaches into it.
+	for (int32 BoxIndex = AirBoxesBefore; BoxIndex < AirBoxes.Num(); ++BoxIndex)
+	{
+		DropCandidatesCutBy(AirBoxes[BoxIndex].Min, AirBoxes[BoxIndex].Max);
+	}
 }
 
 void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
@@ -4172,6 +4413,20 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 		GroundCount = NatureIndices[static_cast<int32>(ENatureForm::Ground)].Num();
 		CliffCount = NatureIndices[static_cast<int32>(ENatureForm::Cliff)].Num();
 		WaterCount = NatureIndices[static_cast<int32>(ENatureForm::Water)].Num();
+	}
+
+	// Ground and water keep the air above them open from the moment they are taken in, judged against the
+	// fields taken in before them, so the rebuild keeps the same air the placements did.
+	if (IsFieldPiece(Platform))
+	{
+		TArray<FAirBox> Boxes;
+		GatherAirBoxes(Platform, PlatformIndex, GetAirHeight(Platform), Boxes);
+
+		for (const FAirBox& Box : Boxes)
+		{
+			AirBoxes.Add(Box);
+			AddObstacleKeys(Box.Min, Box.Max);
+		}
 	}
 }
 
@@ -4728,11 +4983,21 @@ void ARoomManager::RebuildObstacleKeys()
 
 	for (const FGridObstacle& Obstacle : Obstacles)
 	{
-		ForEachObstaclePiece(Obstacle.MinCell, Obstacle.MaxCell, Module,
-			[this](const FIntVector& FaceMinNode, const int32 NormalAxis) { ObstacleFaces.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis)); },
-			[this](const FLatticeEdge& Edge) { ObstacleEdges.Add(MakeEdgeKey(Edge)); },
-			[this](const FIntVector& Node) { ObstacleNodes.Add(MakeCellKey(Node)); });
+		AddObstacleKeys(Obstacle.MinCell, Obstacle.MaxCell);
 	}
+
+	for (const FAirBox& Box : AirBoxes)
+	{
+		AddObstacleKeys(Box.Min, Box.Max);
+	}
+}
+
+void ARoomManager::AddObstacleKeys(const FIntVector& MinCell, const FIntVector& MaxCell)
+{
+	ForEachObstaclePiece(MinCell, MaxCell, GetModule(),
+		[this](const FIntVector& FaceMinNode, const int32 NormalAxis) { ObstacleFaces.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis)); },
+		[this](const FLatticeEdge& Edge) { ObstacleEdges.Add(MakeEdgeKey(Edge)); },
+		[this](const FIntVector& Node) { ObstacleNodes.Add(MakeCellKey(Node)); });
 }
 
 void ARoomManager::BeginNewGeneration()
@@ -5017,6 +5282,7 @@ void ARoomManager::RebuildVisuals()
 	SyncSurfaceMarks();
 
 	RebuildDebugGrid();
+	RebuildAirLines();
 }
 
 void ARoomManager::UpdateVisualsAfterPlacement(
@@ -5025,6 +5291,11 @@ void ARoomManager::UpdateVisualsAfterPlacement(
 {
 	AppendPlatformPieces(Platform);
 	UpdateSurfaceMarks(ChangedSurfaces);
+
+	if (IsFieldPiece(Platform))
+	{
+		RebuildAirLines();
+	}
 }
 
 UMaterialInstanceDynamic* ARoomManager::ResolveTintedMaterial(

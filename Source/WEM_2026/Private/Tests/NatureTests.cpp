@@ -780,4 +780,112 @@ bool FNatureGrowthTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureAirTest, "WEM.Nature.Air", WEMRoomManagerTests::TestFlags)
+
+bool FNatureAirTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+	Manager->GridSize = 129;
+	Manager->ClearPlatforms();
+	UPlatformTileData* Square = Manager->Tiles[0];
+
+	// A piece of ground at Z 32, X and Y 16 to 32, with a wall of the city rising off its east edge, facing it.
+	const FGridPlatform Field = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
+	const FGridPlatform Wall = MakeSegment(FIntVector(32, 16, 32), EGridAxis::X, Square, EGridFace::PosZ, Kit.WallInterior, Kit.WallExterior);
+	FRoomManagerTestAccess::Rebuild(*Manager, { Field, Wall });
+	TestEqual(TEXT("Field and wall stand"), Manager->GetPlatformCount(), 2);
+
+	// Its air: over its opening, out along its Up, between three and five storeys high.
+	TArray<TPair<FIntVector, FIntVector>> Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
+	TestEqual(TEXT("One box of air, over its opening"), Boxes.Num(), 1);
+
+	if (Boxes.Num() == 1)
+	{
+		const int32 Height = Boxes[0].Value.Z - Boxes[0].Key.Z + 1;
+		AddInfo(FString::Printf(TEXT("The field keeps %d cells of air."), Height));
+		TestEqual(TEXT("Between its beams"), Boxes[0].Key, FIntVector(17, 17, 33));
+		TestTrue(TEXT("Between three and five storeys"), Height >= 48 && Height <= 80 && Boxes[0].Value.X == 31 && Boxes[0].Value.Y == 31);
+	}
+
+	// Nothing is built in it: no floor off the wall's top over the field. Beyond the field the air is free.
+	TestFalse(TEXT("No floor over the field"), Manager->CanPlacePlatform(MakeSegment(FIntVector(16, 16, 48), EGridAxis::Z, Square, EGridFace::PosZ, nullptr, nullptr)));
+	TestTrue(TEXT("A floor beyond it"), Manager->CanPlacePlatform(MakeSegment(FIntVector(32, 16, 48), EGridAxis::Z, Square, EGridFace::PosZ, nullptr, nullptr)));
+
+	// Its outline is left open: a wall may still rise off its south edge.
+	const FGridPlatform SouthWall = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Y, Square, EGridFace::PosZ, nullptr, nullptr);
+	TestTrue(TEXT("A wall rises off the outline"), Manager->CanPlacePlatform(SouthWall));
+
+	// A pool beside it, south, shares a seam with it, and the air closes over the seam: no wall rises there now. Water
+	// holds nothing, so the seam stays a wall surface and only the air holds the wall back.
+	FRoomManagerTestAccess::Rebuild(*Manager, { Field, MakeSegment(FIntVector(16, 0, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Water, Kit.CeilingInterior) });
+	Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
+	TestEqual(TEXT("Two openings and the seam between them"), Boxes.Num(), 3);
+
+	if (Boxes.Num() == 3)
+	{
+		TestTrue(TEXT("The seam runs along its edge, short of the nodes at its ends"),
+			Boxes[2].Key == FIntVector(17, 16, 33) && Boxes[2].Value.X == 31 && Boxes[2].Value.Y == 16);
+	}
+
+	TestFalse(TEXT("No wall rises off the seam"), Manager->CanPlacePlatform(SouthWall));
+
+	// A piece is only laid where its fewest storeys of air are clear: not under a floor one storey up.
+	const FGridPlatform Roof = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior);
+	const FGridPlatform Rise = MakeSegment(FIntVector(48, 16, 32), EGridAxis::X, Square, EGridFace::PosZ, Kit.WallExterior, Kit.WallInterior);
+	const FGridPlatform Over = MakeSegment(FIntVector(32, 16, 48), EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior);
+	FRoomManagerTestAccess::Rebuild(*Manager, { Roof, Rise, Over });
+	TestEqual(TEXT("Roof, wall and floor stand"), Manager->GetPlatformCount(), 3);
+
+	const FGridPlatform Under = MakeSegment(FIntVector(32, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
+	TestFalse(TEXT("Ground under a floor one storey up has no air"), FRoomManagerTestAccess::IsAirClear(*Manager, Under));
+
+	Manager->MinAirStoreys = 0;
+	TestTrue(TEXT("Asking no air, it has enough"), FRoomManagerTestAccess::IsAirClear(*Manager, Under));
+	Manager->MinAirStoreys = 3;
+
+	const FGridPlatform Open = MakeSegment(FIntVector(0, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
+	TestTrue(TEXT("Beside the roof, with nothing over it, the air is clear"), FRoomManagerTestAccess::IsAirClear(*Manager, Open));
+
+	// Upside down, the air is kept below it.
+	FRoomManagerTestAccess::Rebuild(*Manager, { MakeSegment(FIntVector(16, 16, 96), EGridAxis::Z, Square, EGridFace::NegZ, Kit.CeilingInterior, Kit.Ground) });
+	Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
+	TestTrue(TEXT("Hanging ground keeps the air below it"), Boxes.Num() == 1 && Boxes[0].Value.Z == 95 && Boxes[0].Key.Z <= 95 - 47);
+
+	// The city growing round fields with their air, and nature growing too, agrees with a full rebuild.
+	Manager->ClearPlatforms();
+
+	for (int32 Beat = 0; Beat < 120; ++Beat)
+	{
+		Manager->PlaceNextPlatform();
+	}
+
+	for (int32 Beat = 0; Beat < 300; ++Beat)
+	{
+		if (Beat % 2 == 0)
+		{
+			Manager->PlaceNextNature();
+		}
+		else
+		{
+			Manager->PlaceNextPlatform();
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("%d platforms: %d ground, %d cliff, %d water, %d boxes of air."),
+		Manager->GetPlatformCount(), Manager->GroundCount, Manager->CliffCount, Manager->WaterCount, FRoomManagerTestAccess::GetAirBoxes(*Manager).Num()));
+
+	TestTrue(TEXT("Fields keep air"), Manager->GroundCount + Manager->WaterCount > 0 && FRoomManagerTestAccess::GetAirBoxes(*Manager).Num() >= Manager->GroundCount + Manager->WaterCount);
+	TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 #endif

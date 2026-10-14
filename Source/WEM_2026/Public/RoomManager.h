@@ -412,6 +412,13 @@ struct FSurfaceMarkLayer
  * or a pool of water, beside ground or at a cliff's top or foot. Where they could go is sampled
  * rather than walked in full, so a beat costs the same however far nature has spread.
  *
+ * Every piece of ground and water keeps the air above it open: a box of cells out along its Up, as
+ * high as it drew between MinAirStoreys and MaxAirStoreys, over its opening and over the seam it shares
+ * with any field laid before it in its plane with its Up - but never over its outline, so cliffs still
+ * rise and drop there. The air holds growth back as an obstacle does, without changing any surface, and
+ * a piece is only laid where MinAirStoreys of it are clear of every platform already. Its height is
+ * drawn from the run's seed and the piece itself, so a rebuild keeps the same air.
+ *
  * Surfaces
  * --------
  * A surface is one face of one cell. Only a platform's two broad faces count - the two faces of
@@ -707,6 +714,29 @@ public:
 	/** The most pieces a pool of water spills out to. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
 	int32 WaterSpillMax = 6;
+
+	/** Cells in one storey, the measure of the air kept open above ground and water. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "1"))
+	int32 StoreyCells = 16;
+
+	/**
+	 * The fewest storeys of air kept open above every piece of ground and water, out along its Up. A piece is
+	 * only laid where this much is clear of every platform. Zero keeps no air.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0"))
+	int32 MinAirStoreys = 3;
+
+	/** The most storeys of air a piece keeps open. Each piece keeps a height of its own, drawn between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0"))
+	int32 MaxAirStoreys = 5;
+
+	/** Draws the air kept open above ground and water as boxes of lines. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
+	bool bShowAir = true;
+
+	/** Colour of the air kept open above ground and water. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
+	FColor AirColor = FColor(255, 190, 40);
 
 	/** Platforms of ground standing. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
@@ -1524,6 +1554,38 @@ private:
 	/** Fills a candidate from the nature stream and places it. False when no fill can be drawn, or it is no longer legal. */
 	bool PlaceNatureCandidate(FNatureCandidate& Candidate);
 
+	/** One box of air kept open, inclusive at both corners. */
+	struct FAirBox
+	{
+		FIntVector Min = FIntVector::ZeroValue;
+		FIntVector Max = FIntVector::ZeroValue;
+	};
+
+	/** Whether a platform is a piece of a field: ground or water, which keep the air above them open. */
+	static bool IsFieldPiece(const FGridPlatform& Platform);
+
+	/** How many cells of air a piece of ground or water keeps open, drawn between the storeys from the run's seed and the piece's own key. */
+	int32 GetAirHeight(const FGridPlatform& Platform) const;
+
+	/**
+	 * The boxes of air a piece of ground or water keeps open, Height cells out along its Up: one over its
+	 * opening, and one over each run of seam it shares with a piece of a field laid before it - before
+	 * PlatformIndex - in its plane with its Up. Its outline is left open.
+	 */
+	void GatherAirBoxes(const FGridPlatform& Platform, int32 PlatformIndex, int32 Height, TArray<FAirBox>& OutBoxes) const;
+
+	/** Whether a piece of ground or water about to be placed would have MinAirStoreys of air clear of every platform. */
+	bool IsAirClear(const FGridPlatform& Platform) const;
+
+	/** Adds the lattice pieces an inclusive box of cells cuts to the obstacle keys. */
+	void AddObstacleKeys(const FIntVector& MinCell, const FIntVector& MaxCell);
+
+	/** Judges again every listed placement whose footprint reaches into a box just held back, dropping those it now cuts. */
+	void DropCandidatesCutBy(const FIntVector& MinCell, const FIntVector& MaxCell);
+
+	/** Flushes and redraws the air kept open, in its own batcher. */
+	void RebuildAirLines();
+
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
 
@@ -1847,6 +1909,12 @@ private:
 
 	TMap<uint64, FNatureFillStandIns> NatureFillCache;
 
+	/** The air every piece of ground and water keeps open, in the order the pieces were taken in. Its pieces are among the obstacle keys. */
+	TArray<FAirBox> AirBoxes;
+
+	/** The seed the streams were last started from, which the heights of the air are drawn from too. */
+	int32 RunSeed = 0;
+
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
 
@@ -2017,4 +2085,8 @@ private:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<ULineBatchComponent> GridLineBatcher;
+
+	/** Draws the air kept open. A batcher of its own, since it is redrawn as nature grows and the lattice is not. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULineBatchComponent> AirLineBatcher;
 };

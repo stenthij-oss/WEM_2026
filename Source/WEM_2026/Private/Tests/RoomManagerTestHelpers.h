@@ -197,6 +197,24 @@ struct FRoomManagerTestAccess
 		return Manager.UsableNatureStructures.Num();
 	}
 
+	/** The air kept open above ground and water, as inclusive boxes of cells, in the order it was laid. */
+	static TArray<TPair<FIntVector, FIntVector>> GetAirBoxes(const ARoomManager& Manager)
+	{
+		TArray<TPair<FIntVector, FIntVector>> Boxes;
+		for (const ARoomManager::FAirBox& Box : Manager.AirBoxes)
+		{
+			Boxes.Emplace(Box.Min, Box.Max);
+		}
+
+		return Boxes;
+	}
+
+	/** Whether a piece of ground or water about to be placed would have its fewest storeys of air clear. */
+	static bool IsAirClear(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsAirClear(Platform);
+	}
+
 	/** How many fields of nature are still spilling out, and how many pieces the oldest may still lay. */
 	static int32 GetSpillingFields(const ARoomManager& Manager, int32& OutOldestRemaining)
 	{
