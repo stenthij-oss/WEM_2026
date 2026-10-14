@@ -4,7 +4,10 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "GridMath.h"
+#include "HAL/PlatformTime.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Misc/AutomationTest.h"
 #include "RoomManagerTestHelpers.h"
@@ -1080,6 +1083,146 @@ bool FNatureAirPocketsTest::RunTest(const FString& Parameters)
 
 	TestTrue(TEXT("Some are left out"), FRoomManagerTestAccess::GetAirPockets(*Crowded).Num() < 6);
 	TestTrue(TEXT("Growth still starts"), Crowded->PlaceNextPlatform());
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+namespace NatureTestsPrivate
+{
+	/** The test kit's structures, as the importer made them. */
+	TArray<TObjectPtr<UPlatformStructureData>> LoadNatureTestKit()
+	{
+		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		Registry.WaitForCompletion();
+
+		FARFilter Filter;
+		Filter.PackagePaths.Add(TEXT("/Game/Structures/TestKit"));
+		Filter.bRecursivePaths = true;
+		Filter.ClassPaths.Add(UPlatformStructureData::StaticClass()->GetClassPathName());
+
+		TArray<FAssetData> Assets;
+		Registry.GetAssets(Filter, Assets);
+		Assets.Sort([](const FAssetData& A, const FAssetData& B) { return A.AssetName.LexicalLess(B.AssetName); });
+
+		TArray<TObjectPtr<UPlatformStructureData>> Structures;
+		for (const FAssetData& Asset : Assets)
+		{
+			if (UPlatformStructureData* Structure = Cast<UPlatformStructureData>(Asset.GetAsset()))
+			{
+				Structures.Add(Structure);
+			}
+		}
+
+		return Structures;
+	}
+
+	/** Mean and longest times, in milliseconds. */
+	struct FBeatTimes
+	{
+		double Total = 0.0;
+		double Longest = 0.0;
+		int32 Beats = 0;
+
+		void Add(const double Seconds)
+		{
+			Total += 1000.0 * Seconds;
+			Longest = FMath::Max(Longest, 1000.0 * Seconds);
+			++Beats;
+		}
+
+		FString Describe() const
+		{
+			return FString::Printf(TEXT("%d beats, mean %.3f ms, longest %.3f ms"), Beats, Beats > 0 ? Total / Beats : 0.0, Longest);
+		}
+	};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNaturePerfTest, "WEM.Nature.Perf", WEMRoomManagerTests::SlowTestFlags)
+
+bool FNaturePerfTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	// A room manager set up as NewMap's - a 509-cell cube, the test kit, pieces built, the overlay off - grown to
+	// 3000 platforms, a nature beat after every tenth beat of the city, timing the beats after the first 1000.
+	// Then the same without nature or pockets, for the city's beat as it was.
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	TArray<TObjectPtr<UPlatformStructureData>> Structures = LoadNatureTestKit();
+	TestTrue(TEXT("The test kit is there"), Structures.Num() > 60);
+
+	UPlatformStructureData* Ground = MakeNature(TEXT("PerfGround"), ENatureForm::Ground);
+	UPlatformStructureData* Cliff = MakeNature(TEXT("PerfCliff"), ENatureForm::Cliff);
+	UPlatformStructureData* Water = MakeNature(TEXT("PerfWater"), ENatureForm::Water);
+	Rooted.Append({ Ground, Cliff, Water });
+
+	for (const bool bNature : { true, false })
+	{
+		TArray<TObjectPtr<UPlatformStructureData>> Fills = Structures;
+
+		if (bNature)
+		{
+			Fills.Append({ Ground, Cliff, Water });
+		}
+
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Fills);
+		Manager->Tiles[1]->Orientation = ETileOrientation::HorizontalOnly;
+		Manager->Tiles[2]->bCanTurn = false;
+		Manager->GridSize = 509;
+		Manager->PlatformRandomSeed = 4242;
+		Manager->bShowPieces = true;
+		Manager->AirPocketCount = bNature ? 6 : 0;
+
+		const double ClearStart = FPlatformTime::Seconds();
+		Manager->ClearPlatforms();
+		const double ClearSeconds = FPlatformTime::Seconds() - ClearStart;
+
+		FBeatTimes CityBeats;
+		FBeatTimes NatureBeats;
+		int32 Beat = 0;
+
+		while (Manager->GetPlatformCount() < 3000)
+		{
+			const bool bMeasure = Manager->GetPlatformCount() >= 1000;
+			const double Start = FPlatformTime::Seconds();
+
+			if (!Manager->PlaceNextPlatform())
+			{
+				break;
+			}
+
+			if (bMeasure)
+			{
+				CityBeats.Add(FPlatformTime::Seconds() - Start);
+			}
+
+			if (bNature && ++Beat % 10 == 0)
+			{
+				const double NatureStart = FPlatformTime::Seconds();
+				Manager->PlaceNextNature();
+
+				if (bMeasure)
+				{
+					NatureBeats.Add(FPlatformTime::Seconds() - NatureStart);
+				}
+			}
+		}
+
+		AddInfo(FString::Printf(TEXT("%s: %d platforms (%d ground, %d cliff, %d water), clearing %.1f ms (%s)."),
+			bNature ? TEXT("With nature and pockets") : TEXT("City alone"),
+			Manager->GetPlatformCount(), Manager->GroundCount, Manager->CliffCount, Manager->WaterCount, 1000.0 * ClearSeconds, *Manager->AirPocketSummary));
+		AddInfo(FString::Printf(TEXT("  City beats: %s."), *CityBeats.Describe()));
+
+		if (bNature)
+		{
+			AddInfo(FString::Printf(TEXT("  Nature beats: %s."), *NatureBeats.Describe()));
+			TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+		}
+
+		Manager->Destroy();
+	}
 
 	ReleaseRooted(Rooted);
 	return true;

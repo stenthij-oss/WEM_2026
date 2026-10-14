@@ -991,6 +991,7 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 	const int32 Module = GetModule();
 	const int32 NormalAxis = AxisIndex(Platform.Normal);
 	bool bTouchesStructure = false;
+	bool bTouchesNature = false;
 	bool bFlush = true;
 	bool bFoldsLegally = true;
 
@@ -1023,6 +1024,8 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 			{
 				continue;
 			}
+
+			bTouchesNature = bTouchesNature || IsNatureSegment(BuiltPlatforms[*Owner]);
 
 			// Every platform met along the edge, whichever way it faces, has to be met flush.
 			if (!IsFlushWith(Platform, BuiltPlatforms[*Owner], Edge.Axis))
@@ -1067,8 +1070,9 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 
 	// Nature takes only the faces its form allows. A filled placement is held to that as it stands. One not
 	// filled yet - the city's, still to be drawn for - is refused only where it would meet water or a cliff,
-	// which take no face of the city; its fill sees to it that what meets ground is an exterior.
-	if (NaturePlatformCount > 0 || IsNatureSegment(Platform))
+	// which take no face of the city; its fill sees to it that what meets ground is an exterior. Faces only
+	// meet round the edges a placement shares, so one touching no nature, and none itself, meets none.
+	if (bTouchesNature || IsNatureSegment(Platform))
 	{
 		return Platform.PositiveStructure || Platform.NegativeStructure ? AreNatureMeetingsLegal(Platform) : !MeetsClosedNature(Platform);
 	}
