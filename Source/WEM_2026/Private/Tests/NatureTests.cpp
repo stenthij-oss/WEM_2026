@@ -888,4 +888,201 @@ bool FNatureAirTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNaturePocketShapesTest, "WEM.Nature.PocketShapes", WEMRoomManagerTests::TestFlags)
+
+bool FNaturePocketShapesTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+	using FPocket = FRoomManagerTestAccess::FPocket;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	Manager->ZigguratTiers = 4;
+
+	auto In = [&](const FPocket& Pocket, const int32 X, const int32 Y, const int32 Z)
+	{
+		return FRoomManagerTestAccess::IsCellInPocket(*Manager, Pocket, FIntVector(X, Y, Z));
+	};
+
+	// Every pocket is centred on the middle of cell (32, 32, 32).
+	const FVector Centre(32.5, 32.5, 32.5);
+
+	const FPocket Sphere{ EAirPocketShape::Sphere, Centre, FVector(10.0), 2, 1, 0 };
+	TestTrue(TEXT("A sphere holds its centre"), In(Sphere, 32, 32, 32));
+	TestTrue(TEXT("And a cell its radius out"), In(Sphere, 32, 32, 42));
+	TestFalse(TEXT("But not one further"), In(Sphere, 32, 32, 43));
+	TestTrue(TEXT("Nor is it a box: a cell 7 out along two axes is in"), In(Sphere, 39, 39, 32));
+	TestFalse(TEXT("And one 8 out along two axes is not"), In(Sphere, 40, 40, 32));
+
+	const FPocket Cube{ EAirPocketShape::Box, Centre, FVector(6.0), 2, 1, 0 };
+	TestTrue(TEXT("A cube reaches its half side"), In(Cube, 38, 38, 38));
+	TestFalse(TEXT("And no further"), In(Cube, 39, 32, 32));
+
+	// A rectangular box standing along Z is 2 across X, 4 across Y and 6 along Z, each a half; along X, the same
+	// measures run Y, Z, X.
+	const FPocket Upright{ EAirPocketShape::Rectangular, Centre, FVector(2.0, 4.0, 6.0), 2, 1, 0 };
+	TestTrue(TEXT("Upright: 2 across X"), In(Upright, 34, 32, 32) && !In(Upright, 35, 32, 32));
+	TestTrue(TEXT("Upright: 4 across Y"), In(Upright, 32, 36, 32) && !In(Upright, 32, 37, 32));
+	TestTrue(TEXT("Upright: 6 along Z"), In(Upright, 32, 32, 38) && !In(Upright, 32, 32, 39));
+
+	const FPocket Lying{ EAirPocketShape::Rectangular, Centre, FVector(2.0, 4.0, 6.0), 0, 1, 0 };
+	TestTrue(TEXT("Lying along X: 6 along X"), In(Lying, 38, 32, 32) && !In(Lying, 39, 32, 32));
+	TestTrue(TEXT("Lying along X: 2 across Y"), In(Lying, 32, 34, 32) && !In(Lying, 32, 35, 32));
+	TestTrue(TEXT("Lying along X: 4 across Z"), In(Lying, 32, 32, 36) && !In(Lying, 32, 32, 37));
+
+	const FPocket Cylinder{ EAirPocketShape::Cylinder, Centre, FVector(5.0, 5.0, 3.0), 0, 1, 0 };
+	TestTrue(TEXT("A cylinder along X reaches its half length"), In(Cylinder, 35, 32, 32) && !In(Cylinder, 36, 32, 32));
+	TestTrue(TEXT("And its radius round it"), In(Cylinder, 32, 37, 32) && !In(Cylinder, 32, 38, 32) && In(Cylinder, 35, 36, 35));
+
+	// A ziggurat 16 across its base and 16 tall, in four tiers of 4: its base 8 out from its axis, its top tier 2.
+	const FPocket Ziggurat{ EAirPocketShape::Ziggurat, Centre, FVector(8.0, 8.0, 8.0), 2, 1, 0 };
+	TestTrue(TEXT("Its base reaches 8 out"), In(Ziggurat, 40, 32, 25) && !In(Ziggurat, 41, 32, 25));
+	TestTrue(TEXT("Its top tier 2"), In(Ziggurat, 34, 32, 39) && !In(Ziggurat, 35, 32, 39));
+
+	const FPocket Inverted{ EAirPocketShape::Ziggurat, Centre, FVector(8.0, 8.0, 8.0), 2, -1, 0 };
+	TestTrue(TEXT("Turned the other way, its base is on top"), In(Inverted, 40, 32, 39) && !In(Inverted, 35, 32, 25));
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureAirPocketsTest, "WEM.Nature.AirPockets", WEMRoomManagerTests::TestFlags)
+
+bool FNatureAirPocketsTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+	using FPocket = FRoomManagerTestAccess::FPocket;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	auto SpawnWithPockets = [&](const int32 Seed) -> ARoomManager*
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+		Manager->GridSize = 129;
+		Manager->PlatformRandomSeed = Seed;
+		Manager->AirPocketCount = 8;
+		Manager->MinAirPocketSize = 16;
+		Manager->MaxAirPocketSize = 40;
+		Manager->ClearPlatforms();
+		return Manager;
+	};
+
+	ARoomManager* Manager = SpawnWithPockets(1234);
+	const TArray<FPocket> Pockets = FRoomManagerTestAccess::GetAirPockets(*Manager);
+	AddInfo(Manager->AirPocketSummary);
+
+	TestEqual(TEXT("Eight pockets are drawn"), Pockets.Num(), 8);
+	TestTrue(TEXT("Each holds lattice pieces back"), !Pockets.ContainsByPredicate([](const FPocket& Pocket) { return Pocket.CutPieces == 0; }));
+	TestTrue(TEXT("As obstacles"), FRoomManagerTestAccess::GetObstaclePieceCount(*Manager) > 0);
+
+	TArray<EAirPocketShape> Shapes;
+	for (const FPocket& Pocket : Pockets)
+	{
+		Shapes.AddUnique(Pocket.Shape);
+		TestTrue(TEXT("Every measure lies between the smallest and largest"),
+			Pocket.HalfSize.GetMin() >= 8.0 && Pocket.HalfSize.GetMax() <= 20.0);
+	}
+
+	TestTrue(TEXT("More than one shape turns up"), Shapes.Num() > 1);
+
+	// Growth starts, and never builds into a pocket.
+	TestTrue(TEXT("The first platform still has its place"), Manager->PlaceNextPlatform());
+
+	for (int32 Beat = 0; Beat < 400; ++Beat)
+	{
+		Manager->PlaceNextPlatform();
+	}
+
+	int32 CellsInPockets = 0;
+	for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		const int32 SpanU = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+		const int32 SpanV = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+
+		int32 U, V;
+		WEMGrid::GetInPlaneAxes(static_cast<int32>(Platform.Normal), U, V);
+
+		for (int32 StepV = 0; StepV <= SpanV; ++StepV)
+		{
+			for (int32 StepU = 0; StepU <= SpanU; ++StepU)
+			{
+				const FIntVector Cell = Platform.MinNode + WEMGrid::AxisStep(U, StepU) + WEMGrid::AxisStep(V, StepV);
+
+				for (const FPocket& Pocket : Pockets)
+				{
+					CellsInPockets += FRoomManagerTestAccess::IsCellInPocket(*Manager, Pocket, Cell) ? 1 : 0;
+				}
+			}
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("%d platforms grew round the pockets."), Manager->GetPlatformCount()));
+	TestTrue(TEXT("Growth goes on"), Manager->GetPlatformCount() > 100);
+	TestEqual(TEXT("No platform reaches into a pocket"), CellsInPockets, 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// A rebuild keeps them as they are, since the platforms grew round them.
+	const int32 ObstaclePieces = FRoomManagerTestAccess::GetObstaclePieceCount(*Manager);
+	FRoomManagerTestAccess::Rebuild(*Manager, TArray<FGridPlatform>(FRoomManagerTestAccess::GetBuilt(*Manager)));
+	TestEqual(TEXT("A rebuild keeps the pockets"), FRoomManagerTestAccess::GetAirPockets(*Manager).Num(), 8);
+	TestEqual(TEXT("And what they hold back"), FRoomManagerTestAccess::GetObstaclePieceCount(*Manager), ObstaclePieces);
+
+	// The same seed draws the same pockets, another seed others.
+	const TArray<FPocket> Again = FRoomManagerTestAccess::GetAirPockets(*SpawnWithPockets(1234));
+	const TArray<FPocket> Other = FRoomManagerTestAccess::GetAirPockets(*SpawnWithPockets(4321));
+
+	bool bSame = Again.Num() == Pockets.Num();
+	for (int32 Index = 0; bSame && Index < Pockets.Num(); ++Index)
+	{
+		bSame = Again[Index].Shape == Pockets[Index].Shape && Again[Index].Centre.Equals(Pockets[Index].Centre) && Again[Index].CutPieces == Pockets[Index].CutPieces;
+	}
+
+	TestTrue(TEXT("The same seed draws the same pockets"), bSame);
+	TestTrue(TEXT("Another seed draws others"), Other.Num() > 0 && !Other[0].Centre.Equals(Pockets[0].Centre));
+
+	// Settings: one shape only, upright; none at all.
+	ARoomManager* Ziggurats = SpawnRoomManager(TestWorld.World, Rooted);
+	Ziggurats->GridSize = 129;
+	Ziggurats->AirPocketCount = 5;
+	Ziggurats->SphereWeight = 0.0f;
+	Ziggurats->BoxWeight = 0.0f;
+	Ziggurats->RectangularWeight = 0.0f;
+	Ziggurats->CylinderWeight = 0.0f;
+	Ziggurats->bAirPocketsAlongAnyAxis = false;
+	Ziggurats->ClearPlatforms();
+
+	const TArray<FPocket> Upright = FRoomManagerTestAccess::GetAirPockets(*Ziggurats);
+	TestEqual(TEXT("Five ziggurats"), Upright.Num(), 5);
+	TestTrue(TEXT("All ziggurats, all upright"), !Upright.ContainsByPredicate([](const FPocket& Pocket)
+	{
+		return Pocket.Shape != EAirPocketShape::Ziggurat || Pocket.Axis != 2 || Pocket.AxisSign != 1;
+	}));
+
+	Ziggurats->AirPocketCount = 0;
+	Ziggurats->ClearPlatforms();
+	TestEqual(TEXT("None asked for, none drawn"), FRoomManagerTestAccess::GetAirPockets(*Ziggurats).Num(), 0);
+	TestEqual(TEXT("And nothing held back"), FRoomManagerTestAccess::GetObstaclePieceCount(*Ziggurats), 0);
+
+	// Pockets as large as the cube cannot all stay clear of the first platform's place: those that cannot are left
+	// out, and growth still starts.
+	ARoomManager* Crowded = SpawnRoomManager(TestWorld.World, Rooted);
+	Crowded->GridSize = 129;
+	Crowded->AirPocketCount = 6;
+	Crowded->MinAirPocketSize = 110;
+	Crowded->MaxAirPocketSize = 120;
+	Crowded->SphereWeight = 0.0f;
+	Crowded->ZigguratWeight = 0.0f;
+	Crowded->CylinderWeight = 0.0f;
+	Crowded->ClearPlatforms();
+	AddInfo(Crowded->AirPocketSummary);
+
+	TestTrue(TEXT("Some are left out"), FRoomManagerTestAccess::GetAirPockets(*Crowded).Num() < 6);
+	TestTrue(TEXT("Growth still starts"), Crowded->PlaceNextPlatform());
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 #endif

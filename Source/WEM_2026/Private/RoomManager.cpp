@@ -113,6 +113,15 @@ namespace
 	/** How many module edges of nature's rim a nature beat tries for what grows off nature: cliffs, pools and terraces. */
 	constexpr int32 NatureSampleEdges = 24;
 
+	/** How many places an air pocket is drawn at before it is left out for taking the first platform's place every time. */
+	constexpr int32 MaxAirPocketPlaces = 16;
+
+	/** Segments in each circle of a sphere's or cylinder's outline. */
+	constexpr int32 AirPocketCircleSegments = 32;
+
+	/** Size on screen, in pixels, of the point drawn at each lattice piece a pocket holds back. */
+	constexpr float AirPocketPieceSize = 6.0f;
+
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
@@ -2046,6 +2055,9 @@ void ARoomManager::ClearPlatforms()
 	ResetPlacementStream();
 	BeginNewGeneration();
 
+	// An empty cube is drawn new pockets of air, before anything grows round them.
+	SpawnAirPockets();
+
 	RebuildPlatformState();
 	UpdateDebugReadouts();
 	RebuildVisuals();
@@ -3506,32 +3518,450 @@ void ARoomManager::RebuildAirLines()
 
 	AirLineBatcher->Flush();
 
-	if (!bShowAir || AirBoxes.IsEmpty())
+	TArray<FBatchedLine> Lines;
+
+	// Each box of air as far as it lies inside the cube, its outer faces on the cells' outer sides.
+	if (bShowAir)
 	{
-		return;
+		const int32 LastCell = ResolveGridSize() - 1;
+		const FLinearColor Color(AirColor);
+
+		Lines.Reserve(AirBoxes.Num() * 12);
+
+		for (const FAirBox& Box : AirBoxes)
+		{
+			const FIntVector Min(FMath::Max(Box.Min.X, 0), FMath::Max(Box.Min.Y, 0), FMath::Max(Box.Min.Z, 0));
+			const FIntVector Max(FMath::Min(Box.Max.X, LastCell), FMath::Min(Box.Max.Y, LastCell), FMath::Min(Box.Max.Z, LastCell));
+
+			if (Min.X > Max.X || Min.Y > Max.Y || Min.Z > Max.Z)
+			{
+				continue;
+			}
+
+			AppendBoxLines(Lines, GetCellMinCorner(Min), GetCellMinCorner(Max) + FVector(CellSize), Color, GridLineThickness, SDPG_World, /*bWithDiagonals=*/false);
+		}
 	}
 
-	// Each box as far as it lies inside the cube, its outer faces on the cells' outer sides.
-	const int32 LastCell = ResolveGridSize() - 1;
-	const FLinearColor Color(AirColor);
-
-	TArray<FBatchedLine> Lines;
-	Lines.Reserve(AirBoxes.Num() * 12);
-
-	for (const FAirBox& Box : AirBoxes)
+	if (bShowAirPockets)
 	{
-		const FIntVector Min(FMath::Max(Box.Min.X, 0), FMath::Max(Box.Min.Y, 0), FMath::Max(Box.Min.Z, 0));
-		const FIntVector Max(FMath::Min(Box.Max.X, LastCell), FMath::Min(Box.Max.Y, LastCell), FMath::Min(Box.Max.Z, LastCell));
-
-		if (Min.X > Max.X || Min.Y > Max.Y || Min.Z > Max.Z)
+		for (const FAirPocket& Pocket : AirPockets)
 		{
-			continue;
+			AppendAirPocketLines(Pocket, Lines);
+		}
+	}
+
+	if (!Lines.IsEmpty())
+	{
+		AirLineBatcher->DrawLines(Lines);
+	}
+
+	// What each pocket holds back, a point at the middle of every piece it cuts: a module face's inside, a module
+	// edge's run, a node.
+	if (bShowAirPocketPieces)
+	{
+		const double Middle = 0.5 * static_cast<double>(GetModule());
+
+		for (const FAirPocket& Pocket : AirPockets)
+		{
+			const FLinearColor Color = GetAirPocketColor(Pocket.Shape);
+
+			auto DrawPiece = [&](const uint64 Key, const int32 AcrossFirst, const int32 AcrossSecond)
+			{
+				FVector Point = FVector(CellFromKey(Key)) + FVector(0.5);
+
+				for (const int32 Axis : { AcrossFirst, AcrossSecond })
+				{
+					if (Axis != INDEX_NONE)
+					{
+						Point[Axis] += Middle - 0.5;
+					}
+				}
+
+				AirLineBatcher->DrawPoint(CellPointToWorld(Point), Color, AirPocketPieceSize, SDPG_World);
+			};
+
+			// A face or an edge key carries its axis in its tag, offset by one.
+			auto GetTag = [](const uint64 Key)
+			{
+				return static_cast<int32>(Key >> KeyTagShift) - 1;
+			};
+
+			for (const uint64 Key : Pocket.FaceKeys)
+			{
+				int32 U, V;
+				GetInPlaneAxes(GetTag(Key), U, V);
+				DrawPiece(Key, U, V);
+			}
+
+			for (const uint64 Key : Pocket.EdgeKeys)
+			{
+				DrawPiece(Key, GetTag(Key), INDEX_NONE);
+			}
+
+			for (const uint64 Key : Pocket.NodeKeys)
+			{
+				DrawPiece(Key, INDEX_NONE, INDEX_NONE);
+			}
+		}
+	}
+}
+
+void ARoomManager::SpawnAirPockets()
+{
+	AirPockets.Reset();
+
+	const int32 CubeCells = ResolveGridSize();
+	const int32 Smallest = FMath::Max(MinAirPocketSize, 1);
+	const int32 Largest = FMath::Max(MaxAirPocketSize, Smallest);
+
+	const float Weights[] = { SphereWeight, BoxWeight, RectangularWeight, ZigguratWeight, CylinderWeight };
+	constexpr int32 ShapeCount = UE_ARRAY_COUNT(Weights);
+
+	float TotalWeight = 0.0f;
+	for (const float Weight : Weights)
+	{
+		TotalWeight += FMath::Max(Weight, 0.0f);
+	}
+
+	int32 Counts[ShapeCount] = {};
+	int32 LeftOut = 0;
+
+	if (AirPocketCount > 0 && TotalWeight > 0.0f)
+	{
+		// From the run's seed, a stream apart from the others, so a seed draws the same pockets every time.
+		FRandomStream Stream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("AirPockets"))))));
+
+		// The first platform's place, which no pocket may take. Its fill decides where it can go, so the structures
+		// are resolved first.
+		ResolveUsableTiles();
+
+		TArray<FGridPlatform> FirstCandidates;
+		GatherFirstPlatformCandidates(FirstCandidates);
+
+		for (int32 Index = 0; Index < AirPocketCount; ++Index)
+		{
+			FAirPocket Pocket;
+
+			float Roll = Stream.FRand() * TotalWeight;
+			int32 ShapeIndex = INDEX_NONE;
+
+			for (int32 Shape = 0; Shape < ShapeCount; ++Shape)
+			{
+				const float Weight = FMath::Max(Weights[Shape], 0.0f);
+
+				if (Weight <= 0.0f)
+				{
+					continue;
+				}
+
+				ShapeIndex = Shape;
+
+				if (Roll < Weight)
+				{
+					break;
+				}
+
+				Roll -= Weight;
+			}
+
+			Pocket.Shape = static_cast<EAirPocketShape>(ShapeIndex);
+
+			auto DrawHalf = [&Stream, Smallest, Largest]()
+			{
+				return 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest));
+			};
+
+			// Half its measure across, then along its axis: one measure for a sphere and a cube, three apart for a
+			// rectangular box, a base and a height for a ziggurat, a diameter and a length for a cylinder.
+			switch (Pocket.Shape)
+			{
+			case EAirPocketShape::Rectangular:
+			{
+				const double First = DrawHalf();
+				const double Second = DrawHalf();
+				Pocket.HalfSize = FVector(First, Second, DrawHalf());
+				break;
+			}
+			case EAirPocketShape::Ziggurat:
+			case EAirPocketShape::Cylinder:
+			{
+				const double Across = DrawHalf();
+				Pocket.HalfSize = FVector(Across, Across, DrawHalf());
+				break;
+			}
+			default:
+				Pocket.HalfSize = FVector(DrawHalf());
+				break;
+			}
+
+			if (bAirPocketsAlongAnyAxis)
+			{
+				Pocket.Axis = Stream.RandRange(0, 2);
+				Pocket.AxisSign = Stream.FRand() < 0.5f ? 1 : -1;
+			}
+
+			// Anywhere in the cube, drawn again while it would take the first platform's place.
+			bool bClear = false;
+
+			for (int32 Place = 0; Place < MaxAirPocketPlaces && !bClear; ++Place)
+			{
+				Pocket.Centre = FVector(Stream.FRand(), Stream.FRand(), Stream.FRand()) * static_cast<double>(CubeCells);
+
+				bClear = !FirstCandidates.ContainsByPredicate([this, &Pocket](const FGridPlatform& First)
+				{
+					int32 SpanU, SpanV;
+					GetPlatformSpans(First, SpanU, SpanV);
+
+					bool bTaken = false;
+					ForEachPlatformCell(First, SpanU, SpanV, [&](const FIntVector& Cell, bool)
+					{
+						bTaken = bTaken || IsCellInPocket(Pocket, Cell);
+					});
+
+					return bTaken;
+				});
+			}
+
+			if (!bClear)
+			{
+				++LeftOut;
+				continue;
+			}
+
+			CutPocketPieces(Pocket);
+			++Counts[ShapeIndex];
+			AirPockets.Add(MoveTemp(Pocket));
+		}
+	}
+
+	AirPocketSummary = FString::Printf(TEXT("%d pockets: %d sphere, %d box, %d rectangular, %d ziggurat, %d cylinder; %d left out"),
+		AirPockets.Num(), Counts[0], Counts[1], Counts[2], Counts[3], Counts[4], LeftOut);
+}
+
+bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const
+{
+	const FVector Offset = FVector(Cell) + FVector(0.5) - Pocket.Centre;
+	const double Along = Offset[Pocket.Axis];
+	const double First = Offset[(Pocket.Axis + 1) % 3];
+	const double Second = Offset[(Pocket.Axis + 2) % 3];
+	const FVector& Half = Pocket.HalfSize;
+
+	switch (Pocket.Shape)
+	{
+	case EAirPocketShape::Sphere:
+		return Offset.SizeSquared() <= Half.X * Half.X;
+
+	case EAirPocketShape::Cylinder:
+		return FMath::Abs(Along) <= Half.Z && First * First + Second * Second <= Half.X * Half.X;
+
+	case EAirPocketShape::Ziggurat:
+	{
+		if (FMath::Abs(Along) > Half.Z || Half.Z <= 0.0)
+		{
+			return false;
 		}
 
-		AppendBoxLines(Lines, GetCellMinCorner(Min), GetCellMinCorner(Max) + FVector(CellSize), Color, GridLineThickness, SDPG_World, /*bWithDiagonals=*/false);
+		// Its tiers count up from its base, on the side its top looks away from, each narrower by an even step.
+		const int32 Tiers = FMath::Max(ZigguratTiers, 1);
+		const double Rise = (Along * Pocket.AxisSign + Half.Z) / (2.0 * Half.Z);
+		const int32 Tier = FMath::Clamp(FMath::FloorToInt32(Rise * Tiers), 0, Tiers - 1);
+		const double TierHalf = Half.X * (1.0 - static_cast<double>(Tier) / Tiers);
+
+		return FMath::Abs(First) <= TierHalf && FMath::Abs(Second) <= TierHalf;
 	}
 
-	AirLineBatcher->DrawLines(Lines);
+	default:
+		return FMath::Abs(First) <= Half.X && FMath::Abs(Second) <= Half.Y && FMath::Abs(Along) <= Half.Z;
+	}
+}
+
+void ARoomManager::CutPocketPieces(FAirPocket& Pocket) const
+{
+	Pocket.FaceKeys.Reset();
+	Pocket.EdgeKeys.Reset();
+	Pocket.NodeKeys.Reset();
+
+	const int32 Module = GetModule();
+	const int32 LastCell = ResolveGridSize() - 1;
+
+	// Its reach along each world axis, as far as the cube goes.
+	FVector Reach;
+	Reach[Pocket.Axis] = Pocket.HalfSize.Z;
+	Reach[(Pocket.Axis + 1) % 3] = Pocket.HalfSize.X;
+	Reach[(Pocket.Axis + 2) % 3] = Pocket.HalfSize.Y;
+
+	if (Pocket.Shape == EAirPocketShape::Sphere)
+	{
+		Reach = FVector(Pocket.HalfSize.X);
+	}
+
+	FIntVector Min, Max;
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		Min[Axis] = FMath::Clamp(FMath::FloorToInt32(Pocket.Centre[Axis] - Reach[Axis]), 0, LastCell);
+		Max[Axis] = FMath::Clamp(FMath::CeilToInt32(Pocket.Centre[Axis] + Reach[Axis]), 0, LastCell);
+	}
+
+	// A piece is cut when any one of its cells lies inside: the inside of a module face, the run of a module edge,
+	// or the node itself. An edge can be visited from both planes it lies in; it is kept once.
+	TSet<uint64> Edges;
+
+	ForEachObstaclePiece(Min, Max, Module,
+		[&](const FIntVector& FaceMinNode, const int32 NormalAxis)
+		{
+			int32 U, V;
+			GetInPlaneAxes(NormalAxis, U, V);
+
+			for (int32 StepV = 1; StepV < Module; ++StepV)
+			{
+				for (int32 StepU = 1; StepU < Module; ++StepU)
+				{
+					if (IsCellInPocket(Pocket, FaceMinNode + AxisStep(U, StepU) + AxisStep(V, StepV)))
+					{
+						Pocket.FaceKeys.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+						return;
+					}
+				}
+			}
+		},
+		[&](const FLatticeEdge& Edge)
+		{
+			for (int32 Step = 1; Step < Module; ++Step)
+			{
+				if (IsCellInPocket(Pocket, Edge.Node + AxisStep(Edge.Axis, Step)))
+				{
+					Edges.Add(MakeEdgeKey(Edge));
+					return;
+				}
+			}
+		},
+		[&](const FIntVector& Node)
+		{
+			if (IsCellInPocket(Pocket, Node))
+			{
+				Pocket.NodeKeys.Add(MakeCellKey(Node));
+			}
+		});
+
+	Pocket.EdgeKeys = Edges.Array();
+}
+
+FVector ARoomManager::CellPointToWorld(const FVector& Point) const
+{
+	const FVector Origin = GetActorLocation();
+	return FVector(Origin.X + Point.X * CellSize, Origin.Y + Point.Y * CellSize, GridBaseZ + Point.Z * CellSize);
+}
+
+FLinearColor ARoomManager::GetAirPocketColor(const EAirPocketShape Shape) const
+{
+	switch (Shape)
+	{
+	case EAirPocketShape::Sphere: return FLinearColor(SphereColor);
+	case EAirPocketShape::Box: return FLinearColor(BoxColor);
+	case EAirPocketShape::Rectangular: return FLinearColor(RectangularColor);
+	case EAirPocketShape::Ziggurat: return FLinearColor(ZigguratColor);
+	default: return FLinearColor(CylinderColor);
+	}
+}
+
+void ARoomManager::AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatchedLine>& Lines) const
+{
+	const FLinearColor Color = GetAirPocketColor(Pocket.Shape);
+	const float Thickness = BoundaryLineThickness;
+
+	const int32 AlongAxis = Pocket.Axis;
+	const int32 FirstAxis = (Pocket.Axis + 1) % 3;
+	const int32 SecondAxis = (Pocket.Axis + 2) % 3;
+
+	// A box in the pocket's own axes - half across its first and second axes, from Start to End along its axis.
+	auto AddBox = [&](const double HalfFirst, const double HalfSecond, const double Start, const double End)
+	{
+		FVector Min = Pocket.Centre;
+		FVector Max = Pocket.Centre;
+		Min[FirstAxis] -= HalfFirst;
+		Max[FirstAxis] += HalfFirst;
+		Min[SecondAxis] -= HalfSecond;
+		Max[SecondAxis] += HalfSecond;
+		Min[AlongAxis] += FMath::Min(Start, End);
+		Max[AlongAxis] += FMath::Max(Start, End);
+
+		AppendBoxLines(Lines, CellPointToWorld(Min), CellPointToWorld(Max), Color, Thickness, SDPG_World, /*bWithDiagonals=*/false);
+	};
+
+	// A circle round the pocket's centre, Offset along one axis, in the plane of the other two.
+	auto AddCircle = [&](const int32 NormalAxis, const double Offset, const double Radius)
+	{
+		const int32 U = (NormalAxis + 1) % 3;
+		const int32 V = (NormalAxis + 2) % 3;
+
+		auto PointAt = [&](const int32 Segment)
+		{
+			const double Angle = 2.0 * UE_DOUBLE_PI * static_cast<double>(Segment) / AirPocketCircleSegments;
+			FVector Point = Pocket.Centre;
+			Point[NormalAxis] += Offset;
+			Point[U] += Radius * FMath::Cos(Angle);
+			Point[V] += Radius * FMath::Sin(Angle);
+			return CellPointToWorld(Point);
+		};
+
+		for (int32 Segment = 0; Segment < AirPocketCircleSegments; ++Segment)
+		{
+			Lines.Emplace(PointAt(Segment), PointAt(Segment + 1), Color, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+		}
+	};
+
+	const FVector& Half = Pocket.HalfSize;
+
+	switch (Pocket.Shape)
+	{
+	case EAirPocketShape::Sphere:
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			AddCircle(Axis, 0.0, Half.X);
+		}
+		break;
+
+	case EAirPocketShape::Cylinder:
+	{
+		AddCircle(AlongAxis, -Half.Z, Half.X);
+		AddCircle(AlongAxis, Half.Z, Half.X);
+
+		// And four lines along it, joining the two.
+		for (int32 Quarter = 0; Quarter < 4; ++Quarter)
+		{
+			const double Angle = 0.5 * UE_DOUBLE_PI * Quarter;
+			FVector Start = Pocket.Centre;
+			Start[FirstAxis] += Half.X * FMath::Cos(Angle);
+			Start[SecondAxis] += Half.X * FMath::Sin(Angle);
+
+			FVector End = Start;
+			Start[AlongAxis] -= Half.Z;
+			End[AlongAxis] += Half.Z;
+
+			Lines.Emplace(CellPointToWorld(Start), CellPointToWorld(End), Color, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+		}
+		break;
+	}
+
+	case EAirPocketShape::Ziggurat:
+	{
+		// A box per tier, from its base on the side its top looks away from.
+		const int32 Tiers = FMath::Max(ZigguratTiers, 1);
+		const double TierHeight = 2.0 * Half.Z / Tiers;
+
+		for (int32 Tier = 0; Tier < Tiers; ++Tier)
+		{
+			const double TierHalf = Half.X * (1.0 - static_cast<double>(Tier) / Tiers);
+			const double Start = Pocket.AxisSign * (-Half.Z + Tier * TierHeight);
+			AddBox(TierHalf, TierHalf, Start, Start + Pocket.AxisSign * TierHeight);
+		}
+		break;
+	}
+
+	default:
+		AddBox(Half.X, Half.Y, -Half.Z, Half.Z);
+		break;
+	}
 }
 
 void ARoomManager::RecordFill(const int32 PlatformIndex)
@@ -4989,6 +5419,13 @@ void ARoomManager::RebuildObstacleKeys()
 	for (const FAirBox& Box : AirBoxes)
 	{
 		AddObstacleKeys(Box.Min, Box.Max);
+	}
+
+	for (const FAirPocket& Pocket : AirPockets)
+	{
+		ObstacleFaces.Append(Pocket.FaceKeys);
+		ObstacleEdges.Append(Pocket.EdgeKeys);
+		ObstacleNodes.Append(Pocket.NodeKeys);
 	}
 }
 

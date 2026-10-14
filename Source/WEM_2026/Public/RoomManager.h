@@ -145,6 +145,24 @@ struct FGridPlatform
 	}
 };
 
+/** The shapes an air pocket can take. */
+UENUM(BlueprintType)
+enum class EAirPocketShape : uint8
+{
+	Sphere,
+
+	/** A cube: all three sides the same. */
+	Box,
+
+	/** A box whose three sides are drawn apart. */
+	Rectangular,
+
+	/** A stepped pyramid, its tiers narrowing toward its top. */
+	Ziggurat,
+
+	Cylinder
+};
+
 /** Addresses one surface: a cell, and which of its six faces. */
 USTRUCT(BlueprintType)
 struct FGridSurfaceRef
@@ -387,37 +405,16 @@ struct FSurfaceMarkLayer
  * Nature
  * ------
  * Every structure belongs to a section (UPlatformStructureData::Section): the city, which growth fills
- * its platforms from, or nature - ground, cliff and water - which growth never draws. A nature platform
- * is one-sided: its nature face looks into the open air, and behind it stands any one-sided urban
- * structure of the face's type, a ceiling under ground and water and a wall behind a cliff. Ground and
- * water lie along their Up, their nature face looking along it; a cliff is a wall. A nature platform is
- * always load-bearing, whatever stands behind it.
+ * its platforms from, or nature - ground, cliff and water - which only the nature beat lays, a piece a
+ * beat on a timer of its own. A nature platform is one-sided, nature on one face looking into the open
+ * air and any urban ceiling or wall behind it, and meets across its beams only what its form allows. The
+ * city meets ground only with exteriors, and water or a cliff never. Ground and water keep the air above
+ * them open. The whole of it is told by the nature code further down.
  *
- * Which faces meet across a shared beam is the walk the category pull takes (see Structures), and a
- * nature face meets only what its form allows: ground meets more ground or water in its own plane, an
- * exterior - one of both sides counts - and a cliff along the cliff's top or foot, the edges across its
- * Up; water meets ground or more water in its plane, and a cliff along its top or foot; a cliff meets
- * ground or water along its own top or foot, and other cliffs with its Up. So a landscape's nature faces
- * all look into the same air, and their backs into the city. A placement is held to that for every face
- * it meets, nature or not: the city grows against ground only with exteriors facing it - the faces that
- * meet ground are drawn from exteriors - and never against water or a cliff.
- *
- * Nature has a beat of its own (NaturePlacementInterval), and lays one piece a beat, drawn from a
- * stream of its own. A field still spilling out takes the beat: ground and water are laid as fields,
- * each spilling out, a piece a beat, to the size it drew when it started (GroundSpillMin and Max,
- * WaterSpillMin and Max) - in its own plane, beside the pieces it has laid, likelier where it would
- * meet more of them - and the oldest still spilling goes first. Otherwise the beat starts something,
- * drawn by GroundWeight, CliffWeight and WaterWeight among what has somewhere to go: a field of ground,
- * against an exterior or at a cliff's top or foot; a cliff, off a field's outline or carrying one on;
- * or a pool of water, beside ground or at a cliff's top or foot. Where they could go is sampled
- * rather than walked in full, so a beat costs the same however far nature has spread.
- *
- * Every piece of ground and water keeps the air above it open: a box of cells out along its Up, as
- * high as it drew between MinAirStoreys and MaxAirStoreys, over its opening and over the seam it shares
- * with any field laid before it in its plane with its Up - but never over its outline, so cliffs still
- * rise and drop there. The air holds growth back as an obstacle does, without changing any surface, and
- * a piece is only laid where MinAirStoreys of it are clear of every platform already. Its height is
- * drawn from the run's seed and the piece itself, so a rebuild keeps the same air.
+ * Air pockets
+ * -----------
+ * Whenever the cube is cleared, AirPocketCount pockets of air - spheres, cubes, rectangular boxes,
+ * ziggurats and cylinders - are drawn at random across it, and nothing is ever built in them.
  *
  * Surfaces
  * --------
@@ -737,6 +734,73 @@ public:
 	/** Colour of the air kept open above ground and water. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
 	FColor AirColor = FColor(255, 190, 40);
+
+	/** How many pockets of air are drawn across the cube each time it is cleared. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0"))
+	int32 AirPocketCount = 6;
+
+	/** The smallest a pocket is across, in cells: a sphere's or cylinder's diameter, a box's side, a ziggurat's base. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "1"))
+	int32 MinAirPocketSize = 24;
+
+	/** The largest a pocket is across, in cells. Each of its measures is drawn evenly between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "1"))
+	int32 MaxAirPocketSize = 64;
+
+	/** How often a pocket is a sphere, relative to the other shapes. Zero never. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0"))
+	float SphereWeight = 1.0f;
+
+	/** How often a pocket is a cube. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0"))
+	float BoxWeight = 1.0f;
+
+	/** How often a pocket is a rectangular box, its three sides drawn apart. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0"))
+	float RectangularWeight = 1.0f;
+
+	/** How often a pocket is a ziggurat. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0"))
+	float ZigguratWeight = 1.0f;
+
+	/** How often a pocket is a cylinder. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0"))
+	float CylinderWeight = 1.0f;
+
+	/** How many tiers a ziggurat steps up in, each narrower than the one below by an even step. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "1"))
+	int32 ZigguratTiers = 4;
+
+	/** Lets a ziggurat or a cylinder stand along any axis, either way, rather than upright in the world. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	bool bAirPocketsAlongAnyAxis = true;
+
+	/** Draws each pocket's shape in lines of its shape's colour. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	bool bShowAirPockets = true;
+
+	/** Draws a point, in its pocket's colour, at every lattice piece a pocket holds back: what growth can actually no longer use. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	bool bShowAirPocketPieces = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	FColor SphereColor = FColor(0, 200, 255);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	FColor BoxColor = FColor(255, 0, 200);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	FColor RectangularColor = FColor(255, 110, 0);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	FColor ZigguratColor = FColor(140, 255, 0);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	FColor CylinderColor = FColor(120, 80, 255);
+
+	/** The pockets drawn the last time the cube was cleared, by shape, and how many were left out. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Air Pockets")
+	FString AirPocketSummary;
 
 	/** Platforms of ground standing. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
@@ -1436,6 +1500,55 @@ private:
 	/** DrawStructure from a stream of the caller's: the nature beat fills what it lays from its own. */
 	UPlatformStructureData* DrawStructureFrom(FRandomStream& Stream, TConstArrayView<UPlatformStructureData*> Options, const FGridPlatform& Platform, int32 FaceSign);
 
+	/*
+	 * Nature
+	 * ------
+	 * Every structure belongs to a section (UPlatformStructureData::Section): the city, which growth fills
+	 * its platforms from, or nature - ground, cliff and water - which growth never draws. A nature platform
+	 * is one-sided: its nature face looks into the open air, and behind it stands any one-sided urban
+	 * structure of the face's type, a ceiling under ground and water and a wall behind a cliff. Ground and
+	 * water lie along their Up, their nature face looking along it; a cliff is a wall. A nature platform is
+	 * always load-bearing, whatever stands behind it.
+	 *
+	 * Which faces meet across a shared beam is the walk the category pull takes (see Structures in the class
+	 * comment), and a nature face meets only what its form allows: ground meets more ground or water in its
+	 * own plane, an exterior - one of both sides counts - and a cliff along the cliff's top or foot, the edges across its
+	 * Up; water meets ground or more water in its plane, and a cliff along its top or foot; a cliff meets
+	 * ground or water along its own top or foot, and other cliffs with its Up. So a landscape's nature faces
+	 * all look into the same air, and their backs into the city. A placement is held to that for every face
+	 * it meets, nature or not: the city grows against ground only with exteriors facing it - the faces that
+	 * meet ground are drawn from exteriors - and never against water or a cliff.
+	 *
+	 * Nature has a beat of its own (NaturePlacementInterval), and lays one piece a beat, drawn from a
+	 * stream of its own. A field still spilling out takes the beat: ground and water are laid as fields,
+	 * each spilling out, a piece a beat, to the size it drew when it started (GroundSpillMin and Max,
+	 * WaterSpillMin and Max) - in its own plane, beside the pieces it has laid, likelier where it would
+	 * meet more of them - and the oldest still spilling goes first. Otherwise the beat starts something,
+	 * drawn by GroundWeight, CliffWeight and WaterWeight among what has somewhere to go: a field of ground,
+	 * against an exterior or at a cliff's top or foot; a cliff, off a field's outline or carrying one on;
+	 * or a pool of water, beside ground or at a cliff's top or foot. Where they could go is sampled
+	 * rather than walked in full, so a beat costs the same however far nature has spread.
+	 *
+	 * Every piece of ground and water keeps the air above it open: a box of cells out along its Up, as
+	 * high as it drew between MinAirStoreys and MaxAirStoreys, over its opening and over the seam it shares
+	 * with any field laid before it in its plane with its Up - but never over its outline, so cliffs still
+	 * rise and drop there. The air holds growth back as an obstacle does, without changing any surface, and
+	 * a piece is only laid where MinAirStoreys of it are clear of every platform already. Its height is
+	 * drawn from the run's seed and the piece itself, so a rebuild keeps the same air.
+	 *
+	 * Air pockets
+	 * -----------
+	 * Whenever the cube is cleared - at the start of play among other times - AirPocketCount pockets of air
+	 * are drawn at random across it, from a stream of their own: spheres, cubes, rectangular boxes,
+	 * ziggurats and cylinders, by their weights, between MinAirPocketSize and MaxAirPocketSize across, a
+	 * ziggurat or a cylinder standing along any axis either way unless bAirPocketsAlongAnyAxis is off.
+	 * Each holds back every lattice piece it reaches into - the inside of a module face, the run of a
+	 * module edge, a node - as an obstacle does, so nothing is ever built there. None is drawn where it
+	 * would take the first platform's place; one that cannot be moved clear of it is left out. They stay
+	 * as they were drawn until the cube is cleared again, however the settings change in between, since
+	 * the platforms standing grew round them.
+	 */
+
 	/** The structure filling one face of a platform: its positive face for a positive Sign, else its negative one. */
 	static UPlatformStructureData* GetFaceStructure(const FGridPlatform& Platform, int32 Sign);
 
@@ -1447,7 +1560,7 @@ private:
 
 	/**
 	 * Whether the nature face of one platform takes the face of another that it meets across a shared beam:
-	 * what its form allows, given how the two platforms lie. See Nature in the class comment.
+	 * what its form allows, given how the two platforms lie. See Nature above.
 	 */
 	static bool AcceptsMeeting(const FGridPlatform& Nature, int32 NatureSign, const FGridPlatform& Other, int32 OtherSign);
 
@@ -1583,8 +1696,47 @@ private:
 	/** Judges again every listed placement whose footprint reaches into a box just held back, dropping those it now cuts. */
 	void DropCandidatesCutBy(const FIntVector& MinCell, const FIntVector& MaxCell);
 
-	/** Flushes and redraws the air kept open, in its own batcher. */
+	/** Flushes and redraws the air kept open and the air pockets, in their own batcher. */
 	void RebuildAirLines();
+
+	/** One pocket of air drawn across the cube, in cells, and the lattice pieces it holds back. */
+	struct FAirPocket
+	{
+		EAirPocketShape Shape = EAirPocketShape::Sphere;
+
+		/** Its centre. A cell's own centre is its coordinate plus a half along each axis. */
+		FVector Centre = FVector::ZeroVector;
+
+		/** Half its measure across its axis, along the first and second axes after it, and half its measure along it. */
+		FVector HalfSize = FVector::ZeroVector;
+
+		/** The axis a ziggurat or cylinder stands along, and which way a ziggurat's top looks along it. */
+		int32 Axis = 2;
+		int32 AxisSign = 1;
+
+		/** The pieces it cuts, keyed as the obstacle keys are. */
+		TArray<uint64> FaceKeys;
+		TArray<uint64> EdgeKeys;
+		TArray<uint64> NodeKeys;
+	};
+
+	/** Draws AirPocketCount pockets afresh from the run's seed, clear of the first platform's place, and summarises them. */
+	void SpawnAirPockets();
+
+	/** Whether a cell's centre lies inside a pocket. */
+	bool IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const;
+
+	/** Works out the lattice pieces a pocket reaches into: every one with a cell inside it. */
+	void CutPocketPieces(FAirPocket& Pocket) const;
+
+	/** A point in cells - a cell's corner is its coordinate - in the world. */
+	FVector CellPointToWorld(const FVector& Point) const;
+
+	/** The colour a pocket of a shape is drawn in. */
+	FLinearColor GetAirPocketColor(EAirPocketShape Shape) const;
+
+	/** One pocket's outline, as lines. */
+	void AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatchedLine>& Lines) const;
 
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
@@ -1914,6 +2066,9 @@ private:
 
 	/** The seed the streams were last started from, which the heights of the air are drawn from too. */
 	int32 RunSeed = 0;
+
+	/** The pockets of air drawn the last time the cube was cleared. Their pieces are among the obstacle keys. */
+	TArray<FAirPocket> AirPockets;
 
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;

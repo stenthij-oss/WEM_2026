@@ -209,6 +209,47 @@ struct FRoomManagerTestAccess
 		return Boxes;
 	}
 
+	/** One pocket of air as the tests read it. */
+	struct FPocket
+	{
+		EAirPocketShape Shape = EAirPocketShape::Sphere;
+		FVector Centre = FVector::ZeroVector;
+		FVector HalfSize = FVector::ZeroVector;
+		int32 Axis = 2;
+		int32 AxisSign = 1;
+		int32 CutPieces = 0;
+	};
+
+	static TArray<FPocket> GetAirPockets(const ARoomManager& Manager)
+	{
+		TArray<FPocket> Pockets;
+		for (const ARoomManager::FAirPocket& Pocket : Manager.AirPockets)
+		{
+			Pockets.Add(FPocket{ Pocket.Shape, Pocket.Centre, Pocket.HalfSize, Pocket.Axis, Pocket.AxisSign,
+				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num() });
+		}
+
+		return Pockets;
+	}
+
+	/** Whether a cell's centre lies inside a pocket of the given shape and measures. */
+	static bool IsCellInPocket(const ARoomManager& Manager, const FPocket& Pocket, const FIntVector& Cell)
+	{
+		ARoomManager::FAirPocket Shape;
+		Shape.Shape = Pocket.Shape;
+		Shape.Centre = Pocket.Centre;
+		Shape.HalfSize = Pocket.HalfSize;
+		Shape.Axis = Pocket.Axis;
+		Shape.AxisSign = Pocket.AxisSign;
+		return Manager.IsCellInPocket(Shape, Cell);
+	}
+
+	/** How many lattice pieces the obstacles hold back, of every kind - objects, air and pockets together. */
+	static int32 GetObstaclePieceCount(const ARoomManager& Manager)
+	{
+		return Manager.ObstacleFaces.Num() + Manager.ObstacleEdges.Num() + Manager.ObstacleNodes.Num();
+	}
+
 	/** Whether a piece of ground or water about to be placed would have its fewest storeys of air clear. */
 	static bool IsAirClear(const ARoomManager& Manager, const FGridPlatform& Platform)
 	{
@@ -385,7 +426,7 @@ namespace WEMRoomManagerTests
 
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
-	 * pieces off, on a fixed seed. Structures replaces the slabs when given.
+	 * pieces off, no air pockets, on a fixed seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -399,6 +440,7 @@ namespace WEMRoomManagerTests
 		Manager->bShowDebugGrid = false;
 		Manager->bSnapToLandscapeHeight = false;
 		Manager->PlatformRandomSeed = 1234;
+		Manager->AirPocketCount = 0;
 
 		UPlatformTileData* Square = MakeTile(16, 16);
 		UPlatformTileData* Small = MakeTile(8, 8);
