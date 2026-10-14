@@ -98,6 +98,12 @@ namespace
 	 */
 	constexpr int32 MaxRuleRedraws = 4;
 
+	/**
+	 * How many times a beat draws a placement afresh when no fill can be drawn for the one it drew (see
+	 * ARoomManager::DrawFill). Only a placement meeting nature can go unfilled.
+	 */
+	constexpr int32 MaxFillRedraws = 8;
+
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
@@ -1019,7 +1025,20 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 	});
 
 	// A placement touching nothing would start a second structure; growth only ever extends the one.
-	return bFlush && bFoldsLegally && bTouchesStructure;
+	if (!bFlush || !bFoldsLegally || !bTouchesStructure)
+	{
+		return false;
+	}
+
+	// Nature takes only the faces its form allows. A filled placement is held to that as it stands. One not
+	// filled yet - the city's, still to be drawn for - is refused only where it would meet water or a cliff,
+	// which take no face of the city; its fill sees to it that what meets ground is an exterior.
+	if (NaturePlatformCount > 0 || IsNatureSegment(Platform))
+	{
+		return Platform.PositiveStructure || Platform.NegativeStructure ? AreNatureMeetingsLegal(Platform) : !MeetsClosedNature(Platform);
+	}
+
+	return true;
 }
 
 void ARoomManager::GatherTouchingPlatforms(const FGridPlatform& Platform, TArray<int32, TInlineAllocator<8>>& OutTouching) const
@@ -1435,6 +1454,11 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 {
 	FGridPlatform Platform;
 
+	// A platform landing where a fence run waits to carry on, laid as the run is, carries it on.
+	// Anything else is filled as drawn, with the platform and before it is taken in, since what fills a
+	// face decides what that face carries.
+	int32 JoinedSide = 0;
+
 	if (BuiltPlatforms.IsEmpty())
 	{
 		// The empty cube is the one case with nothing to grow from, and only FirstTile, laid
@@ -1453,6 +1477,12 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 		}
 
 		Platform = FirstCandidates[PlacementStream.RandRange(0, FirstCandidates.Num() - 1)];
+
+		// The platform that starts growth holds up all the rest.
+		if (!TakeWaitingFenceSpot(Platform, JoinedSide) && !DrawFill(Platform, /*bLoadBearingOnly=*/true))
+		{
+			return false;
+		}
 	}
 	else
 	{
@@ -1493,91 +1523,96 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 			return false;
 		}
 
-		float Roll = PlacementStream.FRand() * TotalWeight;
-		int32 ChosenTile = INDEX_NONE;
-
-		for (int32 TileIndex = 0; TileIndex < TileCandidates.Num(); ++TileIndex)
+		// A placement no fill can be drawn for - one whose face meets nature ground where no exterior fits
+		// it - is drawn again from the top, a few times at most. Anywhere else the first draw is filled.
+		for (int32 FillDraw = 0; ; ++FillDraw)
 		{
-			const float Weight = GetDrawWeight(TileIndex);
+			float Roll = PlacementStream.FRand() * TotalWeight;
+			int32 ChosenTile = INDEX_NONE;
 
-			if (Weight <= 0.0f)
+			for (int32 TileIndex = 0; TileIndex < TileCandidates.Num(); ++TileIndex)
 			{
-				continue;
-			}
+				const float Weight = GetDrawWeight(TileIndex);
 
-			// Taken whenever it is in the running, so rounding at the very top of the roll still
-			// lands on the last tile that could have been drawn.
-			ChosenTile = TileIndex;
-
-			if (Roll < Weight)
-			{
-				break;
-			}
-
-			Roll -= Weight;
-		}
-
-		const TArray<FGridPlatform>& Candidates = TileCandidates[ChosenTile].ByKind[KindIndex(Kind)];
-		const UPlatformTileData* Tile = TileCandidates[ChosenTile].Tile;
-
-		// Drawn by place among the fillable ones. Copied out, since taking the platform in changes the
-		// list it was drawn from. Where every way the tile is listed can be filled - nearly always - every
-		// placement is fillable, and the draw is the same without counting them.
-		const uint8 ListedWays = Tile->bCanTurn && Tile->Width != Tile->Length ? (AsLaidWay | TurnedWay) : AsLaidWay;
-		const bool bAllFillable = (GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays;
-		const int32 Fillable = bAllFillable ? Candidates.Num() : Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
-		{
-			return IsFillable(ChosenTile, Candidate);
-		});
-
-		auto DrawPlacement = [&]() -> FGridPlatform
-		{
-			if (bAllFillable)
-			{
-				return Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
-			}
-
-			int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
-
-			for (const FGridPlatform& Candidate : Candidates)
-			{
-				if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
+				if (Weight <= 0.0f)
 				{
-					return Candidate;
+					continue;
 				}
+
+				// Taken whenever it is in the running, so rounding at the very top of the roll still
+				// lands on the last tile that could have been drawn.
+				ChosenTile = TileIndex;
+
+				if (Roll < Weight)
+				{
+					break;
+				}
+
+				Roll -= Weight;
 			}
 
-			return Candidates[0];
-		};
+			const TArray<FGridPlatform>& Candidates = TileCandidates[ChosenTile].ByKind[KindIndex(Kind)];
+			const UPlatformTileData* Tile = TileCandidates[ChosenTile].Tile;
 
-		Platform = DrawPlacement();
-
-		// A placement going against a growth rule is drawn again, with the rule's chance, so growth leans
-		// the way the rules say without ever being held to it.
-		for (int32 Redraw = 0; Redraw < MaxRuleRedraws; ++Redraw)
-		{
-			const float Chance = GetRuleRedrawChance(Platform);
-
-			if (Chance <= 0.0f || PlacementStream.FRand() >= Chance)
+			// Drawn by place among the fillable ones. Copied out, since taking the platform in changes the
+			// list it was drawn from. Where every way the tile is listed can be filled - nearly always - every
+			// placement is fillable, and the draw is the same without counting them.
+			const uint8 ListedWays = Tile->bCanTurn && Tile->Width != Tile->Length ? (AsLaidWay | TurnedWay) : AsLaidWay;
+			const bool bAllFillable = (GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays;
+			const int32 Fillable = bAllFillable ? Candidates.Num() : Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
 			{
-				break;
-			}
+				return IsFillable(ChosenTile, Candidate);
+			});
+
+			auto DrawPlacement = [&]() -> FGridPlatform
+			{
+				if (bAllFillable)
+				{
+					return Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
+				}
+
+				int32 Pick = PlacementStream.RandRange(0, Fillable - 1);
+
+				for (const FGridPlatform& Candidate : Candidates)
+				{
+					if (IsFillable(ChosenTile, Candidate) && Pick-- == 0)
+					{
+						return Candidate;
+					}
+				}
+
+				return Candidates[0];
+			};
 
 			Platform = DrawPlacement();
+
+			// A placement going against a growth rule is drawn again, with the rule's chance, so growth leans
+			// the way the rules say without ever being held to it.
+			for (int32 Redraw = 0; Redraw < MaxRuleRedraws; ++Redraw)
+			{
+				const float Chance = GetRuleRedrawChance(Platform);
+
+				if (Chance <= 0.0f || PlacementStream.FRand() >= Chance)
+				{
+					break;
+				}
+
+				Platform = DrawPlacement();
+			}
+
+			// Which way up it is follows from what it grows off, and decides what can fill it.
+			Platform.Up = ChooseUp(Platform);
+
+			if (TakeWaitingFenceSpot(Platform, JoinedSide) || DrawFill(Platform, /*bLoadBearingOnly=*/false))
+			{
+				break;
+			}
+
+			if (FillDraw + 1 >= MaxFillRedraws)
+			{
+				return false;
+			}
 		}
-
-		// Which way up it is follows from what it grows off, and decides what can fill it.
-		Platform.Up = ChooseUp(Platform);
-	}
-
-	// A platform landing where a fence run waits to carry on, laid as the run is, carries it on.
-	// Anything else is filled as drawn, with the platform and before it is taken in, since what fills a
-	// face decides what that face carries. The platform that starts growth holds up all the rest.
-	int32 JoinedSide = 0;
-
-	if (!TakeWaitingFenceSpot(Platform, JoinedSide) && !DrawFill(Platform, /*bLoadBearingOnly=*/BuiltPlatforms.IsEmpty()))
-	{
-		return false;
 	}
 
 	PlacePlatform(Platform, JoinedSide);
@@ -2327,14 +2362,46 @@ void ARoomManager::ResolveUsableTiles()
 void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
 {
 	UsableStructures.Reset();
+	UsableNatureStructures.Reset();
 	CategoryIndices.Reset();
 	CategoriesByIndex.Reset();
+
+	// Numbered in the order the structures list them, so the same list numbers them the same way.
+	auto IndexCategories = [this](const UPlatformStructureData* Structure)
+	{
+		for (const UStructureCategory* Category : Structure->Categories)
+		{
+			if (Category && !CategoryIndices.Contains(Category))
+			{
+				CategoryIndices.Add(Category, CategoriesByIndex.Add(Category));
+			}
+		}
+	};
 
 	for (UPlatformStructureData* Structure : Structures)
 	{
 		// An empty entry is only one not filled in yet, and a repeat adds nothing.
-		if (!Structure || UsableStructures.Contains(Structure))
+		if (!Structure || UsableStructures.Contains(Structure) || UsableNatureStructures.Contains(Structure))
 		{
+			continue;
+		}
+
+		// Nature is laid by the nature beat alone, one-sided whatever it is set to, and drawn flat while it has no mesh.
+		if (Structure->IsNature())
+		{
+			if (Structure->Weight <= 0.0f)
+			{
+				continue;
+			}
+
+			if (Structure->bTwoSided || Structure->bFence)
+			{
+				OutProblems.Add(FString::Printf(TEXT("nature structure '%s' is set two-sided or a fence, which nature never is - it fills its own face, with an urban structure behind it"),
+					*Structure->GetName()));
+			}
+
+			UsableNatureStructures.Add(Structure);
+			IndexCategories(Structure);
 			continue;
 		}
 
@@ -2358,15 +2425,7 @@ void ARoomManager::ResolveUsableStructures(TArray<FString>& OutProblems)
 		}
 
 		UsableStructures.Add(Structure);
-
-		// Numbered in the order the structures list them, so the same list numbers them the same way.
-		for (const UStructureCategory* Category : Structure->Categories)
-		{
-			if (Category && !CategoryIndices.Contains(Category))
-			{
-				CategoryIndices.Add(Category, CategoriesByIndex.Add(Category));
-			}
-		}
+		IndexCategories(Structure);
 	}
 }
 
@@ -2388,14 +2447,9 @@ void ARoomManager::GetCategoryIndices(const UPlatformStructureData* Structure, T
 	}
 }
 
-void ARoomManager::GatherFaceNeighbours(
-	const FGridPlatform& Platform,
-	const int32 PlatformIndex,
-	const int32 FaceSign,
-	TArray<int32, TInlineAllocator<16>>& OutNeighbours) const
+template <typename FunctorType>
+void ARoomManager::ForEachMeeting(const FGridPlatform& Platform, const int32 PlatformIndex, FunctorType&& Visit) const
 {
-	OutNeighbours.Reset();
-
 	int32 SpanU, SpanV;
 	if (!GetPlatformSpans(Platform, SpanU, SpanV))
 	{
@@ -2459,17 +2513,261 @@ void ARoomManager::GatherFaceNeighbours(
 			const int32 FirstSign = (First + 1) % 4 < 2 ? 1 : -1;
 			const int32 SecondSign = (Second + 3) % 4 < 2 ? 1 : -1;
 
-			if (Owners[First] == PlatformIndex && FirstSign == FaceSign && Owners[Second] != PlatformIndex)
+			if (Owners[First] == PlatformIndex && Owners[Second] != PlatformIndex)
 			{
-				OutNeighbours.AddUnique(GetFaceFillIndex(Owners[Second], SecondSign));
+				Visit(FirstSign, Owners[Second], SecondSign);
 			}
 
-			if (Owners[Second] == PlatformIndex && SecondSign == FaceSign && Owners[First] != PlatformIndex)
+			if (Owners[Second] == PlatformIndex && Owners[First] != PlatformIndex)
 			{
-				OutNeighbours.AddUnique(GetFaceFillIndex(Owners[First], FirstSign));
+				Visit(SecondSign, Owners[First], FirstSign);
 			}
 		}
 	});
+}
+
+void ARoomManager::GatherFaceNeighbours(
+	const FGridPlatform& Platform,
+	const int32 PlatformIndex,
+	const int32 FaceSign,
+	TArray<int32, TInlineAllocator<16>>& OutNeighbours) const
+{
+	OutNeighbours.Reset();
+
+	ForEachMeeting(Platform, PlatformIndex, [&OutNeighbours, FaceSign](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	{
+		if (OwnSign == FaceSign)
+		{
+			OutNeighbours.AddUnique(GetFaceFillIndex(Neighbour, NeighbourSign));
+		}
+	});
+}
+
+UPlatformStructureData* ARoomManager::GetFaceStructure(const FGridPlatform& Platform, const int32 Sign)
+{
+	return Sign > 0 ? Platform.PositiveStructure.Get() : Platform.NegativeStructure.Get();
+}
+
+bool ARoomManager::GetNatureFace(const FGridPlatform& Platform, int32& OutSign, ENatureForm& OutForm)
+{
+	for (const int32 Sign : { 1, -1 })
+	{
+		if (const UPlatformStructureData* Structure = GetFaceStructure(Platform, Sign); Structure && Structure->IsNature())
+		{
+			OutSign = Sign;
+			OutForm = Structure->NatureForm;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool ARoomManager::IsNatureSegment(const FGridPlatform& Platform)
+{
+	int32 Sign;
+	ENatureForm Form;
+	return GetNatureFace(Platform, Sign, Form);
+}
+
+bool ARoomManager::AcceptsMeeting(const FGridPlatform& Nature, const int32 NatureSign, const FGridPlatform& Other, const int32 OtherSign)
+{
+	const UPlatformStructureData* NatureFace = GetFaceStructure(Nature, NatureSign);
+	const UPlatformStructureData* OtherFace = GetFaceStructure(Other, OtherSign);
+
+	if (!NatureFace || !NatureFace->IsNature())
+	{
+		return true;
+	}
+
+	// Two platforms meeting round a beam they share either lie in one plane or fold at it.
+	const bool bCoplanar = Nature.Normal == Other.Normal;
+	const ENatureForm Form = NatureFace->NatureForm;
+
+	if (OtherFace && OtherFace->IsNature())
+	{
+		const ENatureForm OtherForm = OtherFace->NatureForm;
+
+		// Ground and water lie in one sheet. A cliff carries a cliff on with the same Up, beside it, over it or
+		// round a corner.
+		if (Form != ENatureForm::Cliff && OtherForm != ENatureForm::Cliff)
+		{
+			return bCoplanar;
+		}
+
+		if (Form == ENatureForm::Cliff && OtherForm == ENatureForm::Cliff)
+		{
+			return Nature.Up == Other.Up;
+		}
+
+		// A cliff and ground or water fold at the cliff's top or foot: an edge across its Up, which leaves the
+		// cliff's Up along the other's normal.
+		const FGridPlatform& Cliff = Form == ENatureForm::Cliff ? Nature : Other;
+		const FGridPlatform& Field = Form == ENatureForm::Cliff ? Other : Nature;
+
+		return !bCoplanar && FaceAxis(Cliff.Up) == AxisIndex(Field.Normal);
+	}
+
+	// Of the city, only ground takes a face, and only an exterior - one of both sides counts. A face with no
+	// structure, laid before there were structures, takes anything.
+	return Form == ENatureForm::Ground && (!OtherFace || OtherFace->StandsFor(EStructureSide::Exterior));
+}
+
+bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* bOutNatureMet) const
+{
+	bool bLegal = true;
+	bool bNatureMet = false;
+
+	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	{
+		const FGridPlatform& Other = BuiltPlatforms[Neighbour];
+		const UPlatformStructureData* OwnFace = GetFaceStructure(Platform, OwnSign);
+		const UPlatformStructureData* OtherFace = GetFaceStructure(Other, NeighbourSign);
+
+		// Each side's nature has its say, so a meeting stands only where both take it.
+		if (OwnFace && OwnFace->IsNature())
+		{
+			bNatureMet = true;
+			bLegal = bLegal && AcceptsMeeting(Platform, OwnSign, Other, NeighbourSign);
+		}
+
+		if (OtherFace && OtherFace->IsNature())
+		{
+			bLegal = bLegal && AcceptsMeeting(Other, NeighbourSign, Platform, OwnSign);
+		}
+	});
+
+	if (bOutNatureMet)
+	{
+		*bOutNatureMet = bNatureMet;
+	}
+
+	return bLegal;
+}
+
+bool ARoomManager::MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFacesOnGround) const
+{
+	bool bClosed = false;
+	uint8 FacesOnGround = 0;
+
+	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	{
+		const UPlatformStructureData* OtherFace = GetFaceStructure(BuiltPlatforms[Neighbour], NeighbourSign);
+
+		if (!OtherFace || !OtherFace->IsNature())
+		{
+			return;
+		}
+
+		if (OtherFace->NatureForm == ENatureForm::Ground)
+		{
+			FacesOnGround |= FaceBit(OwnSign);
+		}
+		else
+		{
+			bClosed = true;
+		}
+	});
+
+	if (OutFacesOnGround)
+	{
+		*OutFacesOnGround = FacesOnGround;
+	}
+
+	return bClosed;
+}
+
+bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, FRandomStream& Stream)
+{
+	Platform.PositiveStructure = nullptr;
+	Platform.NegativeStructure = nullptr;
+
+	int32 SpanU, SpanV;
+	if (!GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	const bool bWall = Platform.IsWall();
+
+	// A cliff stands as a wall in its own frame; ground and water lie along their Up, looking out along it.
+	if (bWall != (Form == ENatureForm::Cliff) || (!bWall && NatureSign != FaceSign(Platform.Up)))
+	{
+		return false;
+	}
+
+	auto Fits = [&](const UPlatformStructureData* Structure)
+	{
+		bool bTurned = false;
+		return WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned);
+	};
+
+	// The nature face, from the nature of the form - a slab of its colour fits any opening.
+	TArray<UPlatformStructureData*> Options;
+
+	for (UPlatformStructureData* Structure : UsableNatureStructures)
+	{
+		if (Structure->NatureForm == Form && (!Structure->Mesh || Fits(Structure)))
+		{
+			Options.Add(Structure);
+		}
+	}
+
+	UPlatformStructureData* Front = DrawStructureFrom(Stream, Options, Platform, NatureSign);
+
+	if (!Front)
+	{
+		return false;
+	}
+
+	// Behind it any one-sided urban structure of the face's type there: a ceiling under ground and water, a wall
+	// behind a cliff. Whatever it is, the platform holds up what grows off it.
+	const EStructureType BackType = bWall ? EStructureType::Wall : EStructureType::Ceiling;
+	Options.Reset();
+
+	for (UPlatformStructureData* Structure : UsableStructures)
+	{
+		if (!Structure->bTwoSided
+			&& EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -NatureSign, Platform.Up), BackType)
+			&& Fits(Structure))
+		{
+			Options.Add(Structure);
+		}
+	}
+
+	UPlatformStructureData* Back = DrawStructureFrom(Stream, Options, Platform, -NatureSign);
+
+	if (!Back)
+	{
+		return false;
+	}
+
+	Platform.PositiveStructure = NatureSign > 0 ? Front : Back;
+	Platform.NegativeStructure = NatureSign > 0 ? Back : Front;
+	return true;
+}
+
+FTransform ARoomManager::MakeFlatSlabTransform(const FGridPlatform& Platform, const int32 FaceSign) const
+{
+	int32 SpanU, SpanV, U, V;
+	GetPlatformSpans(Platform, SpanU, SpanV);
+
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// The opening between the beams, half a cell thick, its back on the platform's mid-plane.
+	FVector Extent;
+	Extent[U] = static_cast<double>(SpanU - 1) * CellSize;
+	Extent[V] = static_cast<double>(SpanV - 1) * CellSize;
+	Extent[NormalAxis] = 0.5 * CellSize;
+
+	FVector Centre = GetCellMinCorner(Platform.MinNode);
+	Centre[U] += 0.5 * static_cast<double>(SpanU + 1) * CellSize;
+	Centre[V] += 0.5 * static_cast<double>(SpanV + 1) * CellSize;
+	Centre[NormalAxis] += (0.5 + 0.25 * FaceSign) * CellSize;
+
+	return FTransform(FRotator::ZeroRotator, Centre, Extent / UnitCubeSize);
 }
 
 void ARoomManager::RecordFill(const int32 PlatformIndex)
@@ -2631,7 +2929,8 @@ void ARoomManager::GatherFillOptions(
 	const int32 FaceSign,
 	const UPlatformStructureData* Front,
 	const bool bLoadBearingOnly,
-	TArray<UPlatformStructureData*>& OutOptions) const
+	TArray<UPlatformStructureData*>& OutOptions,
+	const bool bExteriorBackOnly) const
 {
 	OutOptions.Reset();
 
@@ -2666,12 +2965,12 @@ void ARoomManager::GatherFillOptions(
 	}
 
 	// A one-sided structure leaves the face behind it to another, so it is only offered when one that
-	// pairs with it could fill that face.
+	// pairs with it could fill that face - an exterior, where that face has to be one.
 	EStructureType BackOffers = EStructureType::None;
 
 	for (const UPlatformStructureData* Structure : UsableStructures)
 	{
-		if (!Structure->bTwoSided && Fits(Structure, -FaceSign))
+		if (!Structure->bTwoSided && Fits(Structure, -FaceSign) && (!bExteriorBackOnly || Structure->StandsFor(EStructureSide::Exterior)))
 		{
 			BackOffers |= WEMStructures::GetTypesOnFace(*Structure, NormalAxis, -FaceSign, Platform.Up);
 		}
@@ -2693,6 +2992,24 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 {
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
+
+	// The city meets nature only with exteriors, and only ground: a face meeting ground is drawn from the
+	// exteriors - those of both sides among them - and a placement meeting water or a cliff is not filled.
+	uint8 FacesOnGround = 0;
+
+	if (NaturePlatformCount > 0 && MeetsClosedNature(Platform, &FacesOnGround))
+	{
+		return false;
+	}
+
+	auto KeepExteriorsOnGround = [FacesOnGround](TArray<UPlatformStructureData*>& Options, const int32 Sign)
+	{
+		Options.RemoveAll([FacesOnGround, Sign](const UPlatformStructureData* Option)
+		{
+			const bool bOnGround = (FacesOnGround & FaceBit(Sign)) != 0 || (Option->bTwoSided && (FacesOnGround & FaceBit(-Sign)) != 0);
+			return bOnGround && !Option->StandsFor(EStructureSide::Exterior);
+		});
+	};
 
 	// A wall's face over an interior ground it stands on is drawn from the interiors, with the rule's chance.
 	const uint8 OverInteriorGround = bWallsFaceInteriorGrounds ? GetFacesOverInteriorGround(Platform) : 0;
@@ -2727,7 +3044,8 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	}
 
 	TArray<UPlatformStructureData*> Options;
-	GatherFillOptions(Platform, FirstSign, /*Front=*/nullptr, bLoadBearingOnly, Options);
+	GatherFillOptions(Platform, FirstSign, /*Front=*/nullptr, bLoadBearingOnly, Options, /*bExteriorBackOnly=*/(FacesOnGround & FaceBit(-FirstSign)) != 0);
+	KeepExteriorsOnGround(Options, FirstSign);
 	KeepInteriorOverGround(Options, FirstSign);
 
 	UPlatformStructureData* First = DrawStructure(Options, Platform, FirstSign);
@@ -2745,6 +3063,7 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	}
 
 	GatherFillOptions(Platform, -FirstSign, First, bLoadBearingOnly, Options);
+	KeepExteriorsOnGround(Options, -FirstSign);
 
 	// Over an interior ground the back is an inside too. Otherwise, behind an inside, with
 	// InteriorBacksExteriorChance, an outside - where any of the options is one. Behind an outside,
@@ -2847,6 +3166,15 @@ UPlatformStructureData* ARoomManager::DrawStructure(
 	const FGridPlatform& Platform,
 	const int32 FaceSign)
 {
+	return DrawStructureFrom(StructureStream, Options, Platform, FaceSign);
+}
+
+UPlatformStructureData* ARoomManager::DrawStructureFrom(
+	FRandomStream& Stream,
+	const TConstArrayView<UPlatformStructureData*> Options,
+	const FGridPlatform& Platform,
+	const int32 FaceSign)
+{
 	TArray<WEMStructures::FDrawOption, TInlineAllocator<32>> DrawOptions;
 
 	for (const UPlatformStructureData* Option : Options)
@@ -2881,7 +3209,7 @@ UPlatformStructureData* ARoomManager::DrawStructure(
 		}
 	}
 
-	const int32 Chosen = WEMStructures::DrawWithPull(StructureStream, DrawOptions, Offers);
+	const int32 Chosen = WEMStructures::DrawWithPull(Stream, DrawOptions, Offers);
 
 	return Chosen == INDEX_NONE ? nullptr : Options[Chosen];
 }
@@ -2913,6 +3241,7 @@ void ARoomManager::RebuildPlatformState()
 	PatchSizes.Reset();
 	PatchSizeSquares = 0;
 	CategoryPatchSize = 0.0;
+	NaturePlatformCount = 0;
 
 	// The candidates follow from everything below, so they are gathered afresh on the next draw.
 	bPlatformCandidatesStale = true;
@@ -3291,6 +3620,11 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 
 	// What fills it follows from the faces placed before it, so it is recorded in the same order.
 	RecordFill(PlatformIndex);
+
+	if (IsNatureSegment(Platform))
+	{
+		++NaturePlatformCount;
+	}
 }
 
 void ARoomManager::JournalSurfaceChanges(const TConstArrayView<FGridSurfaceRef> Surfaces)
@@ -3672,6 +4006,12 @@ bool ARoomManager::IsFaceBlocked(const FGridPlatform& Platform, const EGridFace 
 
 bool ARoomManager::IsLoadBearing(const FGridPlatform& Platform)
 {
+	// Nature holds up whatever grows off it, whatever stands behind it.
+	if (IsNatureSegment(Platform))
+	{
+		return true;
+	}
+
 	return (!Platform.PositiveStructure || Platform.PositiveStructure->bLoadBearing)
 		&& (!Platform.NegativeStructure || Platform.NegativeStructure->bLoadBearing);
 }
@@ -4047,8 +4387,10 @@ void ARoomManager::UpdateDebugReadouts()
 
 	if (DebugProbeStructure && Behind)
 	{
+		// Nature behind it pairs with whatever was laid there, so only the face's own types are asked.
 		FaceRole = WEMStructures::GetTypesOnFace(*DebugProbeStructure, OwnerNormal, ProbeSign, OwnerPlatform.Up)
-			& WEMStructures::GetBackTypes(WEMStructures::GetTypesOnFace(*Behind, OwnerNormal, -ProbeSign, OwnerPlatform.Up));
+			& (Behind->IsNature() ? WEMStructures::GetFaceTypes(OwnerNormal, ProbeSign, OwnerPlatform.Up)
+				: WEMStructures::GetBackTypes(WEMStructures::GetTypesOnFace(*Behind, OwnerNormal, -ProbeSign, OwnerPlatform.Up)));
 	}
 
 	TArray<FString> RoleNames;
@@ -4062,11 +4404,21 @@ void ARoomManager::UpdateDebugReadouts()
 	}
 
 	const EStructureSide ProbeSide = DebugProbeStructure ? DebugProbeStructure->Side : EStructureSide::Exterior;
+	const FString UpName = StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString();
 
-	DebugProbeRole = FString::Printf(TEXT("%s, %s, up %s"),
-		RoleNames.IsEmpty() ? TEXT("none") : *FString::Join(RoleNames, TEXT(" or ")),
-		ProbeSide == EStructureSide::Interior ? TEXT("interior") : ProbeSide == EStructureSide::Both ? TEXT("interior or exterior") : TEXT("exterior"),
-		*StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString());
+	// Nature is what its form is, on whichever face it was laid.
+	if (DebugProbeStructure && DebugProbeStructure->IsNature())
+	{
+		DebugProbeRole = FString::Printf(TEXT("%s, nature, up %s"),
+			*StaticEnum<ENatureForm>()->GetDisplayNameTextByValue(static_cast<int64>(DebugProbeStructure->NatureForm)).ToString().ToLower(), *UpName);
+	}
+	else
+	{
+		DebugProbeRole = FString::Printf(TEXT("%s, %s, up %s"),
+			RoleNames.IsEmpty() ? TEXT("none") : *FString::Join(RoleNames, TEXT(" or ")),
+			ProbeSide == EStructureSide::Interior ? TEXT("interior") : ProbeSide == EStructureSide::Both ? TEXT("interior or exterior") : TEXT("exterior"),
+			*UpName);
+	}
 
 	TArray<FString> Streaks;
 	for (int32 Index = 0; Index < Fill.Categories.Num(); ++Index)
@@ -4195,13 +4547,16 @@ int32 ARoomManager::SyncPieces()
 		}
 	}
 
-	// A structure keeps its own materials, so no tint is put over it.
+	// A structure keeps its own materials, so no tint is put over it - unless it is nature drawn flat.
 	for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& StructurePieces : Pieces.Structures)
 	{
 		FStructureLayer& Layer = FindOrAddStructureLayer(StructurePieces.Key);
 
-		AddedPieces += SyncPieceLayer(
-			Layer.Pieces, Layer.Pieces.Chunks[0], StructurePieces.Value, StructurePieces.Key->Mesh, /*Material=*/nullptr);
+		UStaticMesh* Mesh = nullptr;
+		UMaterialInterface* Material = nullptr;
+		ResolveStructureLayerLook(Layer, Mesh, Material);
+
+		AddedPieces += SyncPieceLayer(Layer.Pieces, Layer.Pieces.Chunks[0], StructurePieces.Value, Mesh, Material);
 	}
 
 	// Only a sync that built every platform can be added to one placement at a time.
@@ -4274,7 +4629,11 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 	for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& StructurePieces : Pieces.Structures)
 	{
 		FStructureLayer& Layer = FindOrAddStructureLayer(StructurePieces.Key);
-		ApplyMeshAndMaterial(Layer.Pieces.Chunks, StructurePieces.Key->Mesh, /*Material=*/nullptr);
+
+		UStaticMesh* Mesh = nullptr;
+		UMaterialInterface* Material = nullptr;
+		ResolveStructureLayerLook(Layer, Mesh, Material);
+		ApplyMeshAndMaterial(Layer.Pieces.Chunks, Mesh, Material);
 
 		TArray<FTransform> NewPieces;
 		AppendToLayer(Layer.Pieces, StructurePieces.Value, NewPieces);
@@ -4309,6 +4668,13 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 
 	auto AddStructure = [&](UPlatformStructureData* Structure, const int32 Sign, const uint64 Key)
 	{
+		// Nature with no mesh of its own is a slab of its flat colour, which fits any opening.
+		if (Structure && !Structure->Mesh && Structure->IsNature())
+		{
+			OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{ Key, MakeFlatSlabTransform(Platform, Sign) });
+			return;
+		}
+
 		bool bTurned = false;
 
 		if (!Structure || !Structure->Mesh
@@ -4318,10 +4684,11 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 		}
 
 		OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{
-			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, Platform.Up, SpanU, SpanV, Sign, bTurned, Structure->bTwoSided) });
+			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, Platform.Up, SpanU, SpanV, Sign, bTurned, Structure->bTwoSided && !Structure->IsNature()) });
 	};
 
-	if (Platform.PositiveStructure && Platform.PositiveStructure->bTwoSided)
+	// Nature is one-sided, whatever it is set to.
+	if (Platform.PositiveStructure && Platform.PositiveStructure->bTwoSided && !Platform.PositiveStructure->IsNature())
 	{
 		AddStructure(Platform.PositiveStructure, TwoSidedSign, PlatformKey);
 	}
@@ -4398,6 +4765,22 @@ FStructureLayer& ARoomManager::FindOrAddStructureLayer(UPlatformStructureData* S
 	}
 
 	return *Layer;
+}
+
+void ARoomManager::ResolveStructureLayerLook(FStructureLayer& Layer, UStaticMesh*& OutMesh, UMaterialInterface*& OutMaterial)
+{
+	const UPlatformStructureData* Structure = Layer.Structure;
+
+	// Its own mesh with its own materials; or, for nature without one, the beams' box tinted to its flat colour.
+	if (!Structure || Structure->Mesh)
+	{
+		OutMesh = Structure ? Structure->Mesh.Get() : nullptr;
+		OutMaterial = nullptr;
+		return;
+	}
+
+	OutMesh = PieceMesh;
+	OutMaterial = ResolveTintedMaterial(Layer.FlatMaterial, PieceMaterial, PieceColorParameterName, Structure->FlatColor);
 }
 
 void ARoomManager::ResetStructureLayers()

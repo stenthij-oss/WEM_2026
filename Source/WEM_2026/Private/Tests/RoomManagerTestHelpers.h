@@ -6,6 +6,7 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+#include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
@@ -170,6 +171,81 @@ struct FRoomManagerTestAccess
 		return Manager.StandsOnSomething(Platform);
 	}
 
+	/** Fills a platform with nature of one form on the face NatureSign looks out from, and urban behind it, from the structure stream. */
+	static bool DrawNatureFill(ARoomManager& Manager, FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign)
+	{
+		return Manager.DrawNatureFill(Platform, Form, NatureSign, Manager.StructureStream);
+	}
+
+	/** Whether every face a filled platform about to be placed would meet is one the nature on either side takes. */
+	static bool AreNatureMeetingsLegal(const ARoomManager& Manager, const FGridPlatform& Platform, bool& bOutNatureMet)
+	{
+		return Manager.AreNatureMeetingsLegal(Platform, &bOutNatureMet);
+	}
+
+	/** Whether a placement not yet filled would meet water or a cliff, and which of its faces would meet ground (1 positive, 2 negative). */
+	static bool MeetsClosedNature(const ARoomManager& Manager, const FGridPlatform& Platform, uint8& OutFacesOnGround)
+	{
+		return Manager.MeetsClosedNature(Platform, &OutFacesOnGround);
+	}
+
+	static int32 GetUsableNatureCount(const ARoomManager& Manager)
+	{
+		return Manager.UsableNatureStructures.Num();
+	}
+
+	/** How many pairs of faces among the platforms that stand meet where the nature on either side does not take the other. */
+	static int32 CountIllegalNatureMeetings(const ARoomManager& Manager)
+	{
+		int32 Illegal = 0;
+
+		for (int32 Index = 0; Index < Manager.BuiltPlatforms.Num(); ++Index)
+		{
+			const FGridPlatform& Platform = Manager.BuiltPlatforms[Index];
+
+			for (const int32 OwnSign : { 1, -1 })
+			{
+				TArray<int32, TInlineAllocator<16>> Neighbours;
+				Manager.GatherFaceNeighbours(Platform, Index, OwnSign, Neighbours);
+
+				// Face indices run platform * 2, + 1 for its negative face.
+				for (const int32 Face : Neighbours)
+				{
+					Illegal += ARoomManager::AcceptsMeeting(Platform, OwnSign, Manager.BuiltPlatforms[Face / 2], Face % 2 == 0 ? 1 : -1) ? 0 : 1;
+				}
+			}
+		}
+
+		return Illegal;
+	}
+
+	/** The instances a structure's layer holds, and the mesh and material on its first chunk. Zero when it has no layer. */
+	static int32 GetStructureLayerPieces(const ARoomManager& Manager, const UPlatformStructureData* Structure, UStaticMesh*& OutMesh, UMaterialInterface*& OutMaterial)
+	{
+		OutMesh = nullptr;
+		OutMaterial = nullptr;
+
+		for (const FStructureLayer& Layer : Manager.StructureLayers)
+		{
+			if (Layer.Structure != Structure || Layer.Pieces.Chunks.IsEmpty())
+			{
+				continue;
+			}
+
+			int32 Pieces = 0;
+			for (const UInstancedStaticMeshComponent* Chunk : Layer.Pieces.Chunks)
+			{
+				Pieces += Chunk ? Chunk->GetInstanceCount() : 0;
+			}
+
+			OutMesh = Layer.Pieces.Chunks[0]->GetStaticMesh();
+			OutMaterial = Layer.Pieces.Chunks[0]->GetMaterial(0);
+			return Pieces;
+		}
+
+		return 0;
+	}
+
 	/** A face's streak in a category, or zero when its structure does not carry it. */
 	static int32 GetStreak(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign, const UStructureCategory* Category)
 	{
@@ -249,6 +325,18 @@ namespace WEMRoomManagerTests
 		Structure->bMayLieSideways = bMayLieSideways;
 		Structure->AddToRoot();
 		return Structure;
+	}
+
+	/** Nature of one form with no mesh, drawn as a slab of its flat colour. Only ground holds items. Rooted, like a tile. */
+	inline UPlatformStructureData* MakeNature(const TCHAR* Name, const ENatureForm Form)
+	{
+		UPlatformStructureData* Nature = NewObject<UPlatformStructureData>(
+			GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UPlatformStructureData::StaticClass(), Name));
+		Nature->Section = EStructureSection::Nature;
+		Nature->NatureForm = Form;
+		Nature->bHoldsItems = Form == ENatureForm::Ground;
+		Nature->AddToRoot();
+		return Nature;
 	}
 
 	/** One two-sided slab per size, of every type and free to lie sideways: every tile filled, any way it is laid. */

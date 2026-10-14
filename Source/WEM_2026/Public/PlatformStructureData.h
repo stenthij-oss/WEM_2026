@@ -50,6 +50,40 @@ enum class EStructureSide : uint8
 	Both
 };
 
+/** Which part of the world a structure belongs to: the city growth builds, or the nature laid over it. */
+UENUM(BlueprintType)
+enum class EStructureSection : uint8
+{
+	/** Drawn by growth for the segments it lays. Every structure is urban unless it is set otherwise. */
+	Urban,
+
+	/** Laid by the nature beat alone (see ARoomManager), on one face of a segment, with an urban structure behind it. */
+	Nature
+};
+
+/**
+ * What a nature structure is. Its face looks into the open air and its back into the city: every nature
+ * face of a landscape looks into the same air, and only meets the faces its form allows across a shared beam.
+ */
+UENUM(BlueprintType)
+enum class ENatureForm : uint8
+{
+	/**
+	 * Lies along its segment's Up, over any ceiling. Meets more ground or water beside it, an exterior, or
+	 * a cliff along that cliff's top or foot.
+	 */
+	Ground,
+
+	/**
+	 * Stands as a wall in the frame of the ground it rises from or drops off, in front of any wall. Meets
+	 * ground or water along its own top or foot, or another cliff.
+	 */
+	Cliff,
+
+	/** Lies like ground, over any ceiling. Meets ground or more water beside it, or a cliff along its top or foot. */
+	Water
+};
+
 /**
  * A mesh that fills the opening of a segment between its beams, and what it means for growth.
  *
@@ -62,6 +96,10 @@ enum class EStructureSide : uint8
  * across the wall's Up and +Y points along it. Width and length are counted beam to beam, like a tile's, so a
  * structure of 8 x 16 cells is 1.40 m by 3.00 m - the opening between the beams. Its edges are
  * closed, since they show wherever a beam is not built.
+ *
+ * A structure of the nature section is one-sided whatever it is set to, and is only ever laid on the face
+ * its form gives it - Types, Two-sided, Fence and Load-bearing are not asked of it. It needs no mesh: one
+ * without is drawn as a slab of its flat colour.
  */
 UCLASS(BlueprintType)
 class WEM_2026_API UPlatformStructureData : public UDataAsset
@@ -69,9 +107,21 @@ class WEM_2026_API UPlatformStructureData : public UDataAsset
 	GENERATED_BODY()
 
 public:
-	/** The mesh built across the segment's opening, with its own materials. */
+	/** The mesh built across the segment's opening, with its own materials. A nature structure may go without one. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure")
 	TObjectPtr<UStaticMesh> Mesh;
+
+	/** The city growth builds, or the nature laid over it. Growth never draws a nature structure for a segment of its own. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure")
+	EStructureSection Section = EStructureSection::Urban;
+
+	/** What it is, as nature. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
+	ENatureForm NatureForm = ENatureForm::Ground;
+
+	/** The colour it is drawn in, as a flat slab across its face, while it has no mesh. Lit, like the beams. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
+	FLinearColor FlatColor = FLinearColor(0.05f, 0.3f, 0.03f);
 
 	/** Cells from beam to beam along the structure's width (its X), as authored. The importer measures it from the mesh. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (ClampMin = "2"))
@@ -175,5 +225,10 @@ public:
 	bool HasType(const EStructureType Type) const
 	{
 		return (Types & static_cast<int32>(Type)) != 0;
+	}
+
+	bool IsNature() const
+	{
+		return Section == EStructureSection::Nature;
 	}
 };

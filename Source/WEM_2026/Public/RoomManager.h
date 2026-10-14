@@ -18,6 +18,9 @@ class UPlatformTileData;
 class UStructureCategory;
 class UStaticMesh;
 
+/** Defined in PlatformStructureData.h. */
+enum class ENatureForm : uint8;
+
 /** Defined in Components/LineBatchComponent.h; only the drawing code in the .cpp needs it. */
 struct FBatchedLine;
 
@@ -218,6 +221,10 @@ struct FStructureLayer
 	/** Its first chunk is made with the layer, set up like EdgePieces, rather than being one of the actor's own. */
 	UPROPERTY(Transient)
 	FRoomPieceLayer Pieces;
+
+	/** The beams' material tinted to the structure's flat colour, for a nature structure drawn as a slab for want of a mesh. */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> FlatMaterial;
 };
 
 /**
@@ -376,6 +383,24 @@ struct FSurfaceMarkLayer
  * closing round a roof, or meeting another of the same fence - is closed. A platform a normal beat
  * happens to lay on a waiting spot, laid as the run is, carries the run on. A fence that is not
  * load-bearing may carry on across the edge its own run blocked.
+ *
+ * Nature
+ * ------
+ * Every structure belongs to a section (UPlatformStructureData::Section): the city, which growth fills
+ * its platforms from, or nature - ground, cliff and water - which growth never draws. A nature platform
+ * is one-sided: its nature face looks into the open air, and behind it stands any one-sided urban
+ * structure of the face's type, a ceiling under ground and water and a wall behind a cliff. Ground and
+ * water lie along their Up, their nature face looking along it; a cliff is a wall. A nature platform is
+ * always load-bearing, whatever stands behind it.
+ *
+ * Which faces meet across a shared beam is the walk the category pull takes (see Structures), and a
+ * nature face meets only what its form allows: ground meets more ground or water in its own plane, an
+ * exterior - one of both sides counts - and a cliff along the cliff's top or foot, the edges across its
+ * Up; water meets ground or more water in its plane, and a cliff along its top or foot; a cliff meets
+ * ground or water along its own top or foot, and other cliffs with its Up. So a landscape's nature faces
+ * all look into the same air, and their backs into the city. A placement is held to that for every face
+ * it meets, nature or not: the city grows against ground only with exteriors facing it - the faces that
+ * meet ground are drawn from exteriors - and never against water or a cliff.
  *
  * Surfaces
  * --------
@@ -1114,6 +1139,9 @@ private:
 	/** The layer a structure is built in, made the first time the structure needs one. */
 	FStructureLayer& FindOrAddStructureLayer(UPlatformStructureData* Structure);
 
+	/** The mesh a structure's layer is built from and the material put over it: none, so it keeps its own, unless it is nature drawn flat. */
+	void ResolveStructureLayerLook(FStructureLayer& Layer, UStaticMesh*& OutMesh, UMaterialInterface*& OutMaterial);
+
 	/** Takes down every structure's layer, first chunk and all. */
 	void ResetStructureLayers();
 
@@ -1270,22 +1298,25 @@ private:
 	/**
 	 * The usable structures that may fill one face of a platform. For the first face, Front null:
 	 * every two-sided one that fits it, and every one-sided one that fits this face - but those only
-	 * when a one-sided structure that pairs with it fits the face behind, so a draw never leaves a face
-	 * empty. For the face behind Front: the one-sided structures that fit it and pair with Front.
+	 * when a one-sided structure that pairs with it fits the face behind, an exterior one when
+	 * bExteriorBackOnly, so a draw never leaves a face empty. For the face behind Front: the one-sided
+	 * structures that fit it and pair with Front.
 	 */
 	void GatherFillOptions(
 		const FGridPlatform& Platform,
 		int32 FaceSign,
 		const UPlatformStructureData* Front,
 		bool bLoadBearingOnly,
-		TArray<UPlatformStructureData*>& OutOptions) const;
+		TArray<UPlatformStructureData*>& OutOptions,
+		bool bExteriorBackOnly = false) const;
 
 	/**
 	 * Draws the structures filling a platform that is about to be placed, from the structure
 	 * stream: a face first - a floor's face looking along its Up, a wall's face over an interior ground
 	 * where only one is, else either - then a structure for it, and when that is one-sided, one for the
 	 * face behind that pairs with it. Interiors and exteriors are drawn where bWallsFaceInteriorGrounds
-	 * and bInteriorBacksExterior say so. False when nothing fits.
+	 * and bInteriorBacksExterior say so, and a face meeting nature ground is always an exterior. False
+	 * when nothing fits, or when the platform would meet water or a cliff.
 	 */
 	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
 
@@ -1303,6 +1334,57 @@ private:
 	 * Null when there are none.
 	 */
 	UPlatformStructureData* DrawStructure(TConstArrayView<UPlatformStructureData*> Options, const FGridPlatform& Platform, int32 FaceSign);
+
+	/** DrawStructure from a stream of the caller's: the nature beat fills what it lays from its own. */
+	UPlatformStructureData* DrawStructureFrom(FRandomStream& Stream, TConstArrayView<UPlatformStructureData*> Options, const FGridPlatform& Platform, int32 FaceSign);
+
+	/** The structure filling one face of a platform: its positive face for a positive Sign, else its negative one. */
+	static UPlatformStructureData* GetFaceStructure(const FGridPlatform& Platform, int32 Sign);
+
+	/** The face of a platform a nature structure fills, and its form. False for a platform of the city alone. */
+	static bool GetNatureFace(const FGridPlatform& Platform, int32& OutSign, ENatureForm& OutForm);
+
+	/** Whether a nature structure fills either face of a platform. */
+	static bool IsNatureSegment(const FGridPlatform& Platform);
+
+	/**
+	 * Whether the nature face of one platform takes the face of another that it meets across a shared beam:
+	 * what its form allows, given how the two platforms lie. See Nature in the class comment.
+	 */
+	static bool AcceptsMeeting(const FGridPlatform& Nature, int32 NatureSign, const FGridPlatform& Other, int32 OtherSign);
+
+	/**
+	 * Calls Visit(OwnSign, NeighbourIndex, NeighbourSign) for every pair of faces a platform meets others in:
+	 * around every module edge of its rim another platform shares, each face of it meeting the face of
+	 * the platform next round the edge, either way. The platform is BuiltPlatforms[PlatformIndex], or the
+	 * one about to be placed there.
+	 */
+	template <typename FunctorType>
+	void ForEachMeeting(const FGridPlatform& Platform, int32 PlatformIndex, FunctorType&& Visit) const;
+
+	/**
+	 * Whether every face a filled platform about to be placed would meet is one the nature on either side
+	 * takes. bOutNatureMet says whether its own nature face, if it has one, meets anything at all.
+	 */
+	bool AreNatureMeetingsLegal(const FGridPlatform& Platform, bool* bOutNatureMet = nullptr) const;
+
+	/**
+	 * Whether a placement not yet filled would meet water or a cliff, which take no face of the city. The
+	 * faces of it that would meet ground, and so have to be drawn from exteriors, go into OutFacesOnGround
+	 * as FaceBit flags.
+	 */
+	bool MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFacesOnGround = nullptr) const;
+
+	/**
+	 * Fills a platform about to be placed with nature of one form on the face NatureSign looks out from,
+	 * and one-sided urban structure behind it - any of the face's type there - both from Stream. Its Up has
+	 * to suit the form already: along its normal and looking out of the nature face for ground and water,
+	 * in its plane for a cliff. False when that is not so, or when nothing fits either face.
+	 */
+	bool DrawNatureFill(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, FRandomStream& Stream);
+
+	/** Where a nature structure with no mesh is drawn on one face of a platform: a slab across the opening, from the mid-plane out to the face. */
+	FTransform MakeFlatSlabTransform(const FGridPlatform& Platform, int32 FaceSign) const;
 
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
@@ -1602,9 +1684,15 @@ private:
 
 	/**
 	 * The structures growth fills platforms from: Structures, less empty entries, repeats, any with
-	 * no mesh, no type or no weight, and fences that are not two-sided.
+	 * no mesh, no type or no weight, fences that are not two-sided, and nature.
 	 */
 	TArray<TObjectPtr<UPlatformStructureData>> UsableStructures;
+
+	/** The nature among Structures, less empty entries, repeats and any with no weight. A mesh is not asked for. */
+	TArray<TObjectPtr<UPlatformStructureData>> UsableNatureStructures;
+
+	/** How many of BuiltPlatforms have nature on a face. Until there are any, nothing has to ask what a placement meets. */
+	int32 NaturePlatformCount = 0;
 
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
