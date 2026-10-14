@@ -145,6 +145,20 @@ struct FGridPlatform
 	}
 };
 
+/** Which ways ground and water may face in the world. Cliffs stand across whatever they face. */
+UENUM(BlueprintType)
+enum class ENatureFacing : uint8
+{
+	/** Lying flat, looking up at the sky, so cliffs stand upright off their edges. */
+	Up UMETA(DisplayName = "Flat, Looking Up"),
+
+	/** Lying flat, looking up or hanging face down under an overhang. */
+	Flat UMETA(DisplayName = "Flat, Up Or Down"),
+
+	/** Any way the city's segments face: flat, standing on a facade, or hanging. */
+	AnyWay UMETA(DisplayName = "Any Way, Following Up")
+};
+
 /** The shapes an air pocket can take. */
 UENUM(BlueprintType)
 enum class EAirPocketShape : uint8
@@ -680,6 +694,13 @@ public:
 	/** Seconds between nature beats. One piece of nature a beat. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
 	float NaturePlacementInterval = 1.0f;
+
+	/**
+	 * Which ways ground and water may face in the world: lying flat and looking up, by default, so a landscape
+	 * lies like one and its cliffs stand upright. Takes effect on the next nature beat.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature")
+	ENatureFacing NatureFacing = ENatureFacing::Up;
 
 	/**
 	 * How often a nature beat with no field spilling starts a field of ground - against an exterior, or at
@@ -1507,8 +1528,9 @@ private:
 	 * its platforms from, or nature - ground, cliff and water - which growth never draws. A nature platform
 	 * is one-sided: its nature face looks into the open air, and behind it stands any one-sided urban
 	 * structure of the face's type, a ceiling under ground and water and a wall behind a cliff. Ground and
-	 * water lie along their Up, their nature face looking along it; a cliff is a wall. A nature platform is
-	 * always load-bearing, whatever stands behind it.
+	 * water lie along their Up, their nature face looking along it; a cliff is a wall. Which ways they may
+	 * face in the world NatureFacing says - by default only flat, looking up at the sky, so cliffs stand
+	 * upright off their edges. A nature platform is always load-bearing, whatever stands behind it.
 	 *
 	 * Which faces meet across a shared beam is the walk the category pull takes (see Structures in the class
 	 * comment), and a nature face meets only what its form allows: ground meets more ground or water in its
@@ -1649,8 +1671,15 @@ private:
 	void GatherNatureAround(const FGridPlatform& Anchor, const FIntVector& EdgeNode, int32 EdgeAxis, ENatureForm Form, uint8 Starts, TMap<FNatureCandidateKey, int32>& Seen, TArray<FNatureCandidate>& Out);
 
 	/**
+	 * Whether nature laid on a placement with its Up faces a way NatureFacing allows. Ground and water look out
+	 * along their Up and a cliff stands with the Up of what it grows off, so the Up answers for all three: a
+	 * cliff stands upright where they look up, and along the same axis where they lie flat either way.
+	 */
+	bool AllowsNatureFacing(const FGridPlatform& Platform) const;
+
+	/**
 	 * Whether a placement, given its Up, could be laid as nature of Form on the face NatureSign looks out
-	 * from: its tile may lie that way, nature and something behind it fit, and it is free and legal to
+	 * from: it faces a way NatureFacing allows, its tile may lie that way, nature and something behind it fit, and it is free and legal to
 	 * place filled with them - its meetings included - with its nature face meeting one of Starts, as
 	 * AreNatureMeetingsLegal reports them: what it may start against, or the field it spills from. On
 	 * success it is left filled with stand-ins (see FindNatureFill).

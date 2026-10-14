@@ -2966,17 +2966,25 @@ bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
 		? (NatureMeetsCity | GetNatureMeetsBit(ENatureForm::Cliff))
 		: (GetNatureMeetsBit(ENatureForm::Ground) | GetNatureMeetsBit(ENatureForm::Cliff));
 
-	// Ground starts against an exterior: a sample of the city's own open placements, each looking either way.
+	// Ground starts against an exterior: a sample of the city's own open placements - only those lying flat,
+	// unless it may face any way - each looking whichever ways NatureFacing allows.
 	if (Form == ENatureForm::Ground)
 	{
 		EnsurePlatformCandidates();
 
+		const bool bFlatOnly = NatureFacing != ENatureFacing::AnyWay;
+
+		auto IsSampled = [bFlatOnly](const int32 Kind)
+		{
+			return !bFlatOnly || Kind == KindIndex(EPlatformKind::SurfaceHorizontal);
+		};
+
 		int32 Listed = 0;
 		for (const FTileCandidates& TileList : TileCandidates)
 		{
-			for (const TArray<FGridPlatform>& KindList : TileList.ByKind)
+			for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
 			{
-				Listed += KindList.Num();
+				Listed += IsSampled(Kind) ? TileList.ByKind[Kind].Num() : 0;
 			}
 		}
 
@@ -2988,8 +2996,15 @@ bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
 
 			for (int32 TileIndex = 0; PickedTile == INDEX_NONE && TileIndex < TileCandidates.Num(); ++TileIndex)
 			{
-				for (const TArray<FGridPlatform>& KindList : TileCandidates[TileIndex].ByKind)
+				for (int32 Kind = 0; Kind < PlatformKindCount; ++Kind)
 				{
+					const TArray<FGridPlatform>& KindList = TileCandidates[TileIndex].ByKind[Kind];
+
+					if (!IsSampled(Kind))
+					{
+						continue;
+					}
+
 					if (Pick < KindList.Num())
 					{
 						Placement = KindList[Pick];
@@ -3001,10 +3016,14 @@ bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
 				}
 			}
 
-			const int32 FirstSign = NatureStream.FRand() < 0.5f ? 1 : -1;
+			// Looking up, it only ever lies with its face to the sky; otherwise either way, the first drawn.
+			const bool bUpOnly = NatureFacing == ENatureFacing::Up;
+			const int32 FirstSign = bUpOnly || NatureStream.FRand() < 0.5f ? 1 : -1;
 
-			for (const int32 Sign : { FirstSign, -FirstSign })
+			for (int32 SignIndex = 0; SignIndex < (bUpOnly ? 1 : 2); ++SignIndex)
 			{
+				const int32 Sign = SignIndex == 0 ? FirstSign : -FirstSign;
+
 				FGridPlatform Platform = Placement;
 				Platform.Up = MakeFace(AxisIndex(Platform.Normal), Sign);
 
@@ -3198,12 +3217,30 @@ void ARoomManager::GatherNatureAround(
 	});
 }
 
+bool ARoomManager::AllowsNatureFacing(const FGridPlatform& Platform) const
+{
+	// Ground and water look out along their Up, and a cliff stands with the Up of what it grows off, so the Up
+	// answers for both: along world Z when they lie flat, and +Z itself when they look up.
+	switch (NatureFacing)
+	{
+	case ENatureFacing::Up:
+		return Platform.Up == EGridFace::PosZ;
+
+	case ENatureFacing::Flat:
+		return FaceAxis(Platform.Up) == AxisIndex(EGridAxis::Z);
+
+	default:
+		return true;
+	}
+}
+
 bool ARoomManager::JudgeNatureCandidate(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, const uint8 Starts)
 {
 	UPlatformStructureData* Front = nullptr;
 	UPlatformStructureData* Back = nullptr;
 
-	if (!Platform.Tile
+	if (!AllowsNatureFacing(Platform)
+		|| !Platform.Tile
 		|| !Platform.Tile->AllowsOrientation(Platform.GetKind() == EPlatformKind::SurfaceVertical)
 		|| !FindNatureFill(Platform, Form, NatureSign, Front, Back))
 	{

@@ -6,7 +6,7 @@ Brainstormed and approved 2026-10-14, built the same day on branch `nature` (off
 
 Every structure now belongs to a **section** (`UPlatformStructureData::Section`): **Urban**, the default, so every structure that existed is urban without being touched, or **Nature**. Nature comes in three **forms** (`NatureForm`): **Ground**, **Cliff** and **Water**. Growth never draws nature. Only the **nature beat** lays it, on a timer of its own.
 
-A nature segment is **one-sided**. Its nature face looks into the open air, and behind it stands any one-sided urban structure of that face's type: a **ceiling** under ground and water, a **wall** behind a cliff. Ground and water lie along their Up, their nature face looking along it. A cliff is a wall. A nature segment is always load-bearing, whatever stands behind it.
+A nature segment is **one-sided**. Its nature face looks into the open air, and behind it stands any one-sided urban structure of that face's type: a **ceiling** under ground and water, a **wall** behind a cliff. Ground and water lie along their Up, their nature face looking along it. A cliff is a wall. By default ground and water only **lie flat and look up** at the sky, so their cliffs stand upright (`NatureFacing`, see below). A nature segment is always load-bearing, whatever stands behind it.
 
 Each form only **meets** certain faces across a shared beam. "Meets" is the same walk round an edge that the category pull uses: the two faces that bound one region of air there.
 
@@ -46,6 +46,7 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 |---|---|---|---|
 | Grid \| Nature: Auto Place Nature | `bAutoPlaceNature` | on | The nature beat runs on its own once play begins. It lays nothing while no nature is in Structures. |
 | Grid \| Nature: Nature Placement Interval | `NaturePlacementInterval` | 1.0 s | Seconds between nature beats. |
+| Grid \| Nature: Nature Facing | `NatureFacing` | Flat, Looking Up | Which ways ground and water may face in the world. **Flat, Looking Up**: horizontal, face to the sky, cliffs upright. **Flat, Up Or Down**: horizontal, or hanging face down under an overhang. **Any Way, Following Up**: as the city's segments face, standing on facades and hanging included. Takes effect on the next nature beat. |
 | Grid \| Nature: Ground / Cliff / Water Weight | `GroundWeight`, `CliffWeight`, `WaterWeight` | 1, 1, 0.5 | How often a beat with no field spilling starts each form. Zero never. |
 | Grid \| Nature: Ground Spill Min / Max | `GroundSpillMin`, `GroundSpillMax` | 4, 12 | Pieces a field of ground spills out to, its first included, drawn evenly. |
 | Grid \| Nature: Water Spill Min / Max | `WaterSpillMin`, `WaterSpillMax` | 2, 6 | The same for a pool of water. |
@@ -83,7 +84,8 @@ Tests: `WEM.Nature.*`, 13 product tests and 1 stress test (`Perf`). 91/91 produc
 
 ## My calls (the brainstorm left these open, or the user went with my defaults)
 
-- **"Vertical" means in the field's own frame.** A cliff is a wall in the frame of the field it rises from or drops off, which follows the earlier decision that there is no global floor or wall. Ground follows its Up any way, upside down included (the user's decision).
+- **"Vertical" means in the field's own frame.** A cliff is a wall in the frame of the field it rises from or drops off, which follows the earlier decision that there is no global floor or wall.
+- **Ground and water lie flat and look up** (the user's decision, after seeing it in Simulate). The first answer was that ground follows Up any way, which put most fields on facades and under overhangs. `NatureFacing` keeps that and a flat-either-way option as settings. The default looks up, because the original spec put the exterior on top of a horizontal ground.
 - **I read "When Vertical water is placed against the side with an exterior structure" as being about ground.** I flagged this to the user, and it did not come up again.
 - **"Spills out" is a queue**, one piece a beat, like fences ("one piece per tick").
 - **A field spills in its own plane**, and turning a corner is the cliffs' job. A field never meets ground or water across a fold.
@@ -112,7 +114,7 @@ At 3000 platforms that run had 228 ground, 26 cliff and 18 water. The city's ext
 
 I made the three assets and added them to the end of NewMap's room manager **Structures** list (822 → 825), then ran Simulate. NewMap's city beat is 0.0107 s and nature's default beat is 1 s, so in a short run nature is only a sprinkle. For the look below I set nature's interval to 0.03 s on the editor instance, then set it back to 1 s, so that change is not saved. After about 20 s: 2154 platforms, 490 ground, 49 cliff, 128 water, and six pockets (two spheres, three ziggurats, a cylinder).
 
-- **Ground** mostly grows up facades and hangs under overhangs, since it follows Up. Fields are patches of 4-12 pieces, often mixed with pools. Their air reaches out into the open sky as amber boxes.
+- **Ground** mostly grew up facades and hung under overhangs, since it then followed Up any way. That is what led to `NatureFacing` and its looking-up default. Fields are patches of 4-12 pieces, often mixed with pools. Their air reaches out into the open sky as amber boxes.
 - **The air lines are dense** once hundreds of fields stand. Turn off *Show Air* to see the structure.
 - **Colours are lit**, so the level's auto-exposure washes them out: the green reads as a pale lime. At 0.45 grey the cliffs vanished among the pale HL2 textures, so I set `DA_Nature_Cliff` to 0.1 grey, darker than the 0.21 beams. They are still easier to find with the probe than by eye, and the colour is on the asset.
 - **Pocket outlines** (magenta box, lime ziggurats, cyan sphere, violet cylinder) mostly sit outside the structure early on, since the cube is 101 m across and the city starts at its centre.

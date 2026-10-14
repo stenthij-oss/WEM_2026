@@ -1228,4 +1228,111 @@ bool FNaturePerfTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureFacingTest, "WEM.Nature.Facing", WEMRoomManagerTests::TestFlags)
+
+bool FNatureFacingTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	// How the nature that grew faces: ground and water by where their face looks, cliffs by their Up.
+	struct FTally
+	{
+		int32 Up = 0;
+		int32 Down = 0;
+		int32 Standing = 0;
+		int32 Water = 0;
+		int32 WaterNotUp = 0;
+		int32 CliffsUpright = 0;
+		int32 CliffsHanging = 0;
+		int32 CliffsSideways = 0;
+	};
+
+	auto Grow = [&](const ENatureFacing Facing) -> FTally
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+		Manager->GridSize = 129;
+		Manager->NatureFacing = Facing;
+		Manager->WaterWeight = 1.5f;
+		Manager->ClearPlatforms();
+
+		for (int32 Beat = 0; Beat < 150; ++Beat)
+		{
+			Manager->PlaceNextPlatform();
+		}
+
+		for (int32 Beat = 0; Beat < 600; ++Beat)
+		{
+			if (Beat % 3 == 2)
+			{
+				Manager->PlaceNextNature();
+			}
+			else
+			{
+				Manager->PlaceNextPlatform();
+			}
+		}
+
+		FTally Tally;
+
+		for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+		{
+			ENatureForm Form = ENatureForm::Ground;
+			int32 Sign = 0;
+
+			if (!GetNature(Platform, Form, Sign))
+			{
+				continue;
+			}
+
+			if (Form == ENatureForm::Cliff)
+			{
+				(Platform.Up == EGridFace::PosZ ? Tally.CliffsUpright : (Platform.Up == EGridFace::NegZ ? Tally.CliffsHanging : Tally.CliffsSideways))++;
+				continue;
+			}
+
+			// A field's face looks along its Up.
+			const bool bUp = Platform.Up == EGridFace::PosZ;
+			(bUp ? Tally.Up : (Platform.Up == EGridFace::NegZ ? Tally.Down : Tally.Standing))++;
+
+			if (Form == ENatureForm::Water)
+			{
+				++Tally.Water;
+				Tally.WaterNotUp += bUp ? 0 : 1;
+			}
+		}
+
+		AddInfo(FString::Printf(TEXT("%s: %d ground and water looking up, %d down, %d standing (%d water, %d of it not looking up); cliffs %d upright, %d hanging, %d on their side."),
+			*StaticEnum<ENatureFacing>()->GetNameStringByValue(static_cast<int64>(Facing)),
+			Tally.Up, Tally.Down, Tally.Standing, Tally.Water, Tally.WaterNotUp, Tally.CliffsUpright, Tally.CliffsHanging, Tally.CliffsSideways));
+
+		TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+		return Tally;
+	};
+
+	// Looking up, the default: a landscape lies like one, and its cliffs stand upright.
+	const FTally Up = Grow(ENatureFacing::Up);
+	TestTrue(TEXT("Looking up: ground grows"), Up.Up > 0);
+	TestTrue(TEXT("Looking up: water grows"), Up.Water > 0);
+	TestEqual(TEXT("Looking up: nothing hangs face down"), Up.Down, 0);
+	TestEqual(TEXT("Looking up: nothing stands on a facade"), Up.Standing, 0);
+	TestEqual(TEXT("Looking up: water too"), Up.WaterNotUp, 0);
+	TestTrue(TEXT("Looking up: every cliff stands upright"), Up.CliffsHanging == 0 && Up.CliffsSideways == 0);
+
+	// Flat either way: some may hang, none stands.
+	const FTally Flat = Grow(ENatureFacing::Flat);
+	TestEqual(TEXT("Flat: nothing stands on a facade"), Flat.Standing, 0);
+	TestEqual(TEXT("Flat: no cliff lies on its side"), Flat.CliffsSideways, 0);
+
+	// Any way: nature follows Up off the facades and overhangs as the city does.
+	const FTally AnyWay = Grow(ENatureFacing::AnyWay);
+	TestTrue(TEXT("Any way: some of it stands or hangs"), AnyWay.Standing + AnyWay.Down > 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 #endif
