@@ -852,19 +852,19 @@ public:
 
 	/** The smallest a mold's box is along each side, in cells. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "4"))
-	int32 MinMoldSize = 40;
+	int32 MinMoldSize = 64;
 
 	/** The largest a mold's box is along each side, in cells. Each side is drawn evenly between the two. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "4"))
-	int32 MaxMoldSize = 96;
+	int32 MaxMoldSize = 128;
 
 	/** The least of its box the open shape fills, across and in height, as a fraction. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-	float MinMoldFill = 0.4f;
+	float MinMoldFill = 0.5f;
 
 	/** The most of its box the open shape fills. Its width and its height are each drawn evenly between the two. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.05", ClampMax = "1.0"))
-	float MaxMoldFill = 0.8f;
+	float MaxMoldFill = 0.9f;
 
 	/** How often a mold's open shape is a ziggurat, relative to the others. Zero never. Its tiers are ZigguratTiers. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
@@ -892,6 +892,15 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float MoldSpread = 0.35f;
+
+	/**
+	 * Cells at the bottom of every mold's box left open all the way across, for growth to spread in under the shape
+	 * from any side; the shape stands on top of it. One module is room for floors to slide in under the shape, and
+	 * walls standing on them rise into it; deeper, more of the growth stays spread out in the floor instead. Zero
+	 * leaves only the shape open, reached from below its foot.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0"))
+	int32 MoldOpenFloor = 4;
 
 	/** Lets a mold stand along any axis, either way, rather than upright in the world, its floor at the bottom. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
@@ -1664,8 +1673,9 @@ private:
 	 * each side between MinMoldSize and MaxMoldSize, upright unless bMoldsAlongAnyAxis is on. A mold holds back
 	 * everything in its box but a shape left open inside it - a ziggurat, a cylinder, a dome, a square tower, or
 	 * two or three of them stacked - which fills between MinMoldFill and MaxMoldFill of the box across and in
-	 * height. The shape stands on the box's floor, open to the cells below, so growth can only come into it from
-	 * there, and inside the shape it grows as anywhere: whatever forms, forms in the shape. Molds are kept clear of
+	 * height above an open layer, MoldOpenFloor cells deep, across the bottom of the box: growth spreads in under
+	 * the shape from any side, and rises from there into the shape, inside which it grows as anywhere: whatever
+	 * forms above the layer, forms in the shape. Molds are kept clear of
 	 * each other, and pockets clear of molds - pockets may still overlap pockets.
 	 */
 
@@ -1858,6 +1868,9 @@ private:
 		/** What a mold was drawn as: one of the shapes, or Combination. */
 		EMoldShape MoldShape = EMoldShape::Tower;
 
+		/** How many cells at the bottom of a mold's box are open all the way across; its shapes start above them. */
+		double OpenFloor = 0.0;
+
 		/** The pieces it cuts, keyed as the obstacle keys are. */
 		TArray<uint64> FaceKeys;
 		TArray<uint64> EdgeKeys;
@@ -1876,7 +1889,7 @@ private:
 	/** The box of cells a pocket or mold can reach, in cells, its corners included. */
 	void GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const;
 
-	/** Whether a cell's centre lies inside one of a mold's open shapes. */
+	/** Whether a cell's centre lies inside one of a mold's open shapes, or its open floor. */
 	bool IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& Cell) const;
 
 	/** One mold's box and the shapes open inside it, as lines. */

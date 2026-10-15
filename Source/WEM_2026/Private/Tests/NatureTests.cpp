@@ -1413,6 +1413,13 @@ bool FNatureMoldsTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("Its shape is open on the floor"), FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Floor) && !FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Floor));
 		TestTrue(TEXT("Its box's far corner is held back"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Corner));
 		TestFalse(TEXT("Below its floor is not part of it"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Below));
+
+		// Its open floor runs across the whole box; just above it, outside the shape, is held back.
+		const FIntVector FloorCorner = CellAt(Mold.HalfSize.X - 0.6, Mold.HalfSize.Y - 0.6, 0.6);
+		const FIntVector AboveFloorCorner = CellAt(Mold.HalfSize.X - 0.6, Mold.HalfSize.Y - 0.6, Mold.OpenFloor + 1.6);
+		TestTrue(TEXT("It has its open floor"), FMath::IsNearlyEqual(Mold.OpenFloor, static_cast<double>(Manager->MoldOpenFloor)));
+		TestFalse(TEXT("Its open floor reaches the box's sides"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, FloorCorner));
+		TestTrue(TEXT("Above the open floor, its corner is held back"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, AboveFloorCorner));
 	}
 
 	// Growth never builds into what a mold or a pocket holds back, and agrees with a full rebuild.
@@ -1504,13 +1511,14 @@ bool FNatureMoldFillTest::RunTest(const FString& Parameters)
 	using FPocket = FRoomManagerTestAccess::FPocket;
 
 	// A room manager set up as NewMap's - a 509-cell cube, the test kit - with four molds and six pockets, grown to
-	// 3000 platforms: how many platforms grow into each mold's open shape, at a few spreads.
+	// 3000 platforms: how many platforms grow into each mold's open shape, and its open floor, at a few depths of floor.
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;
 	const TArray<TObjectPtr<UPlatformStructureData>> Structures = LoadNatureTestKit();
 
-	for (const float Spread : { 0.15f, 0.35f, 1.0f })
+	for (const int32 OpenFloor : { 4, 8, 20 })
 	{
+		const float Spread = 0.35f;
 		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
 		Manager->Tiles[1]->Orientation = ETileOrientation::HorizontalOnly;
 		Manager->Tiles[2]->bCanTurn = false;
@@ -1518,6 +1526,7 @@ bool FNatureMoldFillTest::RunTest(const FString& Parameters)
 		Manager->PlatformRandomSeed = 4242;
 		Manager->MoldCount = 4;
 		Manager->MoldSpread = Spread;
+		Manager->MoldOpenFloor = OpenFloor;
 		Manager->AirPocketCount = 6;
 		Manager->ClearPlatforms();
 
@@ -1536,6 +1545,7 @@ bool FNatureMoldFillTest::RunTest(const FString& Parameters)
 			}
 
 			int32 Inside = 0;
+			int32 InFloor = 0;
 			for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
 			{
 				const int32 SpanU = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
@@ -1546,14 +1556,21 @@ bool FNatureMoldFillTest::RunTest(const FString& Parameters)
 
 				// Its middle cell inside the open shape.
 				const FIntVector Middle = Platform.MinNode + WEMGrid::AxisStep(U, SpanU / 2) + WEMGrid::AxisStep(V, SpanV / 2);
-				Inside += FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Middle) ? 1 : 0;
+				if (FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Middle))
+				{
+					// Up in the shape, or still in the open floor under it.
+					const FPocket& Mold = Pockets[Index];
+					const double Rise = (FVector(Middle) + FVector(0.5) - Mold.Centre)[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
+					(Rise > Mold.OpenFloor ? Inside : InFloor)++;
+				}
 			}
 
-			PerMold.Add(FString::Printf(TEXT("%s %d"), *StaticEnum<EMoldShape>()->GetNameStringByValue(static_cast<int64>(Pockets[Index].MoldShape)), Inside));
+			PerMold.Add(FString::Printf(TEXT("%s %d in the shape, %d in the open floor"),
+				*StaticEnum<EMoldShape>()->GetNameStringByValue(static_cast<int64>(Pockets[Index].MoldShape)), Inside, InFloor));
 		}
 
-		AddInfo(FString::Printf(TEXT("Spread %.2f: %d platforms; %s; platforms inside each mold: %s."),
-			Spread, Manager->GetPlatformCount(), *Manager->MoldSummary, *FString::Join(PerMold, TEXT(", "))));
+		AddInfo(FString::Printf(TEXT("Spread %.2f, open floor %d: %d platforms; %s; platforms inside each mold: %s."),
+			Spread, OpenFloor, Manager->GetPlatformCount(), *Manager->MoldSummary, *FString::Join(PerMold, TEXT(", "))));
 
 		Manager->Destroy();
 	}

@@ -221,6 +221,7 @@ struct FRoomManagerTestAccess
 		bool bMold = false;
 		EMoldShape MoldShape = EMoldShape::Tower;
 		int32 Parts = 0;
+		double OpenFloor = 0.0;
 
 		/** Its reach, in cells. */
 		FVector Min = FVector::ZeroVector;
@@ -233,7 +234,7 @@ struct FRoomManagerTestAccess
 		for (const ARoomManager::FAirPocket& Pocket : Manager.AirPockets)
 		{
 			FPocket& Read = Pockets.Add_GetRef(FPocket{ Pocket.Shape, Pocket.Centre, Pocket.HalfSize, Pocket.Axis, Pocket.AxisSign,
-				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num(), Pocket.bMold, Pocket.MoldShape, Pocket.Parts.Num() });
+				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num(), Pocket.bMold, Pocket.MoldShape, Pocket.Parts.Num(), Pocket.OpenFloor });
 			Manager.GetPocketBounds(Pocket, Read.Min, Read.Max);
 		}
 

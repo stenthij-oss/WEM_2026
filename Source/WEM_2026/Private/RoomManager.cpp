@@ -3793,6 +3793,10 @@ void ARoomManager::SpawnAirPockets()
 				Mold.AxisSign = Stream.FRand() < 0.5f ? 1 : -1;
 			}
 
+			// Its open floor, and above it room for a shape at least two modules tall.
+			Mold.OpenFloor = FMath::Max(MoldOpenFloor, 0);
+			Mold.HalfSize.Z = FMath::Max(Mold.HalfSize.Z, 0.5 * (Mold.OpenFloor + 2.0 * GetModule()));
+
 			DrawMoldParts(Mold, Stream);
 
 			if (!Place(Mold, Stream, FMath::Clamp(MoldSpread, 0.0f, 1.0f)))
@@ -3894,7 +3898,8 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 	// How wide and how tall the open shape is, as parts of its box: never narrower than a module, so growth fits in.
 	const double Across = FMath::Min(Mold.HalfSize.X, Mold.HalfSize.Y);
 	const double Half = FMath::Max(Across * Stream.FRandRange(LeastFill, MostFill), 0.5 * GetModule());
-	const double Tall = FMath::Max(2.0 * Mold.HalfSize.Z * Stream.FRandRange(LeastFill, MostFill), static_cast<double>(GetModule()));
+	const double Tall = FMath::Max((2.0 * Mold.HalfSize.Z - Mold.OpenFloor) * Stream.FRandRange(LeastFill, MostFill), static_cast<double>(GetModule()));
+	const double Floor = Mold.OpenFloor;
 
 	using FMoldPart = FAirPocket::FMoldPart;
 
@@ -3903,8 +3908,8 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 		// A dome is as tall as it is wide, and no taller than its share of the box.
 		const double Radius = FMath::Min(Half, Tall);
 		Mold.Parts.Add(Mold.MoldShape == EMoldShape::Dome
-			? FMoldPart{ EMoldShape::Dome, 0.0, Radius, Radius }
-			: FMoldPart{ Mold.MoldShape, 0.0, Tall, Half });
+			? FMoldPart{ EMoldShape::Dome, Floor, Floor + Radius, Radius }
+			: FMoldPart{ Mold.MoldShape, Floor, Floor + Tall, Half });
 		return;
 	}
 
@@ -3912,7 +3917,7 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 	const EMoldShape Stackable[] = { EMoldShape::Ziggurat, EMoldShape::Cylinder, EMoldShape::Tower };
 	const int32 PartCount = Stream.RandRange(2, 3);
 
-	double Start = 0.0;
+	double Start = Floor;
 	double PartHalf = Half;
 
 	for (int32 Part = 0; Part < PartCount; ++Part)
@@ -3920,7 +3925,7 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 		const bool bTop = Part == PartCount - 1;
 		const EMoldShape Shape = bTop && Stream.FRand() < 0.5f ? EMoldShape::Dome : Stackable[Stream.RandRange(0, static_cast<int32>(UE_ARRAY_COUNT(Stackable)) - 1)];
 
-		const double Remaining = Tall - Start;
+		const double Remaining = Floor + Tall - Start;
 		double PartTall = bTop ? Remaining : Remaining * Stream.FRandRange(0.3f, 0.6f);
 
 		if (Shape == EMoldShape::Dome)
@@ -3961,6 +3966,12 @@ bool ARoomManager::IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& C
 	const double Rise = Offset[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
 	const double First = Offset[(Mold.Axis + 1) % 3];
 	const double Second = Offset[(Mold.Axis + 2) % 3];
+
+	// The open layer across the bottom of the box.
+	if (Rise >= 0.0 && Rise <= Mold.OpenFloor)
+	{
+		return true;
+	}
 
 	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
 	{
@@ -4055,6 +4066,14 @@ void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>&
 				ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
 		}
 	};
+
+	// The top of its open floor, across the whole box.
+	if (Mold.OpenFloor > 0.0)
+	{
+		const FVector A = Local(-Mold.HalfSize.X, -Mold.HalfSize.Y, 0.0);
+		const FVector B = Local(Mold.HalfSize.X, Mold.HalfSize.Y, Mold.OpenFloor);
+		AppendBoxLines(Lines, CellPointToWorld(A.ComponentMin(B)), CellPointToWorld(A.ComponentMax(B)), FLinearColor(MoldColor), Thickness, SDPG_World, /*bWithDiagonals=*/false);
+	}
 
 	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
 	{

@@ -26,7 +26,7 @@ So all of a landscape's nature faces look into the same air, and their backs fac
 
 **Air pockets.** Whenever the cube is cleared (the start of play, or the Clear Platforms button), `AirPocketCount` pockets are drawn at random across it. The shapes are spheres, cubes, rectangular boxes, ziggurats and cylinders. Each pocket holds back every lattice piece it reaches into, so nothing is ever built there.
 
-**Molds** (asked for on 2026-10-15). A mold is a box of air with a shape left open inside it, for the city to grow into. The shape is a ziggurat, a cylinder, a dome, a square tower, or a combination of two or three of them stacked, each no wider than the one below, with a dome only ever on top. The box holds back everything except the shape. The shape stands on the box's floor, open to the cells below, so growth can only come in from underneath. Inside the shape the city grows as it does anywhere else.
+**Molds** (asked for on 2026-10-15). A mold is a box of air with a shape left open inside it, for the city to grow into. The shape is a ziggurat, a cylinder, a dome, a square tower, or a combination of two or three of them stacked, each no wider than the one below, with a dome only ever on top. The box holds back everything except the shape and an **open floor**: a layer across the bottom of the box (`MoldOpenFloor`, one module by default). The city spreads in under the shape from any side through that floor, and walls standing on it rise into the shape. Inside the shape the city grows as it does anywhere else. (The first version, without the open floor, almost never got filled. See Known limits.)
 
 Molds are drawn before the pockets, from a stream of their own. Molds stay clear of each other, and pockets stay clear of molds, but pockets may overlap each other. Molds are drawn near the cube's centre, where growth starts (`MoldSpread`).
 
@@ -68,8 +68,9 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Air Pockets: Sphere / Box / Rectangular / Ziggurat / Cylinder Color | | cyan, magenta, orange, lime, violet | Debug colours. |
 | Grid \| Air Pockets: Air Pocket Summary | readout | | What was drawn, by shape, and how many were left out. |
 | Grid \| Molds: Mold Count | `MoldCount` | 2 | Molds drawn each time the cube is cleared. |
-| Grid \| Molds: Min / Max Mold Size | `MinMoldSize`, `MaxMoldSize` | 40, 96 | Cells along each side of the box. Each side is drawn separately. |
-| Grid \| Molds: Min / Max Mold Fill | `MinMoldFill`, `MaxMoldFill` | 0.4, 0.8 | How much of its box the open shape fills. Width and height are each drawn between the two. |
+| Grid \| Molds: Min / Max Mold Size | `MinMoldSize`, `MaxMoldSize` | 64, 128 | Cells along each side of the box. Each side is drawn separately. |
+| Grid \| Molds: Min / Max Mold Fill | `MinMoldFill`, `MaxMoldFill` | 0.5, 0.9 | How much of its box (above the open floor) the open shape fills. Width and height are each drawn between the two. A shape narrower than a tile (17 cells for a 16x16) can never hold a platform. |
+| Grid \| Molds: Mold Open Floor | `MoldOpenFloor` | 4 | Cells at the bottom of the box left open all the way across, for growth to come in under the shape. Zero means only the shape's own foot is open. |
 | Grid \| Molds: Mold Ziggurat / Cylinder / Dome / Tower / Combination Weight | | 1 each | How often each shape is drawn. A ziggurat steps in `ZigguratTiers` tiers. |
 | Grid \| Molds: Mold Spread | `MoldSpread` | 0.35 | How far from the cube's centre a mold may be drawn, as a part of the cube. 1 means anywhere. |
 | Grid \| Molds: Molds Along Any Axis | `bMoldsAlongAnyAxis` | off | Off, molds stand upright with their floor at the bottom. |
@@ -135,7 +136,17 @@ To see more nature, lower *Nature Placement Interval* (each beat costs about 4.5
 
 ## Known limits
 
-- **Molds rarely fill.** Growth can only enter a mold from below its floor, so the city has to arrive right under it. `WEM.Nature.MoldFill` (stress) grew a NewMap-sized cube to 3000 platforms with four molds. At a spread of 0.35, between 0 and 7 platforms grew into each mold. Anywhere in the cube (spread 1), none did.
+- **Molds fill slowly.** `WEM.Nature.MoldFill` (stress) grows a NewMap-sized cube to 3000 platforms with four molds at a spread of 0.35:
+  - With no open floor, 0-7 platforms reached each shape.
+  - With the open floor, at default sizes, the platforms that rose into each shape and lay in its floor were:
+
+    | Open floor | In the shape (per mold) | In the floor (per mold) |
+    |---|---|---|
+    | 4 cells (default) | 29, 0, 11, 5 | 0, 0, 142, 133 |
+    | 8 cells | 13, 0, 7, 22 | 218, 7, 130, 157 |
+    | 20 cells | 19, 0, 3, 16 | 398, 1, 376, 657 |
+
+  Deeper floors mostly collect sideways growth. A mold fills as the city reaches it, so it fills over time rather than at once.
 
 - **Nature never goes away.** Eden growth has no removal, so neither does nature. The laplacian branch's living world has removal, and it is a separate system.
 - **Flat colours only.** A nature structure with a mesh is drawn with the mesh, fitted like any structure, but no meshes exist yet.
