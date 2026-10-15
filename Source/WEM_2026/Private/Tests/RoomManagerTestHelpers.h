@@ -218,6 +218,13 @@ struct FRoomManagerTestAccess
 		int32 Axis = 2;
 		int32 AxisSign = 1;
 		int32 CutPieces = 0;
+		bool bMold = false;
+		EMoldShape MoldShape = EMoldShape::Tower;
+		int32 Parts = 0;
+
+		/** Its reach, in cells. */
+		FVector Min = FVector::ZeroVector;
+		FVector Max = FVector::ZeroVector;
 	};
 
 	static TArray<FPocket> GetAirPockets(const ARoomManager& Manager)
@@ -225,8 +232,9 @@ struct FRoomManagerTestAccess
 		TArray<FPocket> Pockets;
 		for (const ARoomManager::FAirPocket& Pocket : Manager.AirPockets)
 		{
-			Pockets.Add(FPocket{ Pocket.Shape, Pocket.Centre, Pocket.HalfSize, Pocket.Axis, Pocket.AxisSign,
-				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num() });
+			FPocket& Read = Pockets.Add_GetRef(FPocket{ Pocket.Shape, Pocket.Centre, Pocket.HalfSize, Pocket.Axis, Pocket.AxisSign,
+				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num(), Pocket.bMold, Pocket.MoldShape, Pocket.Parts.Num() });
+			Manager.GetPocketBounds(Pocket, Read.Min, Read.Max);
 		}
 
 		return Pockets;
@@ -242,6 +250,30 @@ struct FRoomManagerTestAccess
 		Shape.Axis = Pocket.Axis;
 		Shape.AxisSign = Pocket.AxisSign;
 		return Manager.IsCellInPocket(Shape, Cell);
+	}
+
+	/** Whether a cell's centre lies inside the pocket or mold drawn at Index, as it holds back growth. */
+	static bool IsCellInAirPocket(const ARoomManager& Manager, const int32 Index, const FIntVector& Cell)
+	{
+		return Manager.IsCellInPocket(Manager.AirPockets[Index], Cell);
+	}
+
+	/** The shapes the mold drawn at Index leaves open, from its floor up: shape, start, end and half-width. */
+	static TArray<TTuple<EMoldShape, double, double, double>> GetMoldParts(const ARoomManager& Manager, const int32 Index)
+	{
+		TArray<TTuple<EMoldShape, double, double, double>> Parts;
+		for (const ARoomManager::FAirPocket::FMoldPart& Part : Manager.AirPockets[Index].Parts)
+		{
+			Parts.Emplace(Part.Shape, Part.Start, Part.End, Part.Half);
+		}
+
+		return Parts;
+	}
+
+	/** Whether a cell's centre lies inside one of the shapes the mold drawn at Index leaves open. */
+	static bool IsCellInMoldShape(const ARoomManager& Manager, const int32 Index, const FIntVector& Cell)
+	{
+		return Manager.IsCellInMoldShape(Manager.AirPockets[Index], Cell);
 	}
 
 	/** How many lattice pieces the obstacles hold back, of every kind - objects, air and pockets together. */
@@ -426,7 +458,7 @@ namespace WEMRoomManagerTests
 
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
-	 * pieces off, no air pockets, on a fixed seed. Structures replaces the slabs when given.
+	 * pieces off, no air pockets or molds, on a fixed seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -441,6 +473,7 @@ namespace WEMRoomManagerTests
 		Manager->bSnapToLandscapeHeight = false;
 		Manager->PlatformRandomSeed = 1234;
 		Manager->AirPocketCount = 0;
+		Manager->MoldCount = 0;
 
 		UPlatformTileData* Square = MakeTile(16, 16);
 		UPlatformTileData* Small = MakeTile(8, 8);

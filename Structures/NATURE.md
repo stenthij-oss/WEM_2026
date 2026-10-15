@@ -26,6 +26,10 @@ So all of a landscape's nature faces look into the same air, and their backs fac
 
 **Air pockets.** Whenever the cube is cleared (the start of play, or the Clear Platforms button), `AirPocketCount` pockets are drawn at random across it. The shapes are spheres, cubes, rectangular boxes, ziggurats and cylinders. Each pocket holds back every lattice piece it reaches into, so nothing is ever built there.
 
+**Molds** (asked for on 2026-10-15). A mold is a box of air with a shape left open inside it, for the city to grow into. The shape is a ziggurat, a cylinder, a dome, a square tower, or a combination of two or three of them stacked, each no wider than the one below, with a dome only ever on top. The box holds back everything except the shape. The shape stands on the box's floor, open to the cells below, so growth can only come in from underneath. Inside the shape the city grows as it does anywhere else.
+
+Molds are drawn before the pockets, from a stream of their own. Molds stay clear of each other, and pockets stay clear of molds, but pockets may overlap each other. Molds are drawn near the cube's centre, where growth starts (`MoldSpread`).
+
 ## The beat
 
 One piece per nature beat (`NaturePlacementInterval`), drawn from a stream of its own:
@@ -63,6 +67,14 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Air Pockets: Show Air Pocket Pieces | `bShowAirPocketPieces` | off | A point at every lattice piece a pocket holds back. This is what growth can no longer use, which is coarser than the outline. Many points in a large cube. |
 | Grid \| Air Pockets: Sphere / Box / Rectangular / Ziggurat / Cylinder Color | | cyan, magenta, orange, lime, violet | Debug colours. |
 | Grid \| Air Pockets: Air Pocket Summary | readout | | What was drawn, by shape, and how many were left out. |
+| Grid \| Molds: Mold Count | `MoldCount` | 2 | Molds drawn each time the cube is cleared. |
+| Grid \| Molds: Min / Max Mold Size | `MinMoldSize`, `MaxMoldSize` | 40, 96 | Cells along each side of the box. Each side is drawn separately. |
+| Grid \| Molds: Min / Max Mold Fill | `MinMoldFill`, `MaxMoldFill` | 0.4, 0.8 | How much of its box the open shape fills. Width and height are each drawn between the two. |
+| Grid \| Molds: Mold Ziggurat / Cylinder / Dome / Tower / Combination Weight | | 1 each | How often each shape is drawn. A ziggurat steps in `ZigguratTiers` tiers. |
+| Grid \| Molds: Mold Spread | `MoldSpread` | 0.35 | How far from the cube's centre a mold may be drawn, as a part of the cube. 1 means anywhere. |
+| Grid \| Molds: Molds Along Any Axis | `bMoldsAlongAnyAxis` | off | Off, molds stand upright with their floor at the bottom. |
+| Grid \| Molds: Show Molds, Mold Color, Mold Shape Color | | on, light grey, red | Each box in one colour and its open shape in another. *Show Air Pocket Pieces* also marks what each mold holds back. |
+| Grid \| Molds: Mold Summary | readout | | What was drawn, by shape, and how many were left out. |
 
 On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form** and **Flat Color**. A nature structure without a mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
 
@@ -122,6 +134,8 @@ I made the three assets and added them to the end of NewMap's room manager **Str
 To see more nature, lower *Nature Placement Interval* (each beat costs about 4.5 ms at 3000 platforms) or raise the spill sizes.
 
 ## Known limits
+
+- **Molds rarely fill.** Growth can only enter a mold from below its floor, so the city has to arrive right under it. `WEM.Nature.MoldFill` (stress) grew a NewMap-sized cube to 3000 platforms with four molds. At a spread of 0.35, between 0 and 7 platforms grew into each mold. Anywhere in the cube (spread 1), none did.
 
 - **Nature never goes away.** Eden growth has no removal, so neither does nature. The laplacian branch's living world has removal, and it is a separate system.
 - **Flat colours only.** A nature structure with a mesh is drawn with the mesh, fitted like any structure, but no meshes exist yet.

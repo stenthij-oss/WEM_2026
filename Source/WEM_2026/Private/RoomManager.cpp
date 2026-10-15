@@ -3583,9 +3583,13 @@ void ARoomManager::RebuildAirLines()
 		}
 	}
 
-	if (bShowAirPockets)
+	for (const FAirPocket& Pocket : AirPockets)
 	{
-		for (const FAirPocket& Pocket : AirPockets)
+		if (Pocket.bMold && bShowMolds)
+		{
+			AppendMoldLines(Pocket, Lines);
+		}
+		else if (!Pocket.bMold && bShowAirPockets)
 		{
 			AppendAirPocketLines(Pocket, Lines);
 		}
@@ -3604,7 +3608,7 @@ void ARoomManager::RebuildAirLines()
 
 		for (const FAirPocket& Pocket : AirPockets)
 		{
-			const FLinearColor Color = GetAirPocketColor(Pocket.Shape);
+			const FLinearColor Color = Pocket.bMold ? FLinearColor(MoldColor) : GetAirPocketColor(Pocket.Shape);
 
 			auto DrawPiece = [&](const uint64 Key, const int32 AcrossFirst, const int32 AcrossSecond)
 			{
@@ -3652,65 +3656,184 @@ void ARoomManager::SpawnAirPockets()
 	AirPockets.Reset();
 
 	const int32 CubeCells = ResolveGridSize();
-	const int32 Smallest = FMath::Max(MinAirPocketSize, 1);
-	const int32 Largest = FMath::Max(MaxAirPocketSize, Smallest);
 
-	const float Weights[] = { SphereWeight, BoxWeight, RectangularWeight, ZigguratWeight, CylinderWeight };
-	constexpr int32 ShapeCount = UE_ARRAY_COUNT(Weights);
+	// The first platform's place, which neither a mold nor a pocket may take. Its fill decides where it can go, so
+	// the structures are resolved first.
+	TArray<FGridPlatform> FirstCandidates;
 
-	float TotalWeight = 0.0f;
-	for (const float Weight : Weights)
+	if (AirPocketCount > 0 || MoldCount > 0)
 	{
-		TotalWeight += FMath::Max(Weight, 0.0f);
+		ResolveUsableTiles();
+		GatherFirstPlatformCandidates(FirstCandidates);
 	}
 
-	int32 Counts[ShapeCount] = {};
+	auto TakesFirstPlace = [this, &FirstCandidates](const FAirPocket& Pocket)
+	{
+		return FirstCandidates.ContainsByPredicate([this, &Pocket](const FGridPlatform& First)
+		{
+			int32 SpanU, SpanV;
+			GetPlatformSpans(First, SpanU, SpanV);
+
+			bool bTaken = false;
+			ForEachPlatformCell(First, SpanU, SpanV, [&](const FIntVector& Cell, bool)
+			{
+				bTaken = bTaken || IsCellInPocket(Pocket, Cell);
+			});
+
+			return bTaken;
+		});
+	};
+
+	// Whether a pocket's reach meets a mold's box: molds stay clear of each other, and pockets of molds.
+	auto MeetsMold = [this](const FAirPocket& Pocket)
+	{
+		FVector Min, Max;
+		GetPocketBounds(Pocket, Min, Max);
+
+		return AirPockets.ContainsByPredicate([this, &Min, &Max](const FAirPocket& Other)
+		{
+			FVector OtherMin, OtherMax;
+			GetPocketBounds(Other, OtherMin, OtherMax);
+
+			return Other.bMold
+				&& Min.X <= OtherMax.X && OtherMin.X <= Max.X
+				&& Min.Y <= OtherMax.Y && OtherMin.Y <= Max.Y
+				&& Min.Z <= OtherMax.Z && OtherMin.Z <= Max.Z;
+		});
+	};
+
+	// Within Spread of the cube's middle - all of it at 1 - drawn again while it would take the first platform's place or
+	// meet a mold, and left out when every place drawn does.
+	auto Place = [&](FAirPocket& Pocket, FRandomStream& Stream, const double Spread)
+	{
+		for (int32 Attempt = 0; Attempt < MaxAirPocketPlaces; ++Attempt)
+		{
+			const FVector Offset(Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f));
+			Pocket.Centre = (FVector(1.0) + Offset * Spread) * (0.5 * static_cast<double>(CubeCells));
+
+			if (!TakesFirstPlace(Pocket) && !MeetsMold(Pocket))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	};
+
+	auto DrawByWeight = [](FRandomStream& Stream, const TConstArrayView<float> Weights)
+	{
+		float TotalWeight = 0.0f;
+		for (const float Weight : Weights)
+		{
+			TotalWeight += FMath::Max(Weight, 0.0f);
+		}
+
+		if (TotalWeight <= 0.0f)
+		{
+			return int32(INDEX_NONE);
+		}
+
+		float Roll = Stream.FRand() * TotalWeight;
+		int32 Drawn = INDEX_NONE;
+
+		for (int32 Index = 0; Index < Weights.Num(); ++Index)
+		{
+			const float Weight = FMath::Max(Weights[Index], 0.0f);
+
+			if (Weight <= 0.0f)
+			{
+				continue;
+			}
+
+			// Taken whenever it is in the running, so rounding at the very top of the roll still lands on one.
+			Drawn = Index;
+
+			if (Roll < Weight)
+			{
+				break;
+			}
+
+			Roll -= Weight;
+		}
+
+		return Drawn;
+	};
+
+	// The molds first, from a stream of their own, so the pockets can be drawn clear of them.
+	const float MoldWeights[] = { MoldZigguratWeight, MoldCylinderWeight, MoldDomeWeight, MoldTowerWeight, MoldCombinationWeight };
+	int32 MoldCounts[UE_ARRAY_COUNT(MoldWeights)] = {};
+	int32 MoldsLeftOut = 0;
+
+	{
+		FRandomStream Stream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("Molds"))))));
+		const int32 Smallest = FMath::Max(MinMoldSize, 4);
+		const int32 Largest = FMath::Max(MaxMoldSize, Smallest);
+
+		for (int32 Index = 0; Index < MoldCount; ++Index)
+		{
+			const int32 ShapeIndex = DrawByWeight(Stream, MoldWeights);
+
+			if (ShapeIndex == INDEX_NONE)
+			{
+				break;
+			}
+
+			FAirPocket Mold;
+			Mold.bMold = true;
+			Mold.Shape = EAirPocketShape::Rectangular;
+			Mold.MoldShape = static_cast<EMoldShape>(ShapeIndex);
+
+			const double First = 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest));
+			const double Second = 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest));
+			Mold.HalfSize = FVector(First, Second, 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest)));
+
+			if (bMoldsAlongAnyAxis)
+			{
+				Mold.Axis = Stream.RandRange(0, 2);
+				Mold.AxisSign = Stream.FRand() < 0.5f ? 1 : -1;
+			}
+
+			DrawMoldParts(Mold, Stream);
+
+			if (!Place(Mold, Stream, FMath::Clamp(MoldSpread, 0.0f, 1.0f)))
+			{
+				++MoldsLeftOut;
+				continue;
+			}
+
+			CutPocketPieces(Mold);
+			++MoldCounts[ShapeIndex];
+			AirPockets.Add(MoveTemp(Mold));
+		}
+	}
+
+	// Then the pockets, which may overlap each other but never a mold.
+	const float Weights[] = { SphereWeight, BoxWeight, RectangularWeight, ZigguratWeight, CylinderWeight };
+	int32 Counts[UE_ARRAY_COUNT(Weights)] = {};
 	int32 LeftOut = 0;
 
-	if (AirPocketCount > 0 && TotalWeight > 0.0f)
 	{
 		// From the run's seed, a stream apart from the others, so a seed draws the same pockets every time.
 		FRandomStream Stream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("AirPockets"))))));
+		const int32 Smallest = FMath::Max(MinAirPocketSize, 1);
+		const int32 Largest = FMath::Max(MaxAirPocketSize, Smallest);
 
-		// The first platform's place, which no pocket may take. Its fill decides where it can go, so the structures
-		// are resolved first.
-		ResolveUsableTiles();
-
-		TArray<FGridPlatform> FirstCandidates;
-		GatherFirstPlatformCandidates(FirstCandidates);
+		auto DrawHalf = [&Stream, Smallest, Largest]()
+		{
+			return 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest));
+		};
 
 		for (int32 Index = 0; Index < AirPocketCount; ++Index)
 		{
-			FAirPocket Pocket;
+			const int32 ShapeIndex = DrawByWeight(Stream, Weights);
 
-			float Roll = Stream.FRand() * TotalWeight;
-			int32 ShapeIndex = INDEX_NONE;
-
-			for (int32 Shape = 0; Shape < ShapeCount; ++Shape)
+			if (ShapeIndex == INDEX_NONE)
 			{
-				const float Weight = FMath::Max(Weights[Shape], 0.0f);
-
-				if (Weight <= 0.0f)
-				{
-					continue;
-				}
-
-				ShapeIndex = Shape;
-
-				if (Roll < Weight)
-				{
-					break;
-				}
-
-				Roll -= Weight;
+				break;
 			}
 
+			FAirPocket Pocket;
 			Pocket.Shape = static_cast<EAirPocketShape>(ShapeIndex);
-
-			auto DrawHalf = [&Stream, Smallest, Largest]()
-			{
-				return 0.5 * static_cast<double>(Stream.RandRange(Smallest, Largest));
-			};
 
 			// Half its measure across, then along its axis: one measure for a sphere and a cube, three apart for a
 			// rectangular box, a base and a height for a ziggurat, a diameter and a length for a cylinder.
@@ -3741,29 +3864,7 @@ void ARoomManager::SpawnAirPockets()
 				Pocket.AxisSign = Stream.FRand() < 0.5f ? 1 : -1;
 			}
 
-			// Anywhere in the cube, drawn again while it would take the first platform's place.
-			bool bClear = false;
-
-			for (int32 Place = 0; Place < MaxAirPocketPlaces && !bClear; ++Place)
-			{
-				Pocket.Centre = FVector(Stream.FRand(), Stream.FRand(), Stream.FRand()) * static_cast<double>(CubeCells);
-
-				bClear = !FirstCandidates.ContainsByPredicate([this, &Pocket](const FGridPlatform& First)
-				{
-					int32 SpanU, SpanV;
-					GetPlatformSpans(First, SpanU, SpanV);
-
-					bool bTaken = false;
-					ForEachPlatformCell(First, SpanU, SpanV, [&](const FIntVector& Cell, bool)
-					{
-						bTaken = bTaken || IsCellInPocket(Pocket, Cell);
-					});
-
-					return bTaken;
-				});
-			}
-
-			if (!bClear)
+			if (!Place(Pocket, Stream, 1.0))
 			{
 				++LeftOut;
 				continue;
@@ -3776,7 +3877,245 @@ void ARoomManager::SpawnAirPockets()
 	}
 
 	AirPocketSummary = FString::Printf(TEXT("%d pockets: %d sphere, %d box, %d rectangular, %d ziggurat, %d cylinder; %d left out"),
-		AirPockets.Num(), Counts[0], Counts[1], Counts[2], Counts[3], Counts[4], LeftOut);
+		Counts[0] + Counts[1] + Counts[2] + Counts[3] + Counts[4], Counts[0], Counts[1], Counts[2], Counts[3], Counts[4], LeftOut);
+
+	MoldSummary = FString::Printf(TEXT("%d molds: %d ziggurat, %d cylinder, %d dome, %d tower, %d combination; %d left out"),
+		MoldCounts[0] + MoldCounts[1] + MoldCounts[2] + MoldCounts[3] + MoldCounts[4],
+		MoldCounts[0], MoldCounts[1], MoldCounts[2], MoldCounts[3], MoldCounts[4], MoldsLeftOut);
+}
+
+void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
+{
+	Mold.Parts.Reset();
+
+	const float LeastFill = FMath::Clamp(MinMoldFill, 0.05f, 1.0f);
+	const float MostFill = FMath::Clamp(FMath::Max(MaxMoldFill, LeastFill), 0.05f, 1.0f);
+
+	// How wide and how tall the open shape is, as parts of its box: never narrower than a module, so growth fits in.
+	const double Across = FMath::Min(Mold.HalfSize.X, Mold.HalfSize.Y);
+	const double Half = FMath::Max(Across * Stream.FRandRange(LeastFill, MostFill), 0.5 * GetModule());
+	const double Tall = FMath::Max(2.0 * Mold.HalfSize.Z * Stream.FRandRange(LeastFill, MostFill), static_cast<double>(GetModule()));
+
+	using FMoldPart = FAirPocket::FMoldPart;
+
+	if (Mold.MoldShape != EMoldShape::Combination)
+	{
+		// A dome is as tall as it is wide, and no taller than its share of the box.
+		const double Radius = FMath::Min(Half, Tall);
+		Mold.Parts.Add(Mold.MoldShape == EMoldShape::Dome
+			? FMoldPart{ EMoldShape::Dome, 0.0, Radius, Radius }
+			: FMoldPart{ Mold.MoldShape, 0.0, Tall, Half });
+		return;
+	}
+
+	// Two or three shapes stacked from the floor up, each no wider than the one below it, a dome only ever on top.
+	const EMoldShape Stackable[] = { EMoldShape::Ziggurat, EMoldShape::Cylinder, EMoldShape::Tower };
+	const int32 PartCount = Stream.RandRange(2, 3);
+
+	double Start = 0.0;
+	double PartHalf = Half;
+
+	for (int32 Part = 0; Part < PartCount; ++Part)
+	{
+		const bool bTop = Part == PartCount - 1;
+		const EMoldShape Shape = bTop && Stream.FRand() < 0.5f ? EMoldShape::Dome : Stackable[Stream.RandRange(0, static_cast<int32>(UE_ARRAY_COUNT(Stackable)) - 1)];
+
+		const double Remaining = Tall - Start;
+		double PartTall = bTop ? Remaining : Remaining * Stream.FRandRange(0.3f, 0.6f);
+
+		if (Shape == EMoldShape::Dome)
+		{
+			PartHalf = FMath::Min(PartHalf, PartTall);
+			PartTall = PartHalf;
+		}
+
+		Mold.Parts.Add(FMoldPart{ Shape, Start, Start + PartTall, PartHalf });
+
+		Start += PartTall;
+		PartHalf = FMath::Max(PartHalf * Stream.FRandRange(0.5f, 0.9f), 0.5 * GetModule());
+	}
+}
+
+void ARoomManager::GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const
+{
+	// Its reach along each world axis: its half measures across and along its axis, or a sphere's radius.
+	FVector Reach;
+	Reach[Pocket.Axis] = Pocket.HalfSize.Z;
+	Reach[(Pocket.Axis + 1) % 3] = Pocket.HalfSize.X;
+	Reach[(Pocket.Axis + 2) % 3] = Pocket.HalfSize.Y;
+
+	if (Pocket.Shape == EAirPocketShape::Sphere && !Pocket.bMold)
+	{
+		Reach = FVector(Pocket.HalfSize.X);
+	}
+
+	OutMin = Pocket.Centre - Reach;
+	OutMax = Pocket.Centre + Reach;
+}
+
+bool ARoomManager::IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& Cell) const
+{
+	const FVector Offset = FVector(Cell) + FVector(0.5) - Mold.Centre;
+
+	// Its height above the mold's floor, and how far it lies off the mold's axis either way across it.
+	const double Rise = Offset[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
+	const double First = Offset[(Mold.Axis + 1) % 3];
+	const double Second = Offset[(Mold.Axis + 2) % 3];
+
+	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
+	{
+		if (Rise < Part.Start || Rise > Part.End)
+		{
+			continue;
+		}
+
+		switch (Part.Shape)
+		{
+		case EMoldShape::Cylinder:
+			if (First * First + Second * Second <= Part.Half * Part.Half)
+			{
+				return true;
+			}
+			break;
+
+		case EMoldShape::Dome:
+		{
+			const double Above = Rise - Part.Start;
+			if (Above * Above + First * First + Second * Second <= Part.Half * Part.Half)
+			{
+				return true;
+			}
+			break;
+		}
+
+		case EMoldShape::Ziggurat:
+		{
+			// Its tiers count up from the part's foot, each narrower by an even step.
+			const int32 Tiers = FMath::Max(ZigguratTiers, 1);
+			const double Height = FMath::Max(Part.End - Part.Start, UE_DOUBLE_SMALL_NUMBER);
+			const int32 Tier = FMath::Clamp(FMath::FloorToInt32((Rise - Part.Start) / Height * Tiers), 0, Tiers - 1);
+			const double TierHalf = Part.Half * (1.0 - static_cast<double>(Tier) / Tiers);
+
+			if (FMath::Abs(First) <= TierHalf && FMath::Abs(Second) <= TierHalf)
+			{
+				return true;
+			}
+			break;
+		}
+
+		default:
+			if (FMath::Abs(First) <= Part.Half && FMath::Abs(Second) <= Part.Half)
+			{
+				return true;
+			}
+			break;
+		}
+	}
+
+	return false;
+}
+
+void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>& Lines) const
+{
+	const float Thickness = BoundaryLineThickness;
+	const FLinearColor ShapeColor(MoldShapeColor);
+
+	// Its box.
+	FVector Min, Max;
+	GetPocketBounds(Mold, Min, Max);
+	AppendBoxLines(Lines, CellPointToWorld(Min), CellPointToWorld(Max), FLinearColor(MoldColor), Thickness, SDPG_World, /*bWithDiagonals=*/false);
+
+	// A point in the mold's own frame - off its axis across it, and its height above its floor - in the world.
+	auto Local = [&Mold](const double First, const double Second, const double Rise)
+	{
+		FVector Point = Mold.Centre;
+		Point[(Mold.Axis + 1) % 3] += First;
+		Point[(Mold.Axis + 2) % 3] += Second;
+		Point[Mold.Axis] += (Rise - Mold.HalfSize.Z) * Mold.AxisSign;
+		return Point;
+	};
+
+	auto AddSquare = [&](const double Half, const double Start, const double End)
+	{
+		const FVector A = Local(-Half, -Half, Start);
+		const FVector B = Local(Half, Half, End);
+		AppendBoxLines(Lines, CellPointToWorld(A.ComponentMin(B)), CellPointToWorld(A.ComponentMax(B)), ShapeColor, Thickness, SDPG_World, /*bWithDiagonals=*/false);
+	};
+
+	auto AddCircle = [&](const double Radius, const double Rise)
+	{
+		for (int32 Segment = 0; Segment < AirPocketCircleSegments; ++Segment)
+		{
+			const double From = 2.0 * UE_DOUBLE_PI * Segment / AirPocketCircleSegments;
+			const double To = 2.0 * UE_DOUBLE_PI * (Segment + 1) / AirPocketCircleSegments;
+
+			Lines.Emplace(
+				CellPointToWorld(Local(Radius * FMath::Cos(From), Radius * FMath::Sin(From), Rise)),
+				CellPointToWorld(Local(Radius * FMath::Cos(To), Radius * FMath::Sin(To), Rise)),
+				ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+		}
+	};
+
+	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
+	{
+		switch (Part.Shape)
+		{
+		case EMoldShape::Cylinder:
+			AddCircle(Part.Half, Part.Start);
+			AddCircle(Part.Half, Part.End);
+
+			for (int32 Quarter = 0; Quarter < 4; ++Quarter)
+			{
+				const double Angle = 0.5 * UE_DOUBLE_PI * Quarter;
+				const double First = Part.Half * FMath::Cos(Angle);
+				const double Second = Part.Half * FMath::Sin(Angle);
+				Lines.Emplace(CellPointToWorld(Local(First, Second, Part.Start)), CellPointToWorld(Local(First, Second, Part.End)),
+					ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+			}
+			break;
+
+		case EMoldShape::Dome:
+			// Rings up its height, and two arcs over its top.
+			for (int32 Ring = 0; Ring < 4; ++Ring)
+			{
+				const double Angle = 0.5 * UE_DOUBLE_PI * Ring / 4;
+				AddCircle(Part.Half * FMath::Cos(Angle), Part.Start + Part.Half * FMath::Sin(Angle));
+			}
+
+			for (const bool bAlongFirst : { true, false })
+			{
+				for (int32 Segment = 0; Segment < AirPocketCircleSegments / 2; ++Segment)
+				{
+					auto ArcPoint = [&](const int32 Step)
+					{
+						const double Angle = UE_DOUBLE_PI * Step / (AirPocketCircleSegments / 2);
+						const double Across = Part.Half * FMath::Cos(Angle);
+						const double Rise = Part.Start + Part.Half * FMath::Sin(Angle);
+						return CellPointToWorld(bAlongFirst ? Local(Across, 0.0, Rise) : Local(0.0, Across, Rise));
+					};
+
+					Lines.Emplace(ArcPoint(Segment), ArcPoint(Segment + 1), ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+				}
+			}
+			break;
+
+		case EMoldShape::Ziggurat:
+		{
+			const int32 Tiers = FMath::Max(ZigguratTiers, 1);
+			const double TierHeight = (Part.End - Part.Start) / Tiers;
+
+			for (int32 Tier = 0; Tier < Tiers; ++Tier)
+			{
+				AddSquare(Part.Half * (1.0 - static_cast<double>(Tier) / Tiers), Part.Start + Tier * TierHeight, Part.Start + (Tier + 1) * TierHeight);
+			}
+			break;
+		}
+
+		default:
+			AddSquare(Part.Half, Part.Start, Part.End);
+			break;
+		}
+	}
 }
 
 bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const
@@ -3786,6 +4125,12 @@ bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Ce
 	const double First = Offset[(Pocket.Axis + 1) % 3];
 	const double Second = Offset[(Pocket.Axis + 2) % 3];
 	const FVector& Half = Pocket.HalfSize;
+
+	// A mold holds back its whole box but the shapes it leaves open.
+	if (Pocket.bMold)
+	{
+		return FMath::Abs(First) <= Half.X && FMath::Abs(Second) <= Half.Y && FMath::Abs(Along) <= Half.Z && !IsCellInMoldShape(Pocket, Cell);
+	}
 
 	switch (Pocket.Shape)
 	{
@@ -3825,22 +4170,15 @@ void ARoomManager::CutPocketPieces(FAirPocket& Pocket) const
 	const int32 Module = GetModule();
 	const int32 LastCell = ResolveGridSize() - 1;
 
-	// Its reach along each world axis, as far as the cube goes.
-	FVector Reach;
-	Reach[Pocket.Axis] = Pocket.HalfSize.Z;
-	Reach[(Pocket.Axis + 1) % 3] = Pocket.HalfSize.X;
-	Reach[(Pocket.Axis + 2) % 3] = Pocket.HalfSize.Y;
-
-	if (Pocket.Shape == EAirPocketShape::Sphere)
-	{
-		Reach = FVector(Pocket.HalfSize.X);
-	}
+	// Its reach, as far as the cube goes.
+	FVector PocketMin, PocketMax;
+	GetPocketBounds(Pocket, PocketMin, PocketMax);
 
 	FIntVector Min, Max;
 	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
-		Min[Axis] = FMath::Clamp(FMath::FloorToInt32(Pocket.Centre[Axis] - Reach[Axis]), 0, LastCell);
-		Max[Axis] = FMath::Clamp(FMath::CeilToInt32(Pocket.Centre[Axis] + Reach[Axis]), 0, LastCell);
+		Min[Axis] = FMath::Clamp(FMath::FloorToInt32(PocketMin[Axis]), 0, LastCell);
+		Max[Axis] = FMath::Clamp(FMath::CeilToInt32(PocketMax[Axis]), 0, LastCell);
 	}
 
 	// A piece is cut when any one of its cells lies inside: the inside of a module face, the run of a module edge,

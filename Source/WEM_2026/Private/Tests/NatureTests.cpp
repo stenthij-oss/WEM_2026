@@ -1335,4 +1335,231 @@ bool FNatureFacingTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureMoldsTest, "WEM.Nature.Molds", WEMRoomManagerTests::TestFlags)
+
+bool FNatureMoldsTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+	using FPocket = FRoomManagerTestAccess::FPocket;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	Manager->GridSize = 129;
+	Manager->MoldCount = 3;
+	Manager->MoldSpread = 1.0f;
+	Manager->MinMoldSize = 32;
+	Manager->MaxMoldSize = 48;
+	Manager->AirPocketCount = 10;
+	Manager->MinAirPocketSize = 16;
+	Manager->MaxAirPocketSize = 40;
+	Manager->ClearPlatforms();
+
+	AddInfo(Manager->MoldSummary);
+	AddInfo(Manager->AirPocketSummary);
+
+	const TArray<FPocket> Pockets = FRoomManagerTestAccess::GetAirPockets(*Manager);
+	TArray<int32> Molds;
+
+	for (int32 Index = 0; Index < Pockets.Num(); ++Index)
+	{
+		if (Pockets[Index].bMold)
+		{
+			Molds.Add(Index);
+		}
+	}
+
+	TestEqual(TEXT("Three molds are drawn"), Molds.Num(), 3);
+	TestTrue(TEXT("And pockets after them"), Pockets.Num() > Molds.Num());
+
+	auto Meet = [](const FPocket& A, const FPocket& B)
+	{
+		return A.Min.X <= B.Max.X && B.Min.X <= A.Max.X && A.Min.Y <= B.Max.Y && B.Min.Y <= A.Max.Y && A.Min.Z <= B.Max.Z && B.Min.Z <= A.Max.Z;
+	};
+
+	int32 Meetings = 0;
+	for (const int32 Mold : Molds)
+	{
+		for (int32 Other = 0; Other < Pockets.Num(); ++Other)
+		{
+			Meetings += Other != Mold && Meet(Pockets[Mold], Pockets[Other]) ? 1 : 0;
+		}
+	}
+
+	TestEqual(TEXT("No pocket or other mold reaches into a mold's box"), Meetings, 0);
+
+	// Each mold holds back its box but the shape it leaves open, which stands on its floor, open from below.
+	for (const int32 Index : Molds)
+	{
+		const FPocket& Mold = Pockets[Index];
+		const int32 First = (Mold.Axis + 1) % 3;
+		const int32 Second = (Mold.Axis + 2) % 3;
+
+		auto CellAt = [&](const double AlongFirst, const double AlongSecond, const double Rise)
+		{
+			FVector Point = Mold.Centre;
+			Point[First] += AlongFirst;
+			Point[Second] += AlongSecond;
+			Point[Mold.Axis] += (Rise - Mold.HalfSize.Z) * Mold.AxisSign;
+			return FIntVector(FMath::FloorToInt32(Point.X), FMath::FloorToInt32(Point.Y), FMath::FloorToInt32(Point.Z));
+		};
+
+		const FIntVector Floor = CellAt(0.0, 0.0, 0.6);
+		const FIntVector Corner = CellAt(Mold.HalfSize.X - 0.6, Mold.HalfSize.Y - 0.6, 2.0 * Mold.HalfSize.Z - 0.6);
+		const FIntVector Below = CellAt(0.0, 0.0, -1.0);
+
+		TestTrue(TEXT("A mold has a shape open inside it"), Mold.Parts > 0);
+		TestTrue(TEXT("Its shape is open on the floor"), FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Floor) && !FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Floor));
+		TestTrue(TEXT("Its box's far corner is held back"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Corner));
+		TestFalse(TEXT("Below its floor is not part of it"), FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Below));
+	}
+
+	// Growth never builds into what a mold or a pocket holds back, and agrees with a full rebuild.
+	for (int32 Beat = 0; Beat < 400; ++Beat)
+	{
+		Manager->PlaceNextPlatform();
+	}
+
+	int32 HeldBack = 0;
+	int32 InMolds = 0;
+
+	for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		const int32 SpanU = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+		const int32 SpanV = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+
+		int32 U, V;
+		WEMGrid::GetInPlaneAxes(static_cast<int32>(Platform.Normal), U, V);
+
+		bool bInMold = false;
+
+		for (int32 StepV = 0; StepV <= SpanV; ++StepV)
+		{
+			for (int32 StepU = 0; StepU <= SpanU; ++StepU)
+			{
+				const FIntVector Cell = Platform.MinNode + WEMGrid::AxisStep(U, StepU) + WEMGrid::AxisStep(V, StepV);
+
+				for (int32 Index = 0; Index < Pockets.Num(); ++Index)
+				{
+					HeldBack += FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Cell) ? 1 : 0;
+					bInMold = bInMold || (Pockets[Index].bMold && FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Cell));
+				}
+			}
+		}
+
+		InMolds += bInMold ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(TEXT("%d platforms grew, %d of them reaching into a mold's open shape."), Manager->GetPlatformCount(), InMolds));
+	TestEqual(TEXT("No platform reaches into what is held back"), HeldBack, 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// Combinations stack two or three shapes from the floor up, each no wider than the one below, a dome only on top.
+	ARoomManager* Stacked = SpawnRoomManager(TestWorld.World, Rooted);
+	Stacked->GridSize = 129;
+	Stacked->MoldCount = 4;
+	Stacked->MoldSpread = 1.0f;
+	Stacked->MoldZigguratWeight = 0.0f;
+	Stacked->MoldCylinderWeight = 0.0f;
+	Stacked->MoldDomeWeight = 0.0f;
+	Stacked->MoldTowerWeight = 0.0f;
+	Stacked->ClearPlatforms();
+	AddInfo(Stacked->MoldSummary);
+
+	const TArray<FPocket> StackedMolds = FRoomManagerTestAccess::GetAirPockets(*Stacked);
+	TestTrue(TEXT("Some combinations are drawn"), StackedMolds.Num() > 0);
+
+	for (int32 Index = 0; Index < StackedMolds.Num(); ++Index)
+	{
+		const TArray<TTuple<EMoldShape, double, double, double>> Parts = FRoomManagerTestAccess::GetMoldParts(*Stacked, Index);
+		TestTrue(TEXT("A combination of two or three"), StackedMolds[Index].MoldShape == EMoldShape::Combination && Parts.Num() >= 2 && Parts.Num() <= 3);
+
+		for (int32 Part = 0; Part < Parts.Num(); ++Part)
+		{
+			TestTrue(TEXT("A dome only on top"), Parts[Part].Get<0>() != EMoldShape::Dome || Part == Parts.Num() - 1);
+
+			if (Part > 0)
+			{
+				TestTrue(TEXT("Each starts where the one below ends"), FMath::IsNearlyEqual(Parts[Part].Get<1>(), Parts[Part - 1].Get<2>()));
+				TestTrue(TEXT("No wider than the one below"), Parts[Part].Get<3>() <= Parts[Part - 1].Get<3>() + UE_DOUBLE_KINDA_SMALL_NUMBER);
+			}
+		}
+	}
+
+	// None asked for, none drawn.
+	Stacked->MoldCount = 0;
+	Stacked->ClearPlatforms();
+	TestEqual(TEXT("No molds asked for, none drawn"), FRoomManagerTestAccess::GetAirPockets(*Stacked).Num(), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureMoldFillTest, "WEM.Nature.MoldFill", WEMRoomManagerTests::SlowTestFlags)
+
+bool FNatureMoldFillTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+	using FPocket = FRoomManagerTestAccess::FPocket;
+
+	// A room manager set up as NewMap's - a 509-cell cube, the test kit - with four molds and six pockets, grown to
+	// 3000 platforms: how many platforms grow into each mold's open shape, at a few spreads.
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	const TArray<TObjectPtr<UPlatformStructureData>> Structures = LoadNatureTestKit();
+
+	for (const float Spread : { 0.15f, 0.35f, 1.0f })
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
+		Manager->Tiles[1]->Orientation = ETileOrientation::HorizontalOnly;
+		Manager->Tiles[2]->bCanTurn = false;
+		Manager->GridSize = 509;
+		Manager->PlatformRandomSeed = 4242;
+		Manager->MoldCount = 4;
+		Manager->MoldSpread = Spread;
+		Manager->AirPocketCount = 6;
+		Manager->ClearPlatforms();
+
+		while (Manager->GetPlatformCount() < 3000 && Manager->PlaceNextPlatform())
+		{
+		}
+
+		const TArray<FPocket> Pockets = FRoomManagerTestAccess::GetAirPockets(*Manager);
+		TArray<FString> PerMold;
+
+		for (int32 Index = 0; Index < Pockets.Num(); ++Index)
+		{
+			if (!Pockets[Index].bMold)
+			{
+				continue;
+			}
+
+			int32 Inside = 0;
+			for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+			{
+				const int32 SpanU = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+				const int32 SpanV = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+
+				int32 U, V;
+				WEMGrid::GetInPlaneAxes(static_cast<int32>(Platform.Normal), U, V);
+
+				// Its middle cell inside the open shape.
+				const FIntVector Middle = Platform.MinNode + WEMGrid::AxisStep(U, SpanU / 2) + WEMGrid::AxisStep(V, SpanV / 2);
+				Inside += FRoomManagerTestAccess::IsCellInMoldShape(*Manager, Index, Middle) ? 1 : 0;
+			}
+
+			PerMold.Add(FString::Printf(TEXT("%s %d"), *StaticEnum<EMoldShape>()->GetNameStringByValue(static_cast<int64>(Pockets[Index].MoldShape)), Inside));
+		}
+
+		AddInfo(FString::Printf(TEXT("Spread %.2f: %d platforms; %s; platforms inside each mold: %s."),
+			Spread, Manager->GetPlatformCount(), *Manager->MoldSummary, *FString::Join(PerMold, TEXT(", "))));
+
+		Manager->Destroy();
+	}
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 #endif

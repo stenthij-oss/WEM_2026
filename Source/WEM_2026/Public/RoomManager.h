@@ -177,6 +177,25 @@ enum class EAirPocketShape : uint8
 	Cylinder
 };
 
+/** The shapes a mold leaves open inside its box, for growth to fill. */
+UENUM(BlueprintType)
+enum class EMoldShape : uint8
+{
+	/** A stepped pyramid, its tiers narrowing toward its top. */
+	Ziggurat,
+
+	Cylinder,
+
+	/** Half a sphere, standing on its flat side. */
+	Dome,
+
+	/** A square tower. */
+	Tower,
+
+	/** Two or three of the others stacked, each no wider than the one below, a dome only ever on top. */
+	Combination
+};
+
 /** Addresses one surface: a cell, and which of its six faces. */
 USTRUCT(BlueprintType)
 struct FGridSurfaceRef
@@ -428,7 +447,8 @@ struct FSurfaceMarkLayer
  * Air pockets
  * -----------
  * Whenever the cube is cleared, AirPocketCount pockets of air - spheres, cubes, rectangular boxes,
- * ziggurats and cylinders - are drawn at random across it, and nothing is ever built in them.
+ * ziggurats and cylinders - are drawn at random across it, and nothing is ever built in them. Before
+ * them come MoldCount molds: boxes held back but for a shape left open inside, which growth can fill.
  *
  * Surfaces
  * --------
@@ -822,6 +842,74 @@ public:
 	/** The pockets drawn the last time the cube was cleared, by shape, and how many were left out. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Air Pockets")
 	FString AirPocketSummary;
+
+	/**
+	 * How many molds are drawn across the cube each time it is cleared, before the pockets: boxes of air with a
+	 * shape left open inside, standing on the box's floor, that growth can only fill from below.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0"))
+	int32 MoldCount = 2;
+
+	/** The smallest a mold's box is along each side, in cells. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "4"))
+	int32 MinMoldSize = 40;
+
+	/** The largest a mold's box is along each side, in cells. Each side is drawn evenly between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "4"))
+	int32 MaxMoldSize = 96;
+
+	/** The least of its box the open shape fills, across and in height, as a fraction. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float MinMoldFill = 0.4f;
+
+	/** The most of its box the open shape fills. Its width and its height are each drawn evenly between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+	float MaxMoldFill = 0.8f;
+
+	/** How often a mold's open shape is a ziggurat, relative to the others. Zero never. Its tiers are ZigguratTiers. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
+	float MoldZigguratWeight = 1.0f;
+
+	/** How often it is a cylinder. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
+	float MoldCylinderWeight = 1.0f;
+
+	/** How often it is a dome. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
+	float MoldDomeWeight = 1.0f;
+
+	/** How often it is a square tower. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
+	float MoldTowerWeight = 1.0f;
+
+	/** How often it is two or three shapes stacked, such as a tower on a ziggurat crowned by a dome. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0"))
+	float MoldCombinationWeight = 1.0f;
+
+	/**
+	 * How far from the cube's centre - where growth starts - a mold may be drawn, as a part of the cube: its centre
+	 * lies within this much of the cube's middle along each axis. Small keeps molds where growth soon reaches them.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MoldSpread = 0.35f;
+
+	/** Lets a mold stand along any axis, either way, rather than upright in the world, its floor at the bottom. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
+	bool bMoldsAlongAnyAxis = false;
+
+	/** Draws each mold's box and the shape open inside it in lines, the box in MoldColor and the shape in MoldShapeColor. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
+	bool bShowMolds = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
+	FColor MoldColor = FColor(230, 230, 230);
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
+	FColor MoldShapeColor = FColor(255, 40, 40);
+
+	/** The molds drawn the last time the cube was cleared, by shape, and how many were left out. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Molds")
+	FString MoldSummary;
 
 	/** Platforms of ground standing. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
@@ -1569,6 +1657,16 @@ private:
 	 * would take the first platform's place; one that cannot be moved clear of it is left out. They stay
 	 * as they were drawn until the cube is cleared again, however the settings change in between, since
 	 * the platforms standing grew round them.
+	 *
+	 * Molds
+	 * -----
+	 * Before the pockets, MoldCount molds are drawn the same way, from a stream of their own: rectangular boxes,
+	 * each side between MinMoldSize and MaxMoldSize, upright unless bMoldsAlongAnyAxis is on. A mold holds back
+	 * everything in its box but a shape left open inside it - a ziggurat, a cylinder, a dome, a square tower, or
+	 * two or three of them stacked - which fills between MinMoldFill and MaxMoldFill of the box across and in
+	 * height. The shape stands on the box's floor, open to the cells below, so growth can only come into it from
+	 * there, and inside the shape it grows as anywhere: whatever forms, forms in the shape. Molds are kept clear of
+	 * each other, and pockets clear of molds - pockets may still overlap pockets.
 	 */
 
 	/** The structure filling one face of a platform: its positive face for a positive Sign, else its negative one. */
@@ -1743,14 +1841,46 @@ private:
 		int32 Axis = 2;
 		int32 AxisSign = 1;
 
+		/** A mold: a rectangular box held back but for the shapes open inside it, standing on its floor - the face its top looks away from. */
+		bool bMold = false;
+
+		/** One shape open inside a mold, from Start to End above its floor, Half its half-width; stacked from the floor up. */
+		struct FMoldPart
+		{
+			EMoldShape Shape = EMoldShape::Tower;
+			double Start = 0.0;
+			double End = 0.0;
+			double Half = 0.0;
+		};
+
+		TArray<FMoldPart> Parts;
+
+		/** What a mold was drawn as: one of the shapes, or Combination. */
+		EMoldShape MoldShape = EMoldShape::Tower;
+
 		/** The pieces it cuts, keyed as the obstacle keys are. */
 		TArray<uint64> FaceKeys;
 		TArray<uint64> EdgeKeys;
 		TArray<uint64> NodeKeys;
 	};
 
-	/** Draws AirPocketCount pockets afresh from the run's seed, clear of the first platform's place, and summarises them. */
+	/**
+	 * Draws MoldCount molds and then AirPocketCount pockets afresh from the run's seed, each clear of the first
+	 * platform's place, the molds clear of each other and the pockets clear of the molds, and summarises them.
+	 */
 	void SpawnAirPockets();
+
+	/** Draws the shapes one mold leaves open inside its box, from Stream. */
+	void DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const;
+
+	/** The box of cells a pocket or mold can reach, in cells, its corners included. */
+	void GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const;
+
+	/** Whether a cell's centre lies inside one of a mold's open shapes. */
+	bool IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& Cell) const;
+
+	/** One mold's box and the shapes open inside it, as lines. */
+	void AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>& Lines) const;
 
 	/** Whether a cell's centre lies inside a pocket. */
 	bool IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const;
