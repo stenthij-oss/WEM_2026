@@ -10,6 +10,8 @@
 #include "Engine/Engine.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "GridMath.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/AutomationTest.h"
 #include "PlatformStructureData.h"
 #include "PlatformTileData.h"
@@ -283,6 +285,88 @@ struct FRoomManagerTestAccess
 		return Manager.ObstacleFaces.Num() + Manager.ObstacleEdges.Num() + Manager.ObstacleNodes.Num();
 	}
 
+	/** One path of air as drawn: its corners and the box of cells each leg fills. */
+	struct FPath
+	{
+		TArray<FIntVector> Corners;
+		TArray<FIntVector> LegMins;
+		TArray<FIntVector> LegMaxes;
+	};
+
+	static TArray<FPath> GetPaths(const ARoomManager& Manager)
+	{
+		TArray<FPath> Paths;
+		for (const ARoomManager::FAirPath& Path : Manager.AirPaths)
+		{
+			Paths.Add(FPath{ Path.Corners, Path.LegMins, Path.LegMaxes });
+		}
+
+		return Paths;
+	}
+
+	/** How many module faces, edges and nodes the paths hold back. */
+	static void GetPathPieceCounts(const ARoomManager& Manager, int32& OutFaces, int32& OutEdges, int32& OutNodes)
+	{
+		OutFaces = Manager.PathFaces.Num();
+		OutEdges = Manager.PathEdges.Num();
+		OutNodes = Manager.PathNodes.Num();
+	}
+
+	/** The axis each module face a path holds back looks along. */
+	static TArray<int32> GetPathFaceAxes(const ARoomManager& Manager)
+	{
+		TArray<int32> Axes;
+		for (const TPair<uint64, int32>& Piece : Manager.PathFaces)
+		{
+			Axes.Add(static_cast<int32>(Piece.Key >> WEMGrid::KeyTagShift) - 1);
+		}
+
+		return Axes;
+	}
+
+	static bool IsClearOfPaths(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsClearOfPaths(Platform);
+	}
+
+	/** Draws one path afresh, as the path clock does when it falls due. */
+	static void RedrawPath(ARoomManager& Manager, const int32 Index)
+	{
+		Manager.RedrawPath(Index);
+	}
+
+	/** The platforms standing in any path, as the paths found them when drawn, each once. */
+	static int32 GetPathStandingCount(const ARoomManager& Manager)
+	{
+		TSet<int32> Standing;
+		for (const ARoomManager::FAirPath& Path : Manager.AirPaths)
+		{
+			Standing.Append(Path.Standing);
+		}
+
+		return Standing.Num();
+	}
+
+	/** When each path next falls due. */
+	static TArray<double> GetPathRedrawTimes(const ARoomManager& Manager)
+	{
+		TArray<double> Times;
+		for (const ARoomManager::FAirPath& Path : Manager.AirPaths)
+		{
+			Times.Add(Path.RedrawAt);
+		}
+
+		return Times;
+	}
+
+	/** Gathers the candidate lists afresh and returns how long it took, in seconds. */
+	static double TimeCandidateGather(ARoomManager& Manager)
+	{
+		const double Start = FPlatformTime::Seconds();
+		Manager.EnsurePlatformCandidates();
+		return FPlatformTime::Seconds() - Start;
+	}
+
 	/** Whether a piece of ground or water about to be placed would have its fewest storeys of air clear. */
 	static bool IsAirClear(const ARoomManager& Manager, const FGridPlatform& Platform)
 	{
@@ -459,7 +543,7 @@ namespace WEMRoomManagerTests
 
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
-	 * pieces off, no air pockets or molds, on a fixed seed. Structures replaces the slabs when given.
+	 * pieces off, no air pockets, molds or paths, on a fixed seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -475,6 +559,7 @@ namespace WEMRoomManagerTests
 		Manager->PlatformRandomSeed = 1234;
 		Manager->AirPocketCount = 0;
 		Manager->MoldCount = 0;
+		Manager->PathCount = 0;
 
 		UPlatformTileData* Square = MakeTile(16, 16);
 		UPlatformTileData* Small = MakeTile(8, 8);

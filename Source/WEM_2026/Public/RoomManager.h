@@ -920,6 +920,72 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Molds")
 	FString MoldSummary;
 
+	/**
+	 * Turns the paths on or off. Off, none are drawn and none move, so their redraws cost nothing; platforms they
+	 * held back may be placed again. Takes effect at once, in play too.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths")
+	bool bEnablePaths = true;
+
+	/**
+	 * How many paths of air run through the cube: thin tubes, each a few straight legs turning at corners, which no
+	 * new platform may be placed across. They keep doorways open, so the cube is never closed off. Platforms already
+	 * standing in a path stay. Zero draws none.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "0"))
+	int32 PathCount = 12;
+
+	/** The fewest straight legs a path runs in. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "1"))
+	int32 MinPathLegs = 2;
+
+	/** The most straight legs a path runs in. Each path draws its number evenly between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "1"))
+	int32 MaxPathLegs = 5;
+
+	/** The shortest a leg runs, in cells. Legs are whole modules long, so corners meet. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "1"))
+	int32 MinPathLegLength = 16;
+
+	/** The longest a leg runs, in cells. Each leg draws its length evenly between the two. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "1"))
+	int32 MaxPathLegLength = 64;
+
+	/**
+	 * How thick a path is, in cells, across both sides. A path runs down the middle of the modules, so while it is
+	 * thinner than a module it only stops platforms laid across it - walls, floors and ceilings it would pass
+	 * through - and leaves those along its sides alone: a line of doorways. A module thick or more, it reaches
+	 * the lattice planes beside it and holds back those as well: a corridor of open air.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "1"))
+	int32 PathWidth = 2;
+
+	/** How often a leg runs up or down rather than level. Up and down, a path keeps holes open in floors and ceilings. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float PathVerticalChance = 0.2f;
+
+	/**
+	 * Seconds each path stays where it is during play before it is drawn afresh somewhere new. The paths fall due one
+	 * after another, spread across this, so only a path or two moves in any one frame. Zero keeps them where they are.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "0.0"))
+	float PathRerollInterval = 30.0f;
+
+	/** How far each path's wait may stray from the interval, as a part of it, either way. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float PathRerollJitter = 0.2f;
+
+	/** Draws each leg of every path as a thin box of lines. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths")
+	bool bShowPaths = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Paths")
+	FColor PathColor = FColor(120, 230, 255);
+
+	/** The paths drawn last: how many, their legs, the lattice pieces they hold back, and the platforms standing in them. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Paths")
+	FString PathSummary;
+
 	/** Platforms of ground standing. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
 	int32 GroundCount = 0;
@@ -1268,6 +1334,10 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Nature")
 	bool PlaceNextNature();
+
+	/** Draws every path afresh in new places at once. Play moves them on its own, one at a time, each every PathRerollInterval. */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Paths")
+	void RerollPaths();
 
 	//~ Begin AActor Interface
 	virtual void OnConstruction(const FTransform& Transform) override;
@@ -1677,6 +1747,20 @@ private:
 	 * the shape from any side, and rises from there into the shape, inside which it grows as anywhere: whatever
 	 * forms above the layer, forms in the shape. Molds are kept clear of
 	 * each other, and pockets clear of molds - pockets may still overlap pockets.
+	 *
+	 * Paths
+	 * -----
+	 * PathCount paths of air run through the cube, dispersed all over it, from a stream of their own: each a
+	 * tube PathWidth cells thick down the middle of the modules, in MinPathLegs to MaxPathLegs straight legs
+	 * of whole modules, turning at every corner, a leg running up or down with PathVerticalChance. A path
+	 * keeps doorways open: no new platform - growth, a fence panel or nature - is placed across a lattice
+	 * piece it reaches into. Unlike a pocket it holds nothing back that already stands, and nor does the
+	 * rebuild ask about it, so a path may be drawn anywhere at any time, through platforms or not. During play
+	 * each path is drawn afresh somewhere new every PathRerollInterval, give or take PathRerollJitter, the paths
+	 * falling due one after another across the interval rather than all at once, and the placements a path no
+	 * longer holds back come free. The run's seed, the path's place in the list and its count of redraws decide
+	 * where it runs, so a change to their settings redraws them on the same routes, thicker or longer, for
+	 * calibrating by eye.
 	 */
 
 	/** The structure filling one face of a platform: its positive face for a positive Sign, else its negative one. */
@@ -1909,6 +1993,93 @@ private:
 
 	/** One pocket's outline, as lines. */
 	void AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatchedLine>& Lines) const;
+
+	/** One path of air: its corners, the box of cells each leg between two of them fills, and what it holds back. */
+	struct FAirPath
+	{
+		/** Its corners, in cells: each the middle of a module, on a module's corner coordinates. */
+		TArray<FIntVector> Corners;
+
+		/** Per leg, the inclusive box of cells it fills, as far as the cube goes. */
+		TArray<FIntVector> LegMins;
+		TArray<FIntVector> LegMaxes;
+
+		/** How many times it has been drawn afresh since the cube was cleared. With the run's seed and its index, where it runs. */
+		int32 Draw = 0;
+
+		/** When, in the world's time, play next draws it afresh. */
+		double RedrawAt = 0.0;
+
+		/** The lattice pieces it reaches into, each once, keyed as the obstacle keys are. Counted into the path keys. */
+		TArray<uint64> FaceKeys;
+		TArray<uint64> EdgeKeys;
+		TArray<uint64> NodeKeys;
+
+		/** The platforms standing in it when it was drawn, by index in BuiltPlatforms. Growth never adds to them. */
+		TArray<int32> Standing;
+	};
+
+	/**
+	 * Draws every path afresh at its own draw - PathCount of them, keeping the draws of those already there - counts
+	 * its pieces into the path keys, judges listed placements again and sets each falling due across the interval
+	 * from now. Platforms standing are not touched.
+	 */
+	void SpawnPaths();
+
+	/** Lays out one path from the run's seed, its index and its draw: its corners, legs and pieces. */
+	void DrawPath(int32 Index, FAirPath& Path) const;
+
+	/** Counts a path's pieces into the path keys, or out of them. */
+	void AddPathKeys(const FAirPath& Path);
+	void RemovePathKeys(const FAirPath& Path);
+
+	/** Finds the platforms standing in a path: every one covering a module face it cuts, or next to an edge or node it cuts. */
+	void FindPathStanding(FAirPath& Path) const;
+
+	/** Draws one path afresh somewhere new, judges again only the placements on the pieces it left and now reaches, and sets it due again. */
+	void RedrawPath(int32 Index);
+
+	/** Writes PathSummary from the paths as they stand. */
+	void UpdatePathSummary();
+
+	/** Lists can be refreshed piece by piece only while they are gathered and match the tiles. */
+	bool CanRefreshCandidateLists() const;
+
+	/** The world's time, which the paths fall due by. */
+	double GetPathClock() const;
+
+	/** Starts the clock the paths fall due by: a short tick that redraws whichever are due. */
+	void StartPathClock();
+
+	/**
+	 * Judges again every placement taking in one of a set of path pieces, each placement once across calls by Judged
+	 * (per usable tile). With bMayHaveComeFree, unlisted ones too: the pieces of paths just taken away.
+	 */
+	void RefreshCandidatesOnPathPieces(
+		TConstArrayView<uint64> Faces,
+		TConstArrayView<uint64> Edges,
+		TConstArrayView<uint64> Nodes,
+		bool bMayHaveComeFree,
+		TArray<TSet<uint64>>& Judged);
+
+	/** The path clock's tick: redraws the path or two longest due. */
+	void AdvancePaths();
+
+	/** Flushes and redraws the paths' lines, in their own batcher, so moving one does not redraw all the air. */
+	void RebuildPathLines();
+
+	/** Whether a platform keeps clear of every lattice piece in a set of keys (or a map keyed by them), as the obstacle keys are asked. */
+	template <typename KeySetType>
+	bool IsClearOfPieces(
+		const FGridPlatform& Platform,
+		int32 SpanU,
+		int32 SpanV,
+		const KeySetType& Faces,
+		const KeySetType& Edges,
+		const KeySetType& Nodes) const;
+
+	/** Whether a platform keeps clear of every path. Only new placements are held to this. */
+	bool IsClearOfPaths(const FGridPlatform& Platform) const;
 
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
@@ -2242,6 +2413,20 @@ private:
 	/** The pockets of air drawn the last time the cube was cleared. Their pieces are among the obstacle keys. */
 	TArray<FAirPocket> AirPockets;
 
+	/**
+	 * The paths of air, and the lattice pieces they reach into, each with how many paths reach it - kept apart from
+	 * the obstacle keys, which the rebuild asks too.
+	 */
+	TArray<FAirPath> AirPaths;
+	TMap<uint64, int32> PathFaces;
+	TMap<uint64, int32> PathEdges;
+	TMap<uint64, int32> PathNodes;
+
+	/** How many times a path has been drawn afresh since the cube was cleared, all paths together. Readout only. */
+	int32 PathRedraws = 0;
+
+	FTimerHandle PathTimerHandle;
+
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
 
@@ -2416,4 +2601,8 @@ private:
 	/** Draws the air kept open. A batcher of its own, since it is redrawn as nature grows and the lattice is not. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<ULineBatchComponent> AirLineBatcher;
+
+	/** Draws the paths of air. A batcher of its own, since a path moves every fraction of a second during play. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<ULineBatchComponent> PathLineBatcher;
 };

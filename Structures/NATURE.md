@@ -30,6 +30,14 @@ So all of a landscape's nature faces look into the same air, and their backs fac
 
 Molds are drawn before the pockets, from a stream of their own. Molds stay clear of each other, and pockets stay clear of molds, but pockets may overlap each other. Molds are drawn near the cube's centre, where growth starts (`MoldSpread`).
 
+**Paths** (asked for on 2026-10-15). Paths are smaller air pockets in the shape of routes. They keep doorways open, so the cube is never fully closed. Each path is a thin square tube, `PathWidth` cells thick, running down the middle of the modules. It goes in a few straight legs of whole modules and turns at every corner. Paths start anywhere in the cube, so they are dispersed over all of it.
+- While a path is thinner than a module (the default is 2 cells), it reaches only the lattice planes it crosses. So it stops walls, floors and ceilings from being laid across it, and leaves the ones along its sides alone: a line of doorways. At a module thick or more, it also holds back the planes along it: a corridor of open air.
+- A path stops **new** placements only (growth, fence panels and nature), never what already stands. The rebuild doesn't ask about paths either, so a path may be drawn through platforms at any time and they stay. That is what the coming deletion mechanic will start from: the summary counts the platforms standing in paths.
+- During play, each path stays put for `PathRerollInterval` (30 s by default), give or take `PathRerollJitter`, and is then drawn afresh somewhere new. The paths fall due **one after another** across the interval, not all at once. A clock ticks every 0.05 s and moves at most two paths a tick, the longest-due first.
+- Where a path runs comes from the run's seed, its place in the list and its own count of redraws, so moving one path leaves every other path where it is. Any edit to the room manager draws them all again on the same routes, so changing the width or leg lengths shows straight away on the same layout, for calibrating by eye. The **Reroll Paths** button moves them all at once.
+- **Why one at a time** (2026-10-15, after the user saw the frame hang): moving every path in one frame took 20 to 70 ms with 12 paths, and 717 ms with the 162 paths NewMap was calibrated to. Moving one path judges again only the placements on the pieces that path left and now reaches. Where the path left, a placement that meets no platform along its rim is skipped, since it can never be listed. `WEM.Paths.Perf` (162 paths, a 509 cube, 3000 platforms, one path every 17th beat) measured 1.2 ms on average and 4.2 ms at worst per move, and 218 ms for the Reroll Paths button. Gathering every list afresh instead took 0.2 to 1.3 s. Each path keeps its pieces, and the shared path keys count how many paths reach each piece, so a piece stays held back while another path still reaches it.
+- At most 40 paths can move per second (two every 0.05 s). With a very short interval and many paths, they fall behind and move as fast as that allows.
+
 ## The beat
 
 One piece per nature beat (`NaturePlacementInterval`), drawn from a stream of its own:
@@ -76,6 +84,15 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Molds: Molds Along Any Axis | `bMoldsAlongAnyAxis` | off | Off, molds stand upright with their floor at the bottom. |
 | Grid \| Molds: Show Molds, Mold Color, Mold Shape Color | | on, light grey, red | Each box in one colour and its open shape in another. *Show Air Pocket Pieces* also marks what each mold holds back. |
 | Grid \| Molds: Mold Summary | readout | | What was drawn, by shape, and how many were left out. |
+| Grid \| Paths: Enable Paths | `bEnablePaths` | on | Turns paths on or off. Off, none are drawn and the timed redraws do nothing, so the redraw's long frame goes away. It takes effect at once, in play too. Switched back on, the paths return at the next redraw, or straight away on an edit or the Reroll Paths button. |
+| Grid \| Paths: Path Count | `PathCount` | 12 | Paths through the cube. Zero draws none. |
+| Grid \| Paths: Min / Max Path Legs | `MinPathLegs`, `MaxPathLegs` | 2, 5 | Straight legs per path, drawn evenly. |
+| Grid \| Paths: Min / Max Path Leg Length | `MinPathLegLength`, `MaxPathLegLength` | 16, 64 | Cells per leg, rounded to whole modules, cut short at the cube's side. |
+| Grid \| Paths: Path Width | `PathWidth` | 2 | Cells across. Under a module (4), it makes doorways only. At a module or more, it makes corridors of open air. |
+| Grid \| Paths: Path Vertical Chance | `PathVerticalChance` | 0.2 | How often a leg runs up or down, keeping holes open in floors and ceilings. |
+| Grid \| Paths: Path Reroll Interval / Jitter | `PathRerollInterval`, `PathRerollJitter` | 30 s, 0.2 | Seconds each path stays put during play before it moves, and how far each path's wait may stray from it. The paths move one after another across the interval. An interval of zero never moves them. |
+| Grid \| Paths: Show Paths, Path Color | `bShowPaths`, `PathColor` | on, pale cyan | Each leg drawn as a thin box of lines. |
+| Grid \| Paths: Path Summary | readout | | Paths, legs, how many single moves there have been since the cube was cleared, the pieces held back, and the platforms standing in paths. Each path counts the platforms standing in it when it is drawn. |
 
 On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form** and **Flat Color**. A nature structure without a mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
 

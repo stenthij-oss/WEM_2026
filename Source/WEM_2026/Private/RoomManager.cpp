@@ -122,6 +122,12 @@ namespace
 	/** Size on screen, in pixels, of the point drawn at each lattice piece a pocket holds back. */
 	constexpr float AirPocketPieceSize = 6.0f;
 
+	/** Seconds between ticks of the clock the paths fall due by. */
+	constexpr float PathClockSeconds = 0.05f;
+
+	/** The most paths one tick of the path clock draws afresh; any more due wait for the next tick. */
+	constexpr int32 MaxPathRedrawsPerTick = 2;
+
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
@@ -626,6 +632,9 @@ ARoomManager::ARoomManager()
 	AirLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("AirLineBatcher"));
 	AirLineBatcher->SetupAttachment(SceneRoot);
 
+	PathLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("PathLineBatcher"));
+	PathLineBatcher->SetupAttachment(SceneRoot);
+
 	// Instanced rather than a component per piece: a cube fills with thousands of them. Each of
 	// these two is only the first chunk of its kind; SyncPieceLayer adds more as the structure
 	// grows, set up the way these are set up here. Each structure's layer starts from a chunk set up
@@ -717,6 +726,11 @@ void ARoomManager::OnConstruction(const FTransform& Transform)
 	// Everything derived is rebuilt from the list, so resizing the cube, changing the module or
 	// swapping a tile re-resolves it from scratch.
 	RebuildPlatformState();
+
+	// Paths hold back nothing standing, so they are drawn again whatever changed - on the same routes, which
+	// a change to their own settings then shows straight away.
+	SpawnPaths();
+
 	UpdateDebugReadouts();
 
 	RebuildVisuals();
@@ -753,9 +767,13 @@ void ARoomManager::BeginPlay()
 		// The derived state is never saved or copied, so a PIE copy arrives with the platform
 		// list and nothing worked out from it. Work it out before the first beat reads it.
 		RebuildPlatformState();
+		SpawnPaths();
 		UpdateDebugReadouts();
 		RebuildVisuals();
 	}
+
+	// The paths move on a clock of their own.
+	StartPathClock();
 
 	// One placement per beat - the first lands a full interval in, so the empty cube is
 	// visible before anything grows in it.
@@ -795,6 +813,7 @@ void ARoomManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		World->GetTimerManager().ClearTimer(PlacementTimerHandle);
 		World->GetTimerManager().ClearTimer(NatureTimerHandle);
+		World->GetTimerManager().ClearTimer(PathTimerHandle);
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -980,7 +999,9 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 		});
 	}
 
-	if (!IsSpaceFree(Platform))
+	// A path holds back only what is placed from now on, so the rebuild, which asks IsSpaceFree, never
+	// leaves out a platform one has since been drawn through.
+	if (!IsSpaceFree(Platform) || !IsClearOfPaths(Platform))
 	{
 		return false;
 	}
@@ -2063,6 +2084,12 @@ void ARoomManager::ClearPlatforms()
 	SpawnAirPockets();
 
 	RebuildPlatformState();
+
+	// And its paths, from the first of their draws.
+	AirPaths.Reset();
+	PathRedraws = 0;
+	SpawnPaths();
+
 	UpdateDebugReadouts();
 	RebuildVisuals();
 }
@@ -2237,22 +2264,38 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 		});
 	}
 
-	if (!bFree || (ObstacleFaces.IsEmpty() && ObstacleEdges.IsEmpty() && ObstacleNodes.IsEmpty()))
+	return bFree && IsClearOfPieces(Platform, SpanU, SpanV, ObstacleFaces, ObstacleEdges, ObstacleNodes);
+}
+
+template <typename KeySetType>
+bool ARoomManager::IsClearOfPieces(
+	const FGridPlatform& Platform,
+	const int32 SpanU,
+	const int32 SpanV,
+	const KeySetType& Faces,
+	const KeySetType& Edges,
+	const KeySetType& Nodes) const
+{
+	if (Faces.IsEmpty() && Edges.IsEmpty() && Nodes.IsEmpty())
 	{
-		return bFree;
+		return true;
 	}
+
+	const int32 Module = GetModule();
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	bool bFree = true;
 
 	// Every cell a platform covers is the inside of one of its module faces, the run of one of its
 	// module edges, or one of its nodes, so asking those pieces asks every cell - without comparing
 	// boxes, however many obstacles stand.
 	ForEachModuleFace(Platform, SpanU, SpanV, Module, [&](const FIntVector& FaceMinNode)
 	{
-		bFree = bFree && !ObstacleFaces.Contains(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+		bFree = bFree && !Faces.Contains(MakeModuleFaceKey(FaceMinNode, NormalAxis));
 	});
 
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
 	{
-		bFree = bFree && !ObstacleEdges.Contains(MakeEdgeKey(Edge));
+		bFree = bFree && !Edges.Contains(MakeEdgeKey(Edge));
 	});
 
 	int32 U, V;
@@ -2262,11 +2305,18 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 	{
 		for (int32 StepU = 0; bFree && StepU <= SpanU; StepU += Module)
 		{
-			bFree = !ObstacleNodes.Contains(MakeCellKey(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV)));
+			bFree = !Nodes.Contains(MakeCellKey(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV)));
 		}
 	}
 
 	return bFree;
+}
+
+bool ARoomManager::IsClearOfPaths(const FGridPlatform& Platform) const
+{
+	int32 SpanU, SpanV;
+	return GetPlatformSpans(Platform, SpanU, SpanV)
+		&& IsClearOfPieces(Platform, SpanU, SpanV, PathFaces, PathEdges, PathNodes);
 }
 
 bool ARoomManager::IsFlushWith(const FGridPlatform& Platform, const FGridPlatform& Neighbour, const int32 SharedAxis) const
@@ -4244,6 +4294,533 @@ void ARoomManager::CutPocketPieces(FAirPocket& Pocket) const
 	Pocket.EdgeKeys = Edges.Array();
 }
 
+void ARoomManager::RerollPaths()
+{
+	// Every path at once, from the button: each drawn afresh at its next draw, then the lists refreshed in one go.
+	for (FAirPath& Path : AirPaths)
+	{
+		++Path.Draw;
+	}
+
+	PathRedraws += AirPaths.Num();
+	SpawnPaths();
+	RebuildPathLines();
+}
+
+double ARoomManager::GetPathClock() const
+{
+	const UWorld* World = GetWorld();
+	return World ? World->GetTimeSeconds() : 0.0;
+}
+
+void ARoomManager::StartPathClock()
+{
+	UWorld* World = GetWorld();
+
+	if (!World)
+	{
+		return;
+	}
+
+	// A tick that falls behind is dropped, as the beats are: what is due is still due at the next one.
+	FTimerManagerTimerParameters Parameters;
+	Parameters.bLoop = true;
+	Parameters.bMaxOncePerFrame = true;
+
+	World->GetTimerManager().SetTimer(PathTimerHandle, this, &ARoomManager::AdvancePaths, PathClockSeconds, Parameters);
+}
+
+void ARoomManager::AdvancePaths()
+{
+	// Switched off, or with no interval, the paths stay as they are and nothing is drawn or judged.
+	if (!bEnablePaths || PathRerollInterval <= 0.0f)
+	{
+		return;
+	}
+
+	const double Now = GetPathClock();
+
+	// The paths fall due one after another across the interval, so a tick draws a path or two afresh rather than
+	// all of them: what a redraw costs is the placements round one path, not round every path. The longest due
+	// go first; more than a tick's share wait for the next.
+	for (int32 Redrawn = 0; Redrawn < MaxPathRedrawsPerTick; ++Redrawn)
+	{
+		int32 Due = INDEX_NONE;
+
+		for (int32 Index = 0; Index < AirPaths.Num(); ++Index)
+		{
+			if (AirPaths[Index].RedrawAt <= Now && (Due == INDEX_NONE || AirPaths[Index].RedrawAt < AirPaths[Due].RedrawAt))
+			{
+				Due = Index;
+			}
+		}
+
+		if (Due == INDEX_NONE)
+		{
+			break;
+		}
+
+		RedrawPath(Due);
+	}
+}
+
+bool ARoomManager::CanRefreshCandidateLists() const
+{
+	return !bPlatformCandidatesStale && TileCandidates.Num() == UsableTiles.Num();
+}
+
+void ARoomManager::RefreshCandidatesOnPathPieces(
+	const TConstArrayView<uint64> Faces,
+	const TConstArrayView<uint64> Edges,
+	const TConstArrayView<uint64> Nodes,
+	const bool bMayHaveComeFree,
+	TArray<TSet<uint64>>& Judged)
+{
+	const int32 Module = GetModule();
+
+	// Only a placement meeting a platform along its rim is ever open, and the lists hold only open ones. So where a
+	// path has gone, one meeting nothing is not listed and stays unlisted: it is passed over without being judged in
+	// full, which is most of them, since paths run mostly through open air. The empty cube has its own rule.
+	const bool bPassOverLoose = bMayHaveComeFree && !BuiltPlatforms.IsEmpty();
+
+	auto MeetsStructure = [&](const FGridPlatform& Candidate)
+	{
+		int32 SpanU, SpanV;
+
+		if (!GetPlatformSpans(Candidate, SpanU, SpanV))
+		{
+			return false;
+		}
+
+		bool bMeets = false;
+
+		ForEachModuleEdge(Candidate, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+		{
+			bMeets = bMeets || (bRim && ModuleEdgeUses.Contains(MakeEdgeKey(Edge)));
+		});
+
+		return bMeets;
+	};
+
+	auto Refresh = [&](const int32 TileIndex, const FGridPlatform& Candidate)
+	{
+		bool bAlreadyJudged = false;
+		Judged[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyJudged);
+
+		if (!bAlreadyJudged && (!bPassOverLoose || MeetsStructure(Candidate)))
+		{
+			RefreshPlatformCandidate(TileIndex, Candidate, bMayHaveComeFree);
+		}
+	};
+
+	auto RefreshAround = [&](const FLatticeEdge& Edge)
+	{
+		ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/false,
+			[&](const int32 TileIndex, const FGridPlatform& Candidate, bool) { Refresh(TileIndex, Candidate); });
+	};
+
+	// A face is taken in only by placements in its own plane that cover it, which all take in its edge along U and
+	// reach across it along V.
+	for (const uint64 Key : Faces)
+	{
+		const FIntVector FaceMinNode = CellFromKey(Key);
+		const int32 NormalAxis = static_cast<int32>(Key >> KeyTagShift) - 1;
+
+		int32 U, V;
+		GetInPlaneAxes(NormalAxis, U, V);
+
+		ForEachPlacementAround(FLatticeEdge{ FaceMinNode, U }, UsableTiles, Module, /*bRimOnly=*/false,
+			[&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
+		{
+			int32 SpanU, SpanV;
+
+			if (AxisIndex(Candidate.Normal) == NormalAxis
+				&& GetPlatformSpans(Candidate, SpanU, SpanV)
+				&& Candidate.MinNode[V] + SpanV >= FaceMinNode[V] + Module)
+			{
+				Refresh(TileIndex, Candidate);
+			}
+		});
+	}
+
+	for (const uint64 Key : Edges)
+	{
+		RefreshAround(FLatticeEdge{ CellFromKey(Key), static_cast<int32>(Key >> KeyTagShift) - 1 });
+	}
+
+	// A placement taking in a node takes in an edge running from it.
+	for (const uint64 Key : Nodes)
+	{
+		const FIntVector Node = CellFromKey(Key);
+
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			RefreshAround(FLatticeEdge{ Node, Axis });
+			RefreshAround(FLatticeEdge{ Node - AxisStep(Axis, Module), Axis });
+		}
+	}
+}
+
+void ARoomManager::DrawPath(const int32 Index, FAirPath& Path) const
+{
+	Path.Corners.Reset();
+	Path.LegMins.Reset();
+	Path.LegMaxes.Reset();
+	Path.FaceKeys.Reset();
+	Path.EdgeKeys.Reset();
+	Path.NodeKeys.Reset();
+
+	const int32 Module = GetModule();
+	const int32 LastCell = ResolveGridSize() - 1;
+
+	// The cube is whole modules and the node closing them, so this many module middles lie along each axis.
+	const int32 Modules = LastCell / Module;
+
+	if (Modules <= 0)
+	{
+		return;
+	}
+
+	// A stream of its own per path and draw, so one path moving leaves every other where it is.
+	FRandomStream Stream(static_cast<int32>(HashCombineFast(
+		HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("Paths")))),
+		HashCombineFast(GetTypeHash(Index), GetTypeHash(Path.Draw)))));
+
+	const int32 FewestLegs = FMath::Max(MinPathLegs, 1);
+	const int32 MostLegs = FMath::Max(MaxPathLegs, FewestLegs);
+	const int32 Shortest = FMath::Max(MinPathLegLength, 1);
+	const int32 Longest = FMath::Max(MaxPathLegLength, Shortest);
+	const int32 Width = FMath::Max(PathWidth, 1);
+
+	// A corner sits at a module's middle - between its two central cells - and a path's Width cells across
+	// lie about it: two of them clear both lattice planes beside it, as anything under a module does.
+	const int32 Below = Width / 2;
+
+	auto ToCells = [Module](const FIntVector& ModuleIndex)
+	{
+		return ModuleIndex * Module + FIntVector(Module / 2);
+	};
+
+	// Anywhere in the cube, so paths are dispersed all over it rather than gathered round growth.
+	FIntVector At(Stream.RandRange(0, Modules - 1), Stream.RandRange(0, Modules - 1), Stream.RandRange(0, Modules - 1));
+	Path.Corners.Add(ToCells(At));
+
+	const int32 Legs = Stream.RandRange(FewestLegs, MostLegs);
+	int32 PreviousAxis = INDEX_NONE;
+
+	// Legs overlap where they meet, and an edge lies in two lattice planes, so a piece is kept once.
+	TSet<uint64> Faces, Edges, Nodes;
+
+	for (int32 Leg = 0; Leg < Legs; ++Leg)
+	{
+		// Every corner turns: up or down with the vertical chance, unless the last leg was, else level,
+		// across the last level leg.
+		int32 Axis = 2;
+
+		if (PreviousAxis == 2 || Stream.FRand() >= PathVerticalChance)
+		{
+			Axis = PreviousAxis == 0 ? 1 : (PreviousAxis == 1 ? 0 : Stream.RandRange(0, 1));
+		}
+
+		int32 Steps = FMath::Max(FMath::RoundToInt32(static_cast<float>(Stream.RandRange(Shortest, Longest)) / Module), 1);
+		int32 Sign = Stream.RandBool() ? 1 : -1;
+
+		// Kept inside the cube: turned round when the other way has more room, cut short at the side.
+		const int32 Ahead = Sign > 0 ? Modules - 1 - At[Axis] : At[Axis];
+		const int32 Behind = Sign > 0 ? At[Axis] : Modules - 1 - At[Axis];
+
+		if (Ahead < Steps && Behind > Ahead)
+		{
+			Sign = -Sign;
+			Steps = FMath::Min(Steps, Behind);
+		}
+		else
+		{
+			Steps = FMath::Min(Steps, Ahead);
+		}
+
+		if (Steps == 0)
+		{
+			continue;
+		}
+
+		const FIntVector From = ToCells(At);
+		At[Axis] += Sign * Steps;
+		const FIntVector To = ToCells(At);
+
+		Path.Corners.Add(To);
+		PreviousAxis = Axis;
+
+		// The leg's ends reach as far past its corners as its sides do, so legs meet whole at a corner.
+		FIntVector Min, Max;
+
+		for (int32 Each = 0; Each < 3; ++Each)
+		{
+			Min[Each] = FMath::Clamp(FMath::Min(From[Each], To[Each]) - Below, 0, LastCell);
+			Max[Each] = FMath::Clamp(FMath::Max(From[Each], To[Each]) - Below + Width - 1, 0, LastCell);
+		}
+
+		Path.LegMins.Add(Min);
+		Path.LegMaxes.Add(Max);
+
+		ForEachObstaclePiece(Min, Max, Module,
+			[&Faces](const FIntVector& FaceMinNode, const int32 NormalAxis) { Faces.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis)); },
+			[&Edges](const FLatticeEdge& Edge) { Edges.Add(MakeEdgeKey(Edge)); },
+			[&Nodes](const FIntVector& Node) { Nodes.Add(MakeCellKey(Node)); });
+	}
+
+	Path.FaceKeys = Faces.Array();
+	Path.EdgeKeys = Edges.Array();
+	Path.NodeKeys = Nodes.Array();
+}
+
+void ARoomManager::AddPathKeys(const FAirPath& Path)
+{
+	auto Add = [](TMap<uint64, int32>& Uses, const TConstArrayView<uint64> Keys)
+	{
+		for (const uint64 Key : Keys)
+		{
+			++Uses.FindOrAdd(Key);
+		}
+	};
+
+	Add(PathFaces, Path.FaceKeys);
+	Add(PathEdges, Path.EdgeKeys);
+	Add(PathNodes, Path.NodeKeys);
+}
+
+void ARoomManager::RemovePathKeys(const FAirPath& Path)
+{
+	// A piece stays held back while another path still reaches it.
+	auto Remove = [](TMap<uint64, int32>& Uses, const TConstArrayView<uint64> Keys)
+	{
+		for (const uint64 Key : Keys)
+		{
+			if (int32* Count = Uses.Find(Key); Count && --*Count <= 0)
+			{
+				Uses.Remove(Key);
+			}
+		}
+	};
+
+	Remove(PathFaces, Path.FaceKeys);
+	Remove(PathEdges, Path.EdgeKeys);
+	Remove(PathNodes, Path.NodeKeys);
+}
+
+void ARoomManager::FindPathStanding(FAirPath& Path) const
+{
+	const int32 Module = GetModule();
+	TSet<int32> Owners;
+
+	// Every platform is a module or more across, so one that takes in an edge or a node covers a module face beside
+	// it in its own plane - which is all ModuleFaceOwners has to be asked, however many platforms stand.
+	auto AddOwner = [&](const FIntVector& FaceMinNode, const int32 NormalAxis)
+	{
+		if (const int32* Owner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, NormalAxis)))
+		{
+			Owners.Add(*Owner);
+		}
+	};
+
+	for (const uint64 Key : Path.FaceKeys)
+	{
+		AddOwner(CellFromKey(Key), static_cast<int32>(Key >> KeyTagShift) - 1);
+	}
+
+	for (const uint64 Key : Path.EdgeKeys)
+	{
+		const FIntVector Node = CellFromKey(Key);
+		const int32 Axis = static_cast<int32>(Key >> KeyTagShift) - 1;
+
+		for (const int32 NormalAxis : { (Axis + 1) % 3, (Axis + 2) % 3 })
+		{
+			const int32 Across = 3 - NormalAxis - Axis;
+			AddOwner(Node, NormalAxis);
+			AddOwner(Node - AxisStep(Across, Module), NormalAxis);
+		}
+	}
+
+	for (const uint64 Key : Path.NodeKeys)
+	{
+		const FIntVector Node = CellFromKey(Key);
+
+		for (int32 NormalAxis = 0; NormalAxis < 3; ++NormalAxis)
+		{
+			int32 U, V;
+			GetInPlaneAxes(NormalAxis, U, V);
+
+			for (const int32 StepU : { 0, Module })
+			{
+				for (const int32 StepV : { 0, Module })
+				{
+					AddOwner(Node - AxisStep(U, StepU) - AxisStep(V, StepV), NormalAxis);
+				}
+			}
+		}
+	}
+
+	Path.Standing = Owners.Array();
+}
+
+void ARoomManager::SpawnPaths()
+{
+	// Lists that are going to be gathered afresh anyway are left to that; any others are refreshed where the
+	// paths were and where they now run, below.
+	const bool bRefreshLists = CanRefreshCandidateLists();
+
+	TArray<uint64> OldFaces, OldEdges, OldNodes;
+	PathFaces.GenerateKeyArray(OldFaces);
+	PathEdges.GenerateKeyArray(OldEdges);
+	PathNodes.GenerateKeyArray(OldNodes);
+
+	PathFaces.Reset();
+	PathEdges.Reset();
+	PathNodes.Reset();
+
+	// Those already drawn keep their draw, so they come out on the same routes; any more start at their first.
+	const int32 Count = bEnablePaths ? FMath::Max(PathCount, 0) : 0;
+	AirPaths.SetNum(Count);
+
+	const double Now = GetPathClock();
+	const double Interval = FMath::Max(PathRerollInterval, 0.0f);
+
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		FAirPath& Path = AirPaths[Index];
+		DrawPath(Index, Path);
+		AddPathKeys(Path);
+
+		// Due one after another across the interval from now, so they never all move in one frame.
+		Path.RedrawAt = Now + Interval * (static_cast<double>(Index) + FMath::FRand()) / Count;
+	}
+
+	// Where the old paths ran, placements may have come free; where the new ones run, listed ones drop out. Gathering
+	// every list afresh instead stalls the beat for a second once a few thousand platforms stand.
+	if (bRefreshLists)
+	{
+		TArray<uint64> NewFaces, NewEdges, NewNodes;
+		PathFaces.GenerateKeyArray(NewFaces);
+		PathEdges.GenerateKeyArray(NewEdges);
+		PathNodes.GenerateKeyArray(NewNodes);
+
+		TArray<TSet<uint64>> Judged;
+		Judged.SetNum(TileCandidates.Num());
+
+		RefreshCandidatesOnPathPieces(OldFaces, OldEdges, OldNodes, /*bMayHaveComeFree=*/true, Judged);
+		RefreshCandidatesOnPathPieces(NewFaces, NewEdges, NewNodes, /*bMayHaveComeFree=*/false, Judged);
+	}
+	else
+	{
+		bPlatformCandidatesStale = true;
+	}
+
+	for (FAirPath& Path : AirPaths)
+	{
+		FindPathStanding(Path);
+	}
+
+	UpdatePathSummary();
+}
+
+void ARoomManager::RedrawPath(const int32 Index)
+{
+	if (!AirPaths.IsValidIndex(Index))
+	{
+		return;
+	}
+
+	const bool bRefreshLists = CanRefreshCandidateLists();
+	FAirPath& Path = AirPaths[Index];
+
+	RemovePathKeys(Path);
+
+	const TArray<uint64> OldFaces = MoveTemp(Path.FaceKeys);
+	const TArray<uint64> OldEdges = MoveTemp(Path.EdgeKeys);
+	const TArray<uint64> OldNodes = MoveTemp(Path.NodeKeys);
+
+	++Path.Draw;
+	++PathRedraws;
+	DrawPath(Index, Path);
+	AddPathKeys(Path);
+
+	// Only what this one path left and now reaches is judged again. A piece another path still holds is judged
+	// too, and simply stays held back.
+	if (bRefreshLists)
+	{
+		TArray<TSet<uint64>> Judged;
+		Judged.SetNum(TileCandidates.Num());
+
+		RefreshCandidatesOnPathPieces(OldFaces, OldEdges, OldNodes, /*bMayHaveComeFree=*/true, Judged);
+		RefreshCandidatesOnPathPieces(Path.FaceKeys, Path.EdgeKeys, Path.NodeKeys, /*bMayHaveComeFree=*/false, Judged);
+	}
+	else
+	{
+		bPlatformCandidatesStale = true;
+	}
+
+	FindPathStanding(Path);
+
+	// Only when it next moves is left to chance, not where it goes, so the wait comes from no stream of the run's.
+	const float Jitter = FMath::Clamp(PathRerollJitter, 0.0f, 1.0f);
+	Path.RedrawAt = GetPathClock() + FMath::Max(PathRerollInterval, 0.0f) * (1.0f + FMath::FRandRange(-Jitter, Jitter));
+
+	UpdatePathSummary();
+	RebuildPathLines();
+}
+
+void ARoomManager::UpdatePathSummary()
+{
+	if (!bEnablePaths)
+	{
+		PathSummary = TEXT("Paths off");
+		return;
+	}
+
+	int32 Legs = 0;
+	TSet<int32> Standing;
+
+	for (const FAirPath& Path : AirPaths)
+	{
+		Legs += Path.LegMins.Num();
+		Standing.Append(Path.Standing);
+	}
+
+	PathSummary = FString::Printf(TEXT("%d paths, %d legs, %d redraws; %d pieces held back: %d faces, %d edges, %d nodes; %d platforms stand in them"),
+		AirPaths.Num(), Legs, PathRedraws, PathFaces.Num() + PathEdges.Num() + PathNodes.Num(),
+		PathFaces.Num(), PathEdges.Num(), PathNodes.Num(), Standing.Num());
+}
+
+void ARoomManager::RebuildPathLines()
+{
+	if (!PathLineBatcher)
+	{
+		return;
+	}
+
+	PathLineBatcher->Flush();
+
+	if (!bShowPaths || AirPaths.IsEmpty())
+	{
+		return;
+	}
+
+	// Each leg of every path as the box of cells it fills.
+	const FLinearColor Color(PathColor);
+	TArray<FBatchedLine> Lines;
+
+	for (const FAirPath& Path : AirPaths)
+	{
+		for (int32 Leg = 0; Leg < Path.LegMins.Num(); ++Leg)
+		{
+			AppendBoxLines(Lines, GetCellMinCorner(Path.LegMins[Leg]), GetCellMinCorner(Path.LegMaxes[Leg]) + FVector(CellSize),
+				Color, GridLineThickness, SDPG_World, /*bWithDiagonals=*/false);
+		}
+	}
+
+	PathLineBatcher->DrawLines(Lines);
+}
+
 FVector ARoomManager::CellPointToWorld(const FVector& Point) const
 {
 	const FVector Origin = GetActorLocation();
@@ -6118,6 +6695,7 @@ void ARoomManager::RebuildVisuals()
 
 	RebuildDebugGrid();
 	RebuildAirLines();
+	RebuildPathLines();
 }
 
 void ARoomManager::UpdateVisualsAfterPlacement(
