@@ -87,6 +87,13 @@ namespace
 		TEXT("placements had built up differently. Costs a full rebuild each time, so leave it at 0 (off) outside of testing."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarRoomManagerRemoveByRebuild(
+		TEXT("wem.RoomManager.RemoveByRebuild"),
+		0,
+		TEXT("1 takes platforms out of ARoomManager by rebuilding everything derived from the list (step A) rather than\n")
+		TEXT("by undoing just what they brought (step B). Slower; for comparing the two."),
+		ECVF_Default);
+
 	/** The ways round a tile can be laid, one bit each, as GetFillableWays reports them. */
 	constexpr uint8 AsLaidWay = 1 << 0;
 	constexpr uint8 TurnedWay = 1 << 1;
@@ -125,8 +132,32 @@ namespace
 	/** Seconds between ticks of the clock the paths fall due by. */
 	constexpr float PathClockSeconds = 0.05f;
 
-	/** The most paths one tick of the path clock draws afresh; any more due wait for the next tick. */
+	/** The most paths one tick of the clock draws afresh; any more due wait for the next tick. */
 	constexpr int32 MaxPathRedrawsPerTick = 2;
+
+	/**
+	 * The most platforms with no health left one tick of the clock takes away. Each costs about what laying one does, and
+	 * they are taken away together, so this bounds a tick's frame: 4 a tick is 80 a second.
+	 */
+	constexpr int32 MaxRemovalsPerTick = 4;
+
+	/** How many places in its zone a first tile is drawn at before the zone is left without one. */
+	constexpr int32 MaxSeedPlaces = 32;
+
+	/** The air over the fields is bucketed in cubes of 2^this cells, so a placement asks only the boxes near it. */
+	constexpr int32 AirBoxBucketShift = 5;
+
+	/** The colours the zones are drawn in when ZoneColors names too few. */
+	const FColor DefaultZoneColors[] = {
+		FColor(255, 60, 60), FColor(255, 150, 0), FColor(255, 230, 0),
+		FColor(120, 230, 0), FColor(255, 255, 255), FColor(0, 220, 200),
+		FColor(0, 120, 255), FColor(150, 70, 255), FColor(255, 70, 200) };
+
+	/** A bucket of the air over the fields, named by its coordinates in buckets. */
+	FORCEINLINE uint64 MakeAirBucketKey(const int32 X, const int32 Y, const int32 Z)
+	{
+		return WEMGrid::MakeCellKey(FIntVector(X, Y, Z));
+	}
 
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
@@ -626,6 +657,8 @@ ARoomManager::ARoomManager()
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
 
+	ZoneColors.Append(DefaultZoneColors, UE_ARRAY_COUNT(DefaultZoneColors));
+
 	GridLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("GridLineBatcher"));
 	GridLineBatcher->SetupAttachment(SceneRoot);
 
@@ -727,6 +760,9 @@ void ARoomManager::OnConstruction(const FTransform& Transform)
 	// swapping a tile re-resolves it from scratch.
 	RebuildPlatformState();
 
+	// The pockets stay where they were drawn, cut afresh for the lattice as it now stands.
+	RebuildPocketKeys();
+
 	// Paths hold back nothing standing, so they are drawn again whatever changed - on the same routes, which
 	// a change to their own settings then shows straight away.
 	SpawnPaths();
@@ -772,8 +808,11 @@ void ARoomManager::BeginPlay()
 		RebuildVisuals();
 	}
 
-	// The paths move on a clock of their own.
-	StartPathClock();
+	// Paths, pockets, strikes and reshuffles all fall due by one clock, starting from now.
+	const double Now = GetClock();
+	NextStrikeAt = Now + DamageStream.FRandRange(MinStrikeInterval, FMath::Max(MaxStrikeInterval, MinStrikeInterval));
+	NextReshuffleAt = Now + ReshuffleInterval;
+	StartClock();
 
 	// One placement per beat - the first lands a full interval in, so the empty cube is
 	// visible before anything grows in it.
@@ -813,7 +852,7 @@ void ARoomManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		World->GetTimerManager().ClearTimer(PlacementTimerHandle);
 		World->GetTimerManager().ClearTimer(NatureTimerHandle);
-		World->GetTimerManager().ClearTimer(PathTimerHandle);
+		World->GetTimerManager().ClearTimer(ClockTimerHandle);
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -999,9 +1038,9 @@ bool ARoomManager::IsPlacementOpen(const FGridPlatform& Platform) const
 		});
 	}
 
-	// A path holds back only what is placed from now on, so the rebuild, which asks IsSpaceFree, never
-	// leaves out a platform one has since been drawn through.
-	if (!IsSpaceFree(Platform) || !IsClearOfPaths(Platform))
+	// Air held back - a path, a pocket, a mold, the air over a field - holds back only what is placed from now
+	// on, so the rebuild, which asks IsSpaceFree, never leaves out a platform it has since reached.
+	if (!IsSpaceFree(Platform) || !IsClearOfHeldAir(Platform))
 	{
 		return false;
 	}
@@ -1510,7 +1549,7 @@ bool ARoomManager::RefreshPlatformCandidate(
 	return true;
 }
 
-bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
+bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind, const TFunction<bool(const FGridPlatform&)>* Filter)
 {
 	FGridPlatform Platform;
 
@@ -1522,8 +1561,8 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 	if (BuiltPlatforms.IsEmpty())
 	{
 		// The empty cube is the one case with nothing to grow from, and only FirstTile, laid
-		// horizontal, starts it - whatever its weight.
-		if (Kind != EPlatformKind::SurfaceHorizontal)
+		// horizontal, starts it - whatever its weight. Nothing kept to a part of the cube starts it.
+		if (Kind != EPlatformKind::SurfaceHorizontal || Filter)
 		{
 			return false;
 		}
@@ -1548,11 +1587,12 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 	{
 		EnsurePlatformCandidates();
 
-		// A placement is only drawn laid a way round that the structures can fill. Where that is
-		// every way the tile is listed, every placement counts.
-		auto IsFillable = [this, Kind](const int32 TileIndex, const FGridPlatform& Candidate)
+		// A placement is only drawn laid a way round that the structures can fill, and only where the filter - a
+		// reshuffle keeping to its zone - lets it be. Where that is every way the tile is listed, every placement counts.
+		auto IsFillable = [this, Kind, Filter](const int32 TileIndex, const FGridPlatform& Candidate)
 		{
-			return (GetFillableWays(TileIndex, Kind) & (Candidate.bTurned ? TurnedWay : AsLaidWay)) != 0;
+			return (GetFillableWays(TileIndex, Kind) & (Candidate.bTurned ? TurnedWay : AsLaidWay)) != 0
+				&& (!Filter || (*Filter)(Candidate));
 		};
 
 		// The tile is rolled only among those with somewhere to go, so a tile with no room left
@@ -1615,17 +1655,42 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 			const UPlatformTileData* Tile = TileCandidates[ChosenTile].Tile;
 
 			// Drawn by place among the fillable ones. Copied out, since taking the platform in changes the
-			// list it was drawn from. Where every way the tile is listed can be filled - nearly always - every
-			// placement is fillable, and the draw is the same without counting them.
+			// list it was drawn from. Where every way the tile is listed can be filled - nearly always - and nothing
+			// filters them, every placement is fillable, and the draw is the same without counting them.
 			const uint8 ListedWays = Tile->bCanTurn && Tile->Width != Tile->Length ? (AsLaidWay | TurnedWay) : AsLaidWay;
-			const bool bAllFillable = (GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays;
+			const bool bAllFillable = !Filter && (GetFillableWays(ChosenTile, Kind) & ListedWays) == ListedWays;
 			const int32 Fillable = bAllFillable ? Candidates.Num() : Algo::CountIf(Candidates, [ChosenTile, &IsFillable](const FGridPlatform& Candidate)
 			{
 				return IsFillable(ChosenTile, Candidate);
 			});
 
+			// Inside a mold's box a placement weighs MoldGrowthWeight, so the city fills a mold sooner than it would
+			// by chance. Weighed only while a mold stands, so without one the draw is as it always was.
+			const bool bMoldPull = MoldGrowthWeight > 1.0f && AirPockets.ContainsByPredicate([](const FAirPocket& Pocket) { return Pocket.bMold; });
+			TArray<double> PullWeights;
+
+			if (bMoldPull)
+			{
+				PullWeights.Reserve(Candidates.Num());
+				double Running = 0.0;
+
+				for (const FGridPlatform& Candidate : Candidates)
+				{
+					Running += !IsFillable(ChosenTile, Candidate) ? 0.0 : (IsInMoldBox(Candidate) ? MoldGrowthWeight : 1.0);
+					PullWeights.Add(Running);
+				}
+			}
+
 			auto DrawPlacement = [&]() -> FGridPlatform
 			{
+				if (bMoldPull)
+				{
+					// The first placement whose running weight passes the roll.
+					const double Roll = PlacementStream.FRand() * PullWeights.Last();
+					const int32 Pick = FMath::Min(Algo::UpperBound(PullWeights, Roll), Candidates.Num() - 1);
+					return Candidates[Pick];
+				}
+
 				if (bAllFillable)
 				{
 					return Candidates[PlacementStream.RandRange(0, Candidates.Num() - 1)];
@@ -1681,7 +1746,14 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind)
 
 void ARoomManager::PlacePlatform(const FGridPlatform& Platform, const int32 JoinedSide)
 {
+	// The first platform in the empty cube is the one every zone's first tile keeps in step with.
+	if (BuiltPlatforms.IsEmpty())
+	{
+		SeedPhase = Platform.MinNode;
+	}
+
 	Platforms.Add(Platform);
+	GiveHealth(Platform);
 
 	TArray<FGridSurfaceRef> ChangedSurfaces;
 	AddPlacedPlatform(Platform, ChangedSurfaces);
@@ -2054,6 +2126,19 @@ bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoine
 
 bool ARoomManager::PlaceNextPlatform()
 {
+	// Once the middle zone's first tile stands, every other zone's is laid before anything else, a zone a beat. A zone
+	// with no free place for one goes without.
+	while (!BuiltPlatforms.IsEmpty() && !SeedQueue.IsEmpty())
+	{
+		const int32 Zone = SeedQueue[0];
+		SeedQueue.RemoveAt(0);
+
+		if (PlaceSeed(Zone))
+		{
+			return true;
+		}
+	}
+
 	// A fence run waiting to grow takes the beat before anything else, a panel a beat.
 	if (PlaceFencePanel())
 	{
@@ -2077,6 +2162,24 @@ void ARoomManager::ClearPlatforms()
 	FenceQueue.Reset();
 	SpillQueue.Reset();
 
+	// Nothing has health or is waiting to go, no reshuffle is under way, and every zone waits for a first tile again.
+	PlatformHealth.Reset();
+	DyingQueue.Reset();
+	DyingKeys.Reset();
+	ReshuffleZoneIndex = INDEX_NONE;
+	ReshuffleKeys.Reset();
+	ReshuffleEmptied.Reset();
+	StrikeCount = 0;
+	HitCount = 0;
+	VulnerableHitCount = 0;
+	DamageRemovals = 0;
+	ReshuffleCount = 0;
+	ReshuffleRemovals = 0;
+	ReshufflePlacements = 0;
+	PocketMoves = 0;
+	SeedPhase.Reset();
+	QueueSeeds();
+
 	ResetPlacementStream();
 	BeginNewGeneration();
 
@@ -2090,6 +2193,8 @@ void ARoomManager::ClearPlatforms()
 	PathRedraws = 0;
 	SpawnPaths();
 
+	UpdateZoneSummary();
+	UpdateDeletionSummary();
 	UpdateDebugReadouts();
 	RebuildVisuals();
 }
@@ -2106,21 +2211,15 @@ void ARoomManager::ResetPlacementStream()
 	StructureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Structures"))))));
 	RoleStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Roles"))))));
 	NatureStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Nature"))))));
+	DamageStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Damage"))))));
+	SeedStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Seeds"))))));
+	ReshuffleStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Reshuffle"))))));
 }
 
 void ARoomManager::AdvancePlacement()
 {
-	if (PlaceNextPlatform())
-	{
-		return;
-	}
-
-	// Nowhere left to grow. Stop the beat rather than retrying on every interval.
-	GetWorldTimerManager().ClearTimer(PlacementTimerHandle);
-
-	UE_LOG(LogTemp, Log,
-		TEXT("RoomManager: growth stopped with %d platform(s), %d horizontal and %d vertical - there is no room left."),
-		PlatformCount, HorizontalPlatformCount, VerticalPlatformCount);
+	// A beat with nowhere to grow is simply lost. The beat keeps going, since platforms taken away give room back.
+	PlaceNextPlatform();
 }
 
 int32 ARoomManager::GetModule() const
@@ -2206,7 +2305,7 @@ bool ARoomManager::IsPlatformOnGrid(const FGridPlatform& Platform) const
 	return true;
 }
 
-bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
+bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform, const bool bIgnoreBlockedEdges) const
 {
 	int32 SpanU, SpanV;
 
@@ -2248,7 +2347,7 @@ bool ARoomManager::IsSpaceFree(const FGridPlatform& Platform) const
 
 	// An edge a platform that is not load-bearing has blocked holds nothing further, rim or interior -
 	// except the next panel of a fence run the blocking panel belongs to, which carries on across it.
-	if (bFree && !BlockedEdges.IsEmpty())
+	if (bFree && !bIgnoreBlockedEdges && !BlockedEdges.IsEmpty())
 	{
 		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
 		{
@@ -2317,6 +2416,60 @@ bool ARoomManager::IsClearOfPaths(const FGridPlatform& Platform) const
 	int32 SpanU, SpanV;
 	return GetPlatformSpans(Platform, SpanU, SpanV)
 		&& IsClearOfPieces(Platform, SpanU, SpanV, PathFaces, PathEdges, PathNodes);
+}
+
+bool ARoomManager::IsClearOfPockets(const FGridPlatform& Platform) const
+{
+	int32 SpanU, SpanV;
+	return GetPlatformSpans(Platform, SpanU, SpanV)
+		&& IsClearOfPieces(Platform, SpanU, SpanV, PocketFaces, PocketEdges, PocketNodes);
+}
+
+bool ARoomManager::IsClearOfHeldAir(const FGridPlatform& Platform) const
+{
+	return IsClearOfPaths(Platform) && IsClearOfPockets(Platform) && IsClearOfAirBoxes(Platform);
+}
+
+ARoomManager::FAirBox ARoomManager::GetPlatformBox(const FGridPlatform& Platform) const
+{
+	int32 SpanU, SpanV, U, V;
+	GetPlatformSpans(Platform, SpanU, SpanV);
+	GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+	FAirBox Box{ Platform.MinNode, Platform.MinNode };
+	Box.Max[U] += SpanU;
+	Box.Max[V] += SpanV;
+	return Box;
+}
+
+bool ARoomManager::IsClearOfAirBoxes(const FGridPlatform& Platform) const
+{
+	if (AirBoxBuckets.IsEmpty())
+	{
+		return true;
+	}
+
+	// Every cell a platform covers lies in one of its pieces, and a box cuts a piece exactly where it holds one of the
+	// piece's cells - so a box holds a platform back exactly where it holds one of its cells.
+	const FAirBox Box = GetPlatformBox(Platform);
+
+	for (int32 Z = Box.Min.Z >> AirBoxBucketShift; Z <= Box.Max.Z >> AirBoxBucketShift; ++Z)
+	{
+		for (int32 Y = Box.Min.Y >> AirBoxBucketShift; Y <= Box.Max.Y >> AirBoxBucketShift; ++Y)
+		{
+			for (int32 X = Box.Min.X >> AirBoxBucketShift; X <= Box.Max.X >> AirBoxBucketShift; ++X)
+			{
+				const TArray<FAirBox>* Bucket = AirBoxBuckets.Find(MakeAirBucketKey(X, Y, Z));
+
+				if (Bucket && Bucket->ContainsByPredicate([&Box](const FAirBox& Air) { return Air.Intersects(Box); }))
+				{
+					return false;
+				}
+			}
+		}
+	}
+
+	return true;
 }
 
 bool ARoomManager::IsFlushWith(const FGridPlatform& Platform, const FGridPlatform& Neighbour, const int32 SharedAxis) const
@@ -3434,7 +3587,7 @@ int32 ARoomManager::GetAirHeight(const FGridPlatform& Platform) const
 	return Stream.RandRange(Fewest, Most);
 }
 
-void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 PlatformIndex, const int32 Height, TArray<FAirBox>& OutBoxes) const
+void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 PlatformIndex, const int32 Height, TArray<FAirBox>& OutBoxes, const int32 ExtraHeight) const
 {
 	OutBoxes.Reset();
 
@@ -3522,7 +3675,7 @@ void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 Pla
 						RunStart = Platform.MinNode[AlongAxis] + Step;
 					}
 
-					RunHeight = FMath::Min(RunHeight, GetAirHeight(*Neighbour));
+					RunHeight = FMath::Min(RunHeight, GetAirHeight(*Neighbour) + ExtraHeight);
 				}
 				else
 				{
@@ -3561,43 +3714,507 @@ bool ARoomManager::IsAirClear(const FGridPlatform& Platform) const
 	return true;
 }
 
-void ARoomManager::DropCandidatesCutBy(const FIntVector& MinCell, const FIntVector& MaxCell)
+namespace
+{
+	/** The smallest box holding every one of a set. */
+	FIntVector ComponentMin(const FIntVector& A, const FIntVector& B)
+	{
+		return FIntVector(FMath::Min(A.X, B.X), FMath::Min(A.Y, B.Y), FMath::Min(A.Z, B.Z));
+	}
+
+	FIntVector ComponentMax(const FIntVector& A, const FIntVector& B)
+	{
+		return FIntVector(FMath::Max(A.X, B.X), FMath::Max(A.Y, B.Y), FMath::Max(A.Z, B.Z));
+	}
+}
+
+void ARoomManager::DropCandidatesIn(const TConstArrayView<FAirBox> Regions)
 {
 	// Lists that are going to be gathered afresh anyway hold nothing worth judging.
-	if (bPlatformCandidatesStale || TileCandidates.Num() != UsableTiles.Num())
+	if (Regions.IsEmpty() || !CanRefreshCandidateLists())
 	{
 		return;
 	}
 
-	// A box can only cut a placement whose footprint it reaches into, so only those are judged again - in their
-	// lists' own order, which dropping some keeps.
+	FAirBox Bounds = Regions[0];
+
+	for (const FAirBox& Region : Regions)
+	{
+		Bounds.Min = ComponentMin(Bounds.Min, Region.Min);
+		Bounds.Max = ComponentMax(Bounds.Max, Region.Max);
+	}
+
+	// Only a placement reaching into a region can be held back by it, so only those are judged again - in their lists'
+	// own order, which dropping some keeps. Most are passed over by the regions' bounds alone.
 	for (FTileCandidates& TileList : TileCandidates)
 	{
 		for (TArray<FGridPlatform>& Candidates : TileList.ByKind)
 		{
 			for (int32 Index = Candidates.Num() - 1; Index >= 0; --Index)
 			{
-				const FGridPlatform& Candidate = Candidates[Index];
+				const FAirBox Box = GetPlatformBox(Candidates[Index]);
 
-				int32 SpanU, SpanV, U, V;
-				GetPlatformSpans(Candidate, SpanU, SpanV);
-				GetInPlaneAxes(AxisIndex(Candidate.Normal), U, V);
-
-				FIntVector CandidateMax = Candidate.MinNode;
-				CandidateMax[U] += SpanU;
-				CandidateMax[V] += SpanV;
-
-				const bool bReaches = MinCell.X <= CandidateMax.X && MaxCell.X >= Candidate.MinNode.X
-					&& MinCell.Y <= CandidateMax.Y && MaxCell.Y >= Candidate.MinNode.Y
-					&& MinCell.Z <= CandidateMax.Z && MaxCell.Z >= Candidate.MinNode.Z;
-
-				if (bReaches && !IsPlacementOpen(Candidate))
+				if (Bounds.Intersects(Box)
+					&& Regions.ContainsByPredicate([&Box](const FAirBox& Region) { return Region.Intersects(Box); })
+					&& !IsPlacementOpen(Candidates[Index]))
 				{
 					Candidates.RemoveAt(Index);
 				}
 			}
 		}
 	}
+}
+
+void ARoomManager::FreeCandidatesIn(const TConstArrayView<FAirBox> Regions)
+{
+	// The empty cube has a rule of its own, and lists that are going to be gathered afresh anyway need nothing.
+	if (Regions.IsEmpty() || !CanRefreshCandidateLists() || BuiltPlatforms.IsEmpty())
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+
+	// A placement is only ever open sharing a module edge of rim with a platform, and then it lies within its own longest
+	// side of that platform. So the platforms that near a region are the only ones whose placements need asking.
+	int32 Reach = 0;
+
+	for (const UPlatformTileData* Tile : UsableTiles)
+	{
+		Reach = FMath::Max(Reach, FMath::Max(Tile->Width, Tile->Length));
+	}
+
+	FAirBox Bounds = Regions[0];
+
+	for (const FAirBox& Region : Regions)
+	{
+		Bounds.Min = ComponentMin(Bounds.Min, Region.Min);
+		Bounds.Max = ComponentMax(Bounds.Max, Region.Max);
+	}
+
+	auto ReachesRegion = [&Bounds, &Regions](const FAirBox& Box)
+	{
+		return Bounds.Intersects(Box) && Regions.ContainsByPredicate([&Box](const FAirBox& Region) { return Region.Intersects(Box); });
+	};
+
+	TArray<TSet<uint64>> Judged;
+	Judged.SetNum(TileCandidates.Num());
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		FAirBox Near = GetPlatformBox(Platform);
+		Near.Min -= FIntVector(Reach);
+		Near.Max += FIntVector(Reach);
+
+		if (!ReachesRegion(Near))
+		{
+			continue;
+		}
+
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+		{
+			if (!bRim)
+			{
+				return;
+			}
+
+			ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/true,
+				[&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
+			{
+				if (!ReachesRegion(GetPlatformBox(Candidate)))
+				{
+					return;
+				}
+
+				bool bAlreadyJudged = false;
+				Judged[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyJudged);
+
+				if (!bAlreadyJudged)
+				{
+					RefreshPlatformCandidate(TileIndex, Candidate, /*bMayHaveComeFree=*/true);
+				}
+			});
+		});
+	}
+}
+
+int32 ARoomManager::GetMushroomStoreys(const int32 Pieces) const
+{
+	if (!bMushroomAir || Pieces <= 1)
+	{
+		return 0;
+	}
+
+	return FMath::Clamp(FMath::FloorToInt32((Pieces - 1) * MushroomStoreysPerPiece), 0, FMath::Max(MaxMushroomStoreys, 0));
+}
+
+int32 ARoomManager::GetMushroomSpread(const int32 Pieces) const
+{
+	if (!bMushroomAir || Pieces <= 1)
+	{
+		return 0;
+	}
+
+	// In whole modules, so the cap's sides lie on lattice lines like everything else.
+	const int32 Module = GetModule();
+	const int32 Cells = FMath::Clamp(FMath::FloorToInt32((Pieces - 1) * MushroomSpreadPerPiece), 0, FMath::Max(MaxMushroomSpread, 0));
+	return (Cells / Module) * Module;
+}
+
+void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscapes, int32* OutLargest) const
+{
+	OutBoxes.Reset();
+
+	if (OutLandscapes)
+	{
+		*OutLandscapes = 0;
+	}
+
+	if (OutLargest)
+	{
+		*OutLargest = 0;
+	}
+
+	// The pieces of every field, in list order - the order their seams are laid in.
+	TArray<int32> Pieces;
+	Pieces.Append(NatureIndices[static_cast<int32>(ENatureForm::Ground)]);
+	Pieces.Append(NatureIndices[static_cast<int32>(ENatureForm::Water)]);
+
+	if (Pieces.IsEmpty())
+	{
+		return;
+	}
+
+	Pieces.Sort();
+
+	TMap<int32, int32> Slots;
+	Slots.Reserve(Pieces.Num());
+
+	TArray<int32> Parents;
+	Parents.SetNumUninitialized(Pieces.Num());
+
+	for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
+	{
+		Slots.Add(Pieces[Slot], Slot);
+		Parents[Slot] = Slot;
+	}
+
+	auto FindRoot = [&Parents](int32 Slot)
+	{
+		while (Parents[Slot] != Slot)
+		{
+			Parents[Slot] = Parents[Parents[Slot]];
+			Slot = Parents[Slot];
+		}
+
+		return Slot;
+	};
+
+	// Landscapes: the pieces joined across a seam in their plane, with their Up - ground and water alike.
+	const int32 Module = GetModule();
+
+	for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
+	{
+		const FGridPlatform& Piece = BuiltPlatforms[Pieces[Slot]];
+		const int32 NormalAxis = AxisIndex(Piece.Normal);
+
+		int32 SpanU, SpanV, U, V;
+		GetPlatformSpans(Piece, SpanU, SpanV);
+		GetInPlaneAxes(NormalAxis, U, V);
+
+		for (const int32 AcrossAxis : { U, V })
+		{
+			const int32 AlongAxis = AcrossAxis == U ? V : U;
+			const int32 Span = AcrossAxis == U ? SpanU : SpanV;
+			const int32 AlongSpan = AcrossAxis == U ? SpanV : SpanU;
+
+			for (const int32 Side : { -1, 1 })
+			{
+				for (int32 Step = 0; Step < AlongSpan; Step += Module)
+				{
+					// The module face just past this side of it, in its plane.
+					FIntVector FaceMinNode = Piece.MinNode;
+					FaceMinNode[AcrossAxis] += Side > 0 ? Span : -Module;
+					FaceMinNode[AlongAxis] += Step;
+
+					const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+					const int32* Other = FaceOwner ? Slots.Find(*FaceOwner) : nullptr;
+
+					if (Other && BuiltPlatforms[*FaceOwner].Up == Piece.Up)
+					{
+						const int32 Root = FindRoot(Slot);
+						const int32 OtherRoot = FindRoot(*Other);
+
+						// The lower slot is kept as root, so a landscape is named by its first piece whatever order they joined in.
+						Parents[FMath::Max(Root, OtherRoot)] = FMath::Min(Root, OtherRoot);
+					}
+				}
+			}
+		}
+	}
+
+	TArray<int32> Sizes;
+	Sizes.Init(0, Pieces.Num());
+
+	for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
+	{
+		++Sizes[FindRoot(Slot)];
+	}
+
+	// Each piece's air, as high as it drew and raised by its landscape's mushroom, its seams the lower of their two.
+	const int32 Storey = FMath::Max(StoreyCells, 1);
+	TArray<FAirBox> Boxes;
+
+	// Per landscape, by its root: how far it reaches in its plane, and the highest its air goes.
+	TMap<int32, TPair<FAirBox, int32>> Caps;
+	TArray<int32> Roots;
+
+	for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
+	{
+		const FGridPlatform& Piece = BuiltPlatforms[Pieces[Slot]];
+		const int32 Root = FindRoot(Slot);
+		const int32 Extra = GetMushroomStoreys(Sizes[Root]) * Storey;
+		const int32 Height = GetAirHeight(Piece) + Extra;
+
+		GatherAirBoxes(Piece, Pieces[Slot], Height, Boxes, Extra);
+		OutBoxes.Append(Boxes);
+
+		const FAirBox PieceBox = GetPlatformBox(Piece);
+
+		if (TPair<FAirBox, int32>* Cap = Caps.Find(Root))
+		{
+			Cap->Key.Min = ComponentMin(Cap->Key.Min, PieceBox.Min);
+			Cap->Key.Max = ComponentMax(Cap->Key.Max, PieceBox.Max);
+			Cap->Value = FMath::Max(Cap->Value, Height);
+		}
+		else
+		{
+			Caps.Add(Root, TPair<FAirBox, int32>(PieceBox, Height));
+			Roots.Add(Root);
+		}
+	}
+
+	// Then each landscape's cap: a layer at the top of its air, reaching past its edges in its plane.
+	const int32 LastCell = ResolveGridSize() - 1;
+
+	for (const int32 Root : Roots)
+	{
+		const int32 Spread = GetMushroomSpread(Sizes[Root]);
+
+		if (Spread <= 0)
+		{
+			continue;
+		}
+
+		const FGridPlatform& First = BuiltPlatforms[Pieces[Root]];
+		const int32 NormalAxis = AxisIndex(First.Normal);
+		const bool bOutPositive = FaceSign(First.Up) > 0;
+		const TPair<FAirBox, int32>& Cap = Caps.FindChecked(Root);
+		const int32 Top = Cap.Value;
+		const int32 Thick = FMath::Min(FMath::Max(MushroomCapStoreys, 1) * Storey, Top);
+		const int32 Plane = First.MinNode[NormalAxis];
+
+		int32 U, V;
+		GetInPlaneAxes(NormalAxis, U, V);
+
+		FAirBox Box = Cap.Key;
+
+		for (const int32 Axis : { U, V })
+		{
+			Box.Min[Axis] = FMath::Max(Box.Min[Axis] - Spread, 0);
+			Box.Max[Axis] = FMath::Min(Box.Max[Axis] + Spread, LastCell);
+		}
+
+		Box.Min[NormalAxis] = bOutPositive ? Plane + Top - Thick + 1 : Plane - Top;
+		Box.Max[NormalAxis] = bOutPositive ? Plane + Top : Plane - Top + Thick - 1;
+		OutBoxes.Add(Box);
+	}
+
+	if (OutLandscapes)
+	{
+		*OutLandscapes = Roots.Num();
+	}
+
+	if (OutLargest)
+	{
+		for (const int32 Size : Sizes)
+		{
+			*OutLargest = FMath::Max(*OutLargest, Size);
+		}
+	}
+}
+
+void ARoomManager::AddAirBoxToBuckets(const FAirBox& Box)
+{
+	// Only what lies in the cube can hold a platform back.
+	const int32 LastCell = ResolveGridSize() - 1;
+	const FIntVector Min = ComponentMax(Box.Min, FIntVector::ZeroValue);
+	const FIntVector Max = ComponentMin(Box.Max, FIntVector(LastCell));
+
+	for (int32 Z = Min.Z >> AirBoxBucketShift; Z <= Max.Z >> AirBoxBucketShift; ++Z)
+	{
+		for (int32 Y = Min.Y >> AirBoxBucketShift; Y <= Max.Y >> AirBoxBucketShift; ++Y)
+		{
+			for (int32 X = Min.X >> AirBoxBucketShift; X <= Max.X >> AirBoxBucketShift; ++X)
+			{
+				AirBoxBuckets.FindOrAdd(MakeAirBucketKey(X, Y, Z)).Add(Box);
+			}
+		}
+	}
+}
+
+void ARoomManager::RemoveAirBoxFromBuckets(const FAirBox& Box)
+{
+	const int32 LastCell = ResolveGridSize() - 1;
+	const FIntVector Min = ComponentMax(Box.Min, FIntVector::ZeroValue);
+	const FIntVector Max = ComponentMin(Box.Max, FIntVector(LastCell));
+
+	for (int32 Z = Min.Z >> AirBoxBucketShift; Z <= Max.Z >> AirBoxBucketShift; ++Z)
+	{
+		for (int32 Y = Min.Y >> AirBoxBucketShift; Y <= Max.Y >> AirBoxBucketShift; ++Y)
+		{
+			for (int32 X = Min.X >> AirBoxBucketShift; X <= Max.X >> AirBoxBucketShift; ++X)
+			{
+				const uint64 Key = MakeAirBucketKey(X, Y, Z);
+
+				if (TArray<FAirBox>* Bucket = AirBoxBuckets.Find(Key))
+				{
+					Bucket->RemoveSingleSwap(Box, EAllowShrinking::No);
+
+					if (Bucket->IsEmpty())
+					{
+						AirBoxBuckets.Remove(Key);
+					}
+				}
+			}
+		}
+	}
+}
+
+void ARoomManager::UpdateFieldAir(const bool bRefreshLists)
+{
+	TArray<FAirBox> NewBoxes;
+	int32 Landscapes = 0;
+	int32 Largest = 0;
+	GatherFieldAir(NewBoxes, &Landscapes, &Largest);
+
+	// What changed: the old boxes counted off against the new, the new left over added and the old left over gone.
+	TMap<FAirBox, int32> Kept;
+
+	for (const FAirBox& Box : AirBoxes)
+	{
+		++Kept.FindOrAdd(Box);
+	}
+
+	TArray<FAirBox> Added;
+
+	for (const FAirBox& Box : NewBoxes)
+	{
+		int32* Count = Kept.Find(Box);
+
+		if (Count && *Count > 0)
+		{
+			--*Count;
+		}
+		else
+		{
+			Added.Add(Box);
+		}
+	}
+
+	TArray<FAirBox> Gone;
+
+	for (const TPair<FAirBox, int32>& Box : Kept)
+	{
+		for (int32 Copy = 0; Copy < Box.Value; ++Copy)
+		{
+			Gone.Add(Box.Key);
+		}
+	}
+
+	for (const FAirBox& Box : Gone)
+	{
+		RemoveAirBoxFromBuckets(Box);
+	}
+
+	for (const FAirBox& Box : Added)
+	{
+		AddAirBoxToBuckets(Box);
+	}
+
+	AirBoxes = MoveTemp(NewBoxes);
+
+	AirSummary = Landscapes == 0 ? TEXT("No landscapes") : FString::Printf(TEXT("%d landscapes, %d boxes of air; the largest, %d pieces, raises its air %d storeys and caps it %d cells past its edges"),
+		Landscapes, AirBoxes.Num(), Largest, GetMushroomStoreys(Largest), GetMushroomSpread(Largest));
+
+	if (!bRefreshLists || (Added.IsEmpty() && Gone.IsEmpty()))
+	{
+		return;
+	}
+
+	DropCandidatesIn(Added);
+
+	// Where a box has gone, what it held back may have come free - all but what a box in its place still holds, as when
+	// the air over a piece only rises or sinks, or a cap only widens.
+	TArray<FAirBox> Freed;
+
+	for (const FAirBox& Box : Gone)
+	{
+		bool bHandled = false;
+
+		for (const FAirBox& Other : Added)
+		{
+			if (Other.Min.X <= Box.Min.X && Other.Min.Y <= Box.Min.Y && Other.Min.Z <= Box.Min.Z
+				&& Other.Max.X >= Box.Max.X && Other.Max.Y >= Box.Max.Y && Other.Max.Z >= Box.Max.Z)
+			{
+				bHandled = true;
+				break;
+			}
+
+			// The same but along one axis: what lies past the new one along it.
+			int32 DifferingAxis = INDEX_NONE;
+			int32 Differing = 0;
+
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				if (Box.Min[Axis] != Other.Min[Axis] || Box.Max[Axis] != Other.Max[Axis])
+				{
+					DifferingAxis = Axis;
+					++Differing;
+				}
+			}
+
+			if (Differing == 1 && Box.Intersects(Other))
+			{
+				if (Box.Min[DifferingAxis] < Other.Min[DifferingAxis])
+				{
+					FAirBox Part = Box;
+					Part.Max[DifferingAxis] = Other.Min[DifferingAxis] - 1;
+					Freed.Add(Part);
+				}
+
+				if (Box.Max[DifferingAxis] > Other.Max[DifferingAxis])
+				{
+					FAirBox Part = Box;
+					Part.Min[DifferingAxis] = Other.Max[DifferingAxis] + 1;
+					Freed.Add(Part);
+				}
+
+				bHandled = true;
+				break;
+			}
+		}
+
+		if (!bHandled)
+		{
+			Freed.Add(Box);
+		}
+	}
+
+	FreeCandidatesIn(Freed);
 }
 
 void ARoomManager::RebuildAirLines()
@@ -3701,23 +4318,20 @@ void ARoomManager::RebuildAirLines()
 	}
 }
 
-void ARoomManager::SpawnAirPockets()
+bool ARoomManager::PlacePocket(FAirPocket& Pocket, FRandomStream& Stream, const double Spread, const int32 Ignore, const bool bKeepFirstPlace) const
 {
-	AirPockets.Reset();
-
 	const int32 CubeCells = ResolveGridSize();
 
-	// The first platform's place, which neither a mold nor a pocket may take. Its fill decides where it can go, so
-	// the structures are resolved first.
+	// The first platform's place, which neither a mold nor a pocket drawn at a clear may take. Its fill decides where it
+	// can go, so the structures have to be resolved already.
 	TArray<FGridPlatform> FirstCandidates;
 
-	if (AirPocketCount > 0 || MoldCount > 0)
+	if (bKeepFirstPlace)
 	{
-		ResolveUsableTiles();
 		GatherFirstPlatformCandidates(FirstCandidates);
 	}
 
-	auto TakesFirstPlace = [this, &FirstCandidates](const FAirPocket& Pocket)
+	auto TakesFirstPlace = [this, &FirstCandidates, &Pocket]()
 	{
 		return FirstCandidates.ContainsByPredicate([this, &Pocket](const FGridPlatform& First)
 		{
@@ -3734,40 +4348,338 @@ void ARoomManager::SpawnAirPockets()
 		});
 	};
 
-	// Whether a pocket's reach meets a mold's box: molds stay clear of each other, and pockets of molds.
-	auto MeetsMold = [this](const FAirPocket& Pocket)
+	// Whether its reach meets a mold's box: molds stay clear of each other, and pockets of molds.
+	auto MeetsMold = [this, &Pocket, Ignore]()
 	{
 		FVector Min, Max;
 		GetPocketBounds(Pocket, Min, Max);
 
-		return AirPockets.ContainsByPredicate([this, &Min, &Max](const FAirPocket& Other)
+		for (int32 Index = 0; Index < AirPockets.Num(); ++Index)
 		{
+			const FAirPocket& Other = AirPockets[Index];
+
+			if (Index == Ignore || !Other.bMold)
+			{
+				continue;
+			}
+
 			FVector OtherMin, OtherMax;
 			GetPocketBounds(Other, OtherMin, OtherMax);
 
-			return Other.bMold
-				&& Min.X <= OtherMax.X && OtherMin.X <= Max.X
+			if (Min.X <= OtherMax.X && OtherMin.X <= Max.X
 				&& Min.Y <= OtherMax.Y && OtherMin.Y <= Max.Y
-				&& Min.Z <= OtherMax.Z && OtherMin.Z <= Max.Z;
-		});
-	};
-
-	// Within Spread of the cube's middle - all of it at 1 - drawn again while it would take the first platform's place or
-	// meet a mold, and left out when every place drawn does.
-	auto Place = [&](FAirPocket& Pocket, FRandomStream& Stream, const double Spread)
-	{
-		for (int32 Attempt = 0; Attempt < MaxAirPocketPlaces; ++Attempt)
-		{
-			const FVector Offset(Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f));
-			Pocket.Centre = (FVector(1.0) + Offset * Spread) * (0.5 * static_cast<double>(CubeCells));
-
-			if (!TakesFirstPlace(Pocket) && !MeetsMold(Pocket))
+				&& Min.Z <= OtherMax.Z && OtherMin.Z <= Max.Z)
 			{
 				return true;
 			}
 		}
 
 		return false;
+	};
+
+	// Within Spread of the cube's middle - all of it at 1 - drawn again while it would take the first platform's place or
+	// meet a mold.
+	for (int32 Attempt = 0; Attempt < MaxAirPocketPlaces; ++Attempt)
+	{
+		const FVector Offset(Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f), Stream.FRandRange(-1.0f, 1.0f));
+		Pocket.Centre = (FVector(1.0) + Offset * Spread) * (0.5 * static_cast<double>(CubeCells));
+
+		if (!TakesFirstPlace() && !MeetsMold())
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+double ARoomManager::DrawPocketLife(FRandomStream& Stream) const
+{
+	// Lives drawn so that half of them are over by the half-life, and the rest go on breaking down at the same rate.
+	const double HalfLife = FMath::Max(PocketHalfLife, 1.0f);
+	const double Life = -HalfLife / FMath::Loge(2.0) * FMath::Loge(FMath::Max(1.0 - static_cast<double>(Stream.FRand()), UE_DOUBLE_SMALL_NUMBER));
+
+	return FMath::Max(Life, static_cast<double>(FMath::Max(MinPocketLife, 0.0f)));
+}
+
+void ARoomManager::CountPocketSlabKeys(const FAirPocket& Pocket, const int32 Slab, const int32 Delta)
+{
+	if (!Pocket.SlabEnds.IsValidIndex(Slab))
+	{
+		return;
+	}
+
+	const FIntVector Start = Slab > 0 ? Pocket.SlabEnds[Slab - 1] : FIntVector::ZeroValue;
+	const FIntVector End = Pocket.SlabEnds[Slab];
+
+	// A piece stays held back while another pocket still reaches it.
+	auto Tally = [Delta](TMap<uint64, int32>& Uses, const TArray<uint64>& Keys, const int32 From, const int32 To)
+	{
+		for (int32 Index = From; Index < To; ++Index)
+		{
+			int32& Reaching = Uses.FindOrAdd(Keys[Index]);
+			Reaching += Delta;
+
+			if (Reaching <= 0)
+			{
+				Uses.Remove(Keys[Index]);
+			}
+		}
+	};
+
+	Tally(PocketFaces, Pocket.FaceKeys, Start.X, End.X);
+	Tally(PocketEdges, Pocket.EdgeKeys, Start.Y, End.Y);
+	Tally(PocketNodes, Pocket.NodeKeys, Start.Z, End.Z);
+}
+
+void ARoomManager::AddPocketKeys(const FAirPocket& Pocket)
+{
+	for (int32 Slab = 0; Slab < Pocket.SlabEnds.Num(); ++Slab)
+	{
+		CountPocketSlabKeys(Pocket, Slab, 1);
+	}
+}
+
+void ARoomManager::RemovePocketKeys(const FAirPocket& Pocket)
+{
+	for (int32 Slab = 0; Slab < Pocket.SlabEnds.Num(); ++Slab)
+	{
+		CountPocketSlabKeys(Pocket, Slab, -1);
+	}
+}
+
+void ARoomManager::RebuildPocketKeys()
+{
+	PocketFaces.Reset();
+	PocketEdges.Reset();
+	PocketNodes.Reset();
+
+	// A move under way is finished where it was heading: every pocket is cut whole for the lattice as it now stands.
+	MovingPocket = INDEX_NONE;
+	bPocketForming = false;
+
+	for (FAirPocket& Pocket : AirPockets)
+	{
+		CutPocketPieces(Pocket);
+		AddPocketKeys(Pocket);
+	}
+}
+
+int32 ARoomManager::GetPocketSlabCount(const FAirPocket& Pocket) const
+{
+	const FAirBox Bounds = GetPocketCellBounds(Pocket);
+	const int32 Module = GetModule();
+
+	return Bounds.Max.Z / Module - Bounds.Min.Z / Module + 1;
+}
+
+ARoomManager::FAirBox ARoomManager::GetPocketSlabBox(const FAirPocket& Pocket, const int32 Slab) const
+{
+	// A slab is one band of the lattice along Z, from a node layer to the cell below the next: every piece's cells lie
+	// in exactly one, so a pocket cut a slab at a time cuts every piece once.
+	const FAirBox Bounds = GetPocketCellBounds(Pocket);
+	const int32 Module = GetModule();
+	const int32 Band = Bounds.Min.Z / Module + Slab;
+
+	FAirBox Box = Bounds;
+	Box.Min.Z = FMath::Max(Bounds.Min.Z, Band * Module);
+	Box.Max.Z = FMath::Min(Bounds.Max.Z, (Band + 1) * Module - 1);
+	return Box;
+}
+
+ARoomManager::FAirBox ARoomManager::GetPocketCellBounds(const FAirPocket& Pocket) const
+{
+	const int32 LastCell = ResolveGridSize() - 1;
+
+	FVector PocketMin, PocketMax;
+	GetPocketBounds(Pocket, PocketMin, PocketMax);
+
+	FAirBox Box;
+
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		Box.Min[Axis] = FMath::Clamp(FMath::FloorToInt32(PocketMin[Axis]), 0, LastCell);
+		Box.Max[Axis] = FMath::Clamp(FMath::CeilToInt32(PocketMax[Axis]), 0, LastCell);
+	}
+
+	return Box;
+}
+
+bool ARoomManager::IsInMoldBox(const FGridPlatform& Platform) const
+{
+	const FAirBox Box = GetPlatformBox(Platform);
+	const FVector Middle = 0.5 * FVector(Box.Min + Box.Max) + FVector(0.5);
+
+	return AirPockets.ContainsByPredicate([this, &Middle](const FAirPocket& Pocket)
+	{
+		if (!Pocket.bMold)
+		{
+			return false;
+		}
+
+		FVector Min, Max;
+		GetPocketBounds(Pocket, Min, Max);
+
+		return Middle.X >= Min.X && Middle.X <= Max.X
+			&& Middle.Y >= Min.Y && Middle.Y <= Max.Y
+			&& Middle.Z >= Min.Z && Middle.Z <= Max.Z;
+	});
+}
+
+void ARoomManager::StepPocketMove()
+{
+	if (!AirPockets.IsValidIndex(MovingPocket))
+	{
+		MovingPocket = INDEX_NONE;
+		return;
+	}
+
+	const int32 Index = MovingPocket;
+	FAirPocket& Pocket = AirPockets[Index];
+
+	if (!bPocketForming)
+	{
+		// Breaking down, from the top: one slab let go, and what it held back may come free.
+		if (!Pocket.SlabEnds.IsEmpty())
+		{
+			const int32 Slab = Pocket.SlabEnds.Num() - 1;
+			const FAirBox Region = GetPocketSlabBox(Pocket, Slab);
+			const FIntVector Start = Slab > 0 ? Pocket.SlabEnds[Slab - 1] : FIntVector::ZeroValue;
+
+			CountPocketSlabKeys(Pocket, Slab, -1);
+			Pocket.FaceKeys.SetNum(Start.X);
+			Pocket.EdgeKeys.SetNum(Start.Y);
+			Pocket.NodeKeys.SetNum(Start.Z);
+			Pocket.SlabEnds.Pop();
+
+			FreeCandidatesIn(MakeArrayView(&Region, 1));
+			return;
+		}
+
+		// Gone: drawn again somewhere else, the same shape and measures, from a stream of its own per pocket and draw so
+		// one moving leaves every other where it is - a pocket anywhere, a mold near the middle, clear of the molds. Where no
+		// place drawn is clear it forms again where it was.
+		++Pocket.Draw;
+		++PocketMoves;
+
+		FRandomStream Stream(static_cast<int32>(HashCombineFast(
+			HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("PocketMoves")))),
+			HashCombineFast(GetTypeHash(Index), GetTypeHash(Pocket.Draw)))));
+
+		const FVector WasCentre = Pocket.Centre;
+
+		if (!PlacePocket(Pocket, Stream, Pocket.bMold ? FMath::Clamp(MoldSpread, 0.0f, 1.0f) : 1.0, Index, /*bKeepFirstPlace=*/false))
+		{
+			Pocket.Centre = WasCentre;
+		}
+
+		Pocket.MoveAt = GetClock() + DrawPocketLife(Stream);
+		bPocketForming = true;
+
+		UpdateDeletionSummary();
+		RebuildAirLines();
+		return;
+	}
+
+	// Forming, from the bottom: one slab cut and held, and what is listed there drops out.
+	if (Pocket.SlabEnds.Num() < GetPocketSlabCount(Pocket))
+	{
+		const FAirBox Region = GetPocketSlabBox(Pocket, Pocket.SlabEnds.Num());
+
+		CutPocketSlab(Pocket);
+		CountPocketSlabKeys(Pocket, Pocket.SlabEnds.Num() - 1, 1);
+		DropCandidatesIn(MakeArrayView(&Region, 1));
+	}
+
+	if (Pocket.SlabEnds.Num() >= GetPocketSlabCount(Pocket))
+	{
+		MovingPocket = INDEX_NONE;
+		bPocketForming = false;
+	}
+}
+
+void ARoomManager::MovePocket(const int32 Index)
+{
+	if (!AirPockets.IsValidIndex(Index))
+	{
+		return;
+	}
+
+	// Any move under way first, then this one, every slab of it at once.
+	while (MovingPocket != INDEX_NONE)
+	{
+		StepPocketMove();
+	}
+
+	MovingPocket = Index;
+	bPocketForming = false;
+
+	while (MovingPocket != INDEX_NONE)
+	{
+		StepPocketMove();
+	}
+}
+
+void ARoomManager::MoveAirPockets()
+{
+	for (int32 Index = 0; Index < AirPockets.Num(); ++Index)
+	{
+		MovePocket(Index);
+	}
+}
+
+void ARoomManager::AdvancePockets(const double Now)
+{
+	// A move under way goes on a slab a tick, switched off or not, so nothing is left half formed.
+	if (MovingPocket != INDEX_NONE)
+	{
+		StepPocketMove();
+		return;
+	}
+
+	if (!bMovePockets)
+	{
+		return;
+	}
+
+	// One at a time, the longest due first.
+	int32 Due = INDEX_NONE;
+
+	for (int32 Index = 0; Index < AirPockets.Num(); ++Index)
+	{
+		if (AirPockets[Index].MoveAt <= Now && (Due == INDEX_NONE || AirPockets[Index].MoveAt < AirPockets[Due].MoveAt))
+		{
+			Due = Index;
+		}
+	}
+
+	if (Due != INDEX_NONE)
+	{
+		MovingPocket = Due;
+		bPocketForming = false;
+		StepPocketMove();
+	}
+}
+
+void ARoomManager::SpawnAirPockets()
+{
+	// The pockets drawn before go, and so does what they held back, a move under way with them.
+	AirPockets.Reset();
+	PocketFaces.Reset();
+	PocketEdges.Reset();
+	PocketNodes.Reset();
+	MovingPocket = INDEX_NONE;
+	bPocketForming = false;
+
+	// The first platform's place, which neither a mold nor a pocket may take, follows from the structures.
+	if (AirPocketCount > 0 || MoldCount > 0)
+	{
+		ResolveUsableTiles();
+	}
+
+	auto Place = [this](FAirPocket& Pocket, FRandomStream& Stream, const double Spread)
+	{
+		return PlacePocket(Pocket, Stream, Spread, INDEX_NONE, /*bKeepFirstPlace=*/true);
 	};
 
 	auto DrawByWeight = [](FRandomStream& Stream, const TConstArrayView<float> Weights)
@@ -3930,7 +4842,23 @@ void ARoomManager::SpawnAirPockets()
 		}
 	}
 
-	AirPocketSummary = FString::Printf(TEXT("%d pockets: %d sphere, %d box, %d rectangular, %d ziggurat, %d cylinder; %d left out"),
+	// Every one holds back what it reaches from now on, and lasts a life of its own before it moves - drawn from the
+	// stream it will move by, so how long it lasts takes nothing from the streams the cube is drawn from.
+	const double Now = GetClock();
+
+	for (int32 Index = 0; Index < AirPockets.Num(); ++Index)
+	{
+		FAirPocket& Pocket = AirPockets[Index];
+		AddPocketKeys(Pocket);
+
+		FRandomStream Stream(static_cast<int32>(HashCombineFast(
+			HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("PocketMoves")))),
+			HashCombineFast(GetTypeHash(Index), GetTypeHash(Pocket.Draw)))));
+
+		Pocket.MoveAt = Now + DrawPocketLife(Stream);
+	}
+
+	AirPocketSummary =FString::Printf(TEXT("%d pockets: %d sphere, %d box, %d rectangular, %d ziggurat, %d cylinder; %d left out"),
 		Counts[0] + Counts[1] + Counts[2] + Counts[3] + Counts[4], Counts[0], Counts[1], Counts[2], Counts[3], Counts[4], LeftOut);
 
 	MoldSummary = FString::Printf(TEXT("%d molds: %d ziggurat, %d cylinder, %d dome, %d tower, %d combination; %d left out"),
@@ -4235,26 +5163,24 @@ void ARoomManager::CutPocketPieces(FAirPocket& Pocket) const
 	Pocket.FaceKeys.Reset();
 	Pocket.EdgeKeys.Reset();
 	Pocket.NodeKeys.Reset();
+	Pocket.SlabEnds.Reset();
 
-	const int32 Module = GetModule();
-	const int32 LastCell = ResolveGridSize() - 1;
-
-	// Its reach, as far as the cube goes.
-	FVector PocketMin, PocketMax;
-	GetPocketBounds(Pocket, PocketMin, PocketMax);
-
-	FIntVector Min, Max;
-	for (int32 Axis = 0; Axis < 3; ++Axis)
+	for (int32 Slab = GetPocketSlabCount(Pocket); Slab > 0; --Slab)
 	{
-		Min[Axis] = FMath::Clamp(FMath::FloorToInt32(PocketMin[Axis]), 0, LastCell);
-		Max[Axis] = FMath::Clamp(FMath::CeilToInt32(PocketMax[Axis]), 0, LastCell);
+		CutPocketSlab(Pocket);
 	}
+}
 
-	// A piece is cut when any one of its cells lies inside: the inside of a module face, the run of a module edge,
-	// or the node itself. An edge can be visited from both planes it lies in; it is kept once.
+void ARoomManager::CutPocketSlab(FAirPocket& Pocket) const
+{
+	const int32 Module = GetModule();
+	const FAirBox Slab = GetPocketSlabBox(Pocket, Pocket.SlabEnds.Num());
+
+	// A piece is cut when any one of its cells lies inside: the inside of a module face, the run of a module edge, or the
+	// node itself. An edge can be visited from both planes it lies in; it is kept once.
 	TSet<uint64> Edges;
 
-	ForEachObstaclePiece(Min, Max, Module,
+	ForEachObstaclePiece(Slab.Min, Slab.Max, Module,
 		[&](const FIntVector& FaceMinNode, const int32 NormalAxis)
 		{
 			int32 U, V;
@@ -4291,7 +5217,8 @@ void ARoomManager::CutPocketPieces(FAirPocket& Pocket) const
 			}
 		});
 
-	Pocket.EdgeKeys = Edges.Array();
+	Pocket.EdgeKeys.Append(Edges.Array());
+	Pocket.SlabEnds.Add(FIntVector(Pocket.FaceKeys.Num(), Pocket.EdgeKeys.Num(), Pocket.NodeKeys.Num()));
 }
 
 void ARoomManager::RerollPaths()
@@ -4307,13 +5234,13 @@ void ARoomManager::RerollPaths()
 	RebuildPathLines();
 }
 
-double ARoomManager::GetPathClock() const
+double ARoomManager::GetClock() const
 {
 	const UWorld* World = GetWorld();
 	return World ? World->GetTimeSeconds() : 0.0;
 }
 
-void ARoomManager::StartPathClock()
+void ARoomManager::StartClock()
 {
 	UWorld* World = GetWorld();
 
@@ -4327,18 +5254,28 @@ void ARoomManager::StartPathClock()
 	Parameters.bLoop = true;
 	Parameters.bMaxOncePerFrame = true;
 
-	World->GetTimerManager().SetTimer(PathTimerHandle, this, &ARoomManager::AdvancePaths, PathClockSeconds, Parameters);
+	World->GetTimerManager().SetTimer(ClockTimerHandle, this, &ARoomManager::AdvanceClock, PathClockSeconds, Parameters);
 }
 
-void ARoomManager::AdvancePaths()
+void ARoomManager::AdvanceClock()
+{
+	const double Now = GetClock();
+
+	AdvancePaths(Now);
+	AdvancePockets(Now);
+	AdvanceDeletion(Now);
+
+	// A few of the platforms with no health left at a time, so however many a strike leaves, no frame takes them all.
+	RemoveDying(MaxRemovalsPerTick);
+}
+
+void ARoomManager::AdvancePaths(const double Now)
 {
 	// Switched off, or with no interval, the paths stay as they are and nothing is drawn or judged.
 	if (!bEnablePaths || PathRerollInterval <= 0.0f)
 	{
 		return;
 	}
-
-	const double Now = GetPathClock();
 
 	// The paths fall due one after another across the interval, so a tick draws a path or two afresh rather than
 	// all of them: what a redraw costs is the placements round one path, not round every path. The longest due
@@ -4682,7 +5619,7 @@ void ARoomManager::SpawnPaths()
 	const int32 Count = bEnablePaths ? FMath::Max(PathCount, 0) : 0;
 	AirPaths.SetNum(Count);
 
-	const double Now = GetPathClock();
+	const double Now = GetClock();
 	const double Interval = FMath::Max(PathRerollInterval, 0.0f);
 
 	for (int32 Index = 0; Index < Count; ++Index)
@@ -4763,7 +5700,7 @@ void ARoomManager::RedrawPath(const int32 Index)
 
 	// Only when it next moves is left to chance, not where it goes, so the wait comes from no stream of the run's.
 	const float Jitter = FMath::Clamp(PathRerollJitter, 0.0f, 1.0f);
-	Path.RedrawAt = GetPathClock() + FMath::Max(PathRerollInterval, 0.0f) * (1.0f + FMath::FRandRange(-Jitter, Jitter));
+	Path.RedrawAt = GetClock() + FMath::Max(PathRerollInterval, 0.0f) * (1.0f + FMath::FRandRange(-Jitter, Jitter));
 
 	UpdatePathSummary();
 	RebuildPathLines();
@@ -5389,8 +6326,7 @@ void ARoomManager::RebuildPlatformState()
 	ResolveUsableTiles();
 
 	// And the obstacles, which every placement below is held against as well. The air nature keeps open
-	// follows from the platforms, so it is laid again with them below.
-	AirBoxes.Reset();
+	// follows from the platforms, so it is worked out again once they are all in.
 	RebuildObstacleKeys();
 
 	++StructureRevision;
@@ -5404,6 +6340,7 @@ void ARoomManager::RebuildPlatformState()
 	ModuleFaceOwners.Reset();
 	ModuleEdgeUses.Reset();
 	RimCellNormals.Reset();
+	bHasRemovals = false;
 	PromotedFaces.Reset();
 	RimEdgeUsers.Reset();
 	BlockedEdges.Reset();
@@ -5433,7 +6370,9 @@ void ARoomManager::RebuildPlatformState()
 
 	for (const FGridPlatform& Platform : Platforms)
 	{
-		if (!IsPlatformOnGrid(Platform) || !IsSpaceFree(Platform))
+		// A platform standing on an edge that a platform listed before it blocks is kept: it stood there before the
+		// block came about - once what the blocker grew from was taken away - and RecordPlatform lifts it.
+		if (!IsPlatformOnGrid(Platform) || !IsSpaceFree(Platform, /*bIgnoreBlockedEdges=*/true))
 		{
 			++SkippedPlatforms;
 			continue;
@@ -5441,6 +6380,23 @@ void ARoomManager::RebuildPlatformState()
 
 		RecordPlatform(Platform);
 	}
+
+	// The air the fields keep open, from the fields that stand, and health for any platform that has none yet. Neither
+	// holds back what stands, so the order they come in leaves the platforms as they are. The air starts from nothing,
+	// since the cube its buckets were cut for may have changed.
+	AirBoxes.Reset();
+	AirBoxBuckets.Reset();
+	UpdateFieldAir(/*bRefreshLists=*/false);
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		if (!PlatformHealth.Contains(MakePlatformKey(Platform)))
+		{
+			GiveHealth(Platform);
+		}
+	}
+
+	UpdateZoneSummary();
 
 	// This runs on every edit and every check, so the warning is only given when what it would
 	// say has changed.
@@ -5564,7 +6520,6 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		bPlatformCandidatesStale = true;
 	}
 
-	const int32 AirBoxesBefore = AirBoxes.Num();
 	RecordPlatform(Platform);
 
 	++StructureRevision;
@@ -5591,6 +6546,10 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 	// worked through, since every promotion can open the surfaces beside it.
 	TArray<FGridSurfaceRef> PromotionQueue;
 
+	// Promoted surfaces this platform builds against. Growth held to the rules folds off no promoted run, but it can
+	// meet one at a node, and a platform standing where one was taken away can build against what has opened since.
+	TArray<FGridSurfaceRef> Demoted;
+
 	ForEachPlatformCell(Platform, SpanU, SpanV, [&](const FIntVector& Cell, const bool bRim)
 	{
 		// The platform's own two broad faces: new surfaces, or rim ones a neighbour already brought.
@@ -5604,6 +6563,23 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		{
 			PromotionQueue.Add(MakeSurfaceRef(Cell, FrontFace));
 			PromotionQueue.Add(MakeSurfaceRef(Cell, BackFace));
+
+			// A rim cell can carry other platforms' faces too, along the other axes, and its beam or post may only now
+			// be built - one every platform round it had blocked, now ending a beam of this one - which is when those
+			// faces first become surfaces at all.
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				if (Axis == NormalAxis)
+				{
+					continue;
+				}
+
+				for (const int32 Sign : { 1, -1 })
+				{
+					OutChangedSurfaces.Add(MakeSurfaceRef(Cell, MakeFace(Axis, Sign)));
+					PromotionQueue.Add(MakeSurfaceRef(Cell, MakeFace(Axis, Sign)));
+				}
+			}
 		}
 
 		// Every surface that looks into this cell is now built against.
@@ -5617,13 +6593,47 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 				if ((GetCellSurfaceAxes(Neighbour, NeighbourOwner) & AxisBit(Axis)) != 0)
 				{
 					OutChangedSurfaces.Add(MakeSurfaceRef(Neighbour, MakeFace(Axis, -Sign)));
+
+					if (PromotedFaces.Remove(MakeFaceKey(Neighbour, MakeFace(Axis, -Sign))) > 0)
+					{
+						Demoted.Add(MakeSurfaceRef(Neighbour, MakeFace(Axis, -Sign)));
+					}
 				}
 			}
 		}
 	});
 
+	// A surface built against is promoted no more, and nor is whatever promotion hung on it: every promoted surface
+	// joined to it, in its own plane and on its own side, is let go, and worked out again below with the rest wherever
+	// the rule still holds.
+	for (int32 Index = 0; Index < Demoted.Num(); ++Index)
+	{
+		const FGridSurfaceRef Surface = Demoted[Index];
+
+		for (int32 InPlaneAxis = 0; InPlaneAxis < 3; ++InPlaneAxis)
+		{
+			if (InPlaneAxis == FaceAxis(Surface.Face))
+			{
+				continue;
+			}
+
+			for (const int32 Sign : { 1, -1 })
+			{
+				const FIntVector Beside = Surface.Cell + AxisStep(InPlaneAxis, Sign);
+
+				if (PromotedFaces.Remove(MakeFaceKey(Beside, Surface.Face)) > 0)
+				{
+					Demoted.Add(MakeSurfaceRef(Beside, Surface.Face));
+				}
+			}
+		}
+	}
+
+	OutChangedSurfaces.Append(Demoted);
+	PromotionQueue.Append(Demoted);
+
 	// The same rule the rebuild sweeps to a fixpoint, worked outward from this platform instead.
-	// A surface once promoted stays promoted as the structure grows - that is what lets the
+	// Otherwise a surface once promoted stays promoted as the structure grows - that is what lets the
 	// promotions already standing be kept - so only a surface next to one that has just opened
 	// can newly qualify, and each promotion queues its neighbours in its own plane and side.
 	TArray<FGridSurfaceRef> PromotedSurfaces;
@@ -5668,6 +6678,13 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 
 	JournalSurfaceChanges(OutChangedSurfaces);
 
+	// Ground and water keep the air above them open from the moment they are laid, and a piece can grow its landscape's
+	// mushroom, so the air is worked out again - the lists with it, unless they are about to be gathered afresh.
+	if (IsFieldPiece(Platform))
+	{
+		UpdateFieldAir(/*bRefreshLists=*/!bPlatformCandidatesStale);
+	}
+
 	if (bPlatformCandidatesStale)
 	{
 		return;
@@ -5681,6 +6698,9 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 	TArray<FLatticeEdge> ChangedEdges;
 	TSet<uint64> ChangedEdgeKeys;
 	TSet<uint64> NewRimEdgeKeys;
+
+	// A run let go and not promoted again offers a fold once more, so a placement folding off it may have come free.
+	TSet<uint64> OpenedRunKeys;
 
 	auto AddChangedEdge = [&ChangedEdges, &ChangedEdgeKeys](const FLatticeEdge& Edge)
 	{
@@ -5712,33 +6732,38 @@ void ARoomManager::AddPlacedPlatform(const FGridPlatform& Platform, TArray<FGrid
 		}
 	}
 
+	for (const FGridSurfaceRef& Surface : Demoted)
+	{
+		FLatticeEdge Edge;
+		if (!PromotedFaces.Contains(MakeFaceKey(Surface.Cell, Surface.Face)) && GetRunEdge(Surface.Cell, Module, Edge))
+		{
+			AddChangedEdge(Edge);
+			OpenedRunKeys.Add(MakeEdgeKey(Edge));
+		}
+	}
+
 	// Everything else a placement asks for only ever closes as the structure grows, so a placement
 	// not yet listed can only have come free by coming to share a module edge of rim with this
-	// platform - and only those are judged, along with every listed one. This platform's own
-	// placement is among the listed, and drops out here too.
+	// platform, or by folding off a run let go - and only those are judged, along with every listed
+	// one. This platform's own placement is among the listed, and drops out here too.
 	TArray<TSet<uint64>> Judged;
 	Judged.SetNum(TileCandidates.Num());
 
 	for (const FLatticeEdge& Edge : ChangedEdges)
 	{
-		const bool bNewRim = NewRimEdgeKeys.Contains(MakeEdgeKey(Edge));
+		const uint64 EdgeKey = MakeEdgeKey(Edge);
+		const bool bMayOpen = NewRimEdgeKeys.Contains(EdgeKey) || OpenedRunKeys.Contains(EdgeKey);
 
 		ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/false,
 			[&](const int32 TileIndex, const FGridPlatform& Candidate, const bool bOnRim)
 		{
 			const uint64 Key = MakeCandidateKey(Candidate);
 
-			if (!Judged[TileIndex].Contains(Key) && RefreshPlatformCandidate(TileIndex, Candidate, bNewRim && bOnRim))
+			if (!Judged[TileIndex].Contains(Key) && RefreshPlatformCandidate(TileIndex, Candidate, bMayOpen && bOnRim))
 			{
 				Judged[TileIndex].Add(Key);
 			}
 		});
-	}
-
-	// Air it keeps open only takes room away, from anything listed that reaches into it.
-	for (int32 BoxIndex = AirBoxesBefore; BoxIndex < AirBoxes.Num(); ++BoxIndex)
-	{
-		DropCandidatesCutBy(AirBoxes[BoxIndex].Min, AirBoxes[BoxIndex].Max);
 	}
 }
 
@@ -5771,6 +6796,23 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
 		const uint64 EdgeKey = MakeEdgeKey(Edge);
+
+		// A floor or ceiling blocks a beam only while it is the one platform using it. While growth only adds, the only
+		// platform ever to take a blocked beam in after it is the next panel of its own fence run, which leaves it
+		// blocked; anything else standing there - as a platform can, once what the blocker grew from has been taken
+		// away - lifts the block. A wall's block on its top holds whatever uses the beam.
+		if (bRim)
+		{
+			if (const int32* Blocker = BlockedEdges.Find(EdgeKey))
+			{
+				const FGridPlatform& Blocking = BuiltPlatforms[*Blocker];
+
+				if (*Blocker != PlatformIndex && !Blocking.IsWall() && !IsRunContinuation(Platform, Blocking))
+				{
+					BlockedEdges.Remove(EdgeKey);
+				}
+			}
+		}
 
 		if (bRim && bBlocks)
 		{
@@ -5818,20 +6860,6 @@ void ARoomManager::RecordPlatform(const FGridPlatform& Platform)
 		GroundCount = NatureIndices[static_cast<int32>(ENatureForm::Ground)].Num();
 		CliffCount = NatureIndices[static_cast<int32>(ENatureForm::Cliff)].Num();
 		WaterCount = NatureIndices[static_cast<int32>(ENatureForm::Water)].Num();
-	}
-
-	// Ground and water keep the air above them open from the moment they are taken in, judged against the
-	// fields taken in before them, so the rebuild keeps the same air the placements did.
-	if (IsFieldPiece(Platform))
-	{
-		TArray<FAirBox> Boxes;
-		GatherAirBoxes(Platform, PlatformIndex, GetAirHeight(Platform), Boxes);
-
-		for (const FAirBox& Box : Boxes)
-		{
-			AirBoxes.Add(Box);
-			AddObstacleKeys(Box.Min, Box.Max);
-		}
 	}
 }
 
@@ -5939,6 +6967,8 @@ void ARoomManager::VerifyIncrementalState()
 	const TArray<FFaceFill> IncrementalFaceFills = FaceFills;
 	const TArray<int32> IncrementalPatchLabels = GetPatchLabels();
 	const int32 IncrementalStructureRevision = StructureRevision;
+	const TArray<FAirBox> IncrementalAirBoxes = AirBoxes;
+	const bool bHadRemovals = bHasRemovals;
 
 	// The record of changed surfaces belongs with the revision, and goes back with it below.
 	TArray<FGridSurfaceRef> IncrementalJournal = MoveTemp(SurfaceJournal);
@@ -6008,10 +7038,10 @@ void ARoomManager::VerifyIncrementalState()
 		const FFaceFill& Incremental = IncrementalFaceFills[Index];
 		const FFaceFill& Rebuilt = FaceFills[Index];
 
+		// A removal leaves the streaks and patches as they were, so after one only what fills each face is asked.
 		DifferentFills += Incremental.Structure == Rebuilt.Structure
 			&& Incremental.Categories == Rebuilt.Categories
-			&& Incremental.Streaks == Rebuilt.Streaks
-			&& Incremental.PatchNodes == Rebuilt.PatchNodes ? 0 : 1;
+			&& (bHadRemovals || (Incremental.Streaks == Rebuilt.Streaks && Incremental.PatchNodes == Rebuilt.PatchNodes)) ? 0 : 1;
 	}
 
 	if (DifferentFills > 0)
@@ -6019,9 +7049,37 @@ void ARoomManager::VerifyIncrementalState()
 		Mismatches.Add(FString::Printf(TEXT("face fills: %d differ"), DifferentFills));
 	}
 
-	if (IncrementalPatchLabels != GetPatchLabels())
+	if (!bHadRemovals && IncrementalPatchLabels != GetPatchLabels())
 	{
 		Mismatches.Add(TEXT("category patches differ"));
+	}
+
+	// The air over the fields, box for box, whatever order the changes came in.
+	{
+		TMap<FAirBox, int32> Counts;
+
+		for (const FAirBox& Box : IncrementalAirBoxes)
+		{
+			++Counts.FindOrAdd(Box);
+		}
+
+		int32 DifferentBoxes = 0;
+
+		for (const FAirBox& Box : AirBoxes)
+		{
+			int32* Count = Counts.Find(Box);
+			DifferentBoxes += Count && (*Count)-- > 0 ? 0 : 1;
+		}
+
+		for (const TPair<FAirBox, int32>& Left : Counts)
+		{
+			DifferentBoxes += FMath::Max(Left.Value, 0);
+		}
+
+		if (DifferentBoxes > 0)
+		{
+			Mismatches.Add(FString::Printf(TEXT("air over the fields: %d boxes differ"), DifferentBoxes));
+		}
 	}
 
 	// Compared in order, since the order is what the placement stream draws from.
@@ -6386,21 +7444,10 @@ void ARoomManager::RebuildObstacleKeys()
 
 	const int32 Module = GetModule();
 
+	// The air held back - pockets, molds, paths and the air over the fields - is kept apart, since what stands in it stays.
 	for (const FGridObstacle& Obstacle : Obstacles)
 	{
 		AddObstacleKeys(Obstacle.MinCell, Obstacle.MaxCell);
-	}
-
-	for (const FAirBox& Box : AirBoxes)
-	{
-		AddObstacleKeys(Box.Min, Box.Max);
-	}
-
-	for (const FAirPocket& Pocket : AirPockets)
-	{
-		ObstacleFaces.Append(Pocket.FaceKeys);
-		ObstacleEdges.Append(Pocket.EdgeKeys);
-		ObstacleNodes.Append(Pocket.NodeKeys);
 	}
 }
 
@@ -6774,7 +7821,7 @@ int32 ARoomManager::SyncPieces()
 
 		if (!Pieces.Structures.Contains(Layer.Structure.Get()))
 		{
-			ResetChunks(Layer.Pieces.Chunks, nullptr);
+			ResetPieceLayer(Layer.Pieces, nullptr);
 			StructureLayers.RemoveAt(LayerIndex);
 		}
 	}
@@ -6823,7 +7870,7 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 	auto AppendToLayer = [](
 		FRoomPieceLayer& Layer,
 		const TConstArrayView<FPlacedPiece> LayerPieces,
-		TArray<FTransform>& OutNewPieces)
+		TArray<FPlacedPiece>& OutNewPieces)
 	{
 		for (const FPlacedPiece& Piece : LayerPieces)
 		{
@@ -6834,7 +7881,7 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 			if (Stamp == 0)
 			{
 				Stamp = Layer.SyncStamp;
-				OutNewPieces.Add(Piece.Transform);
+				OutNewPieces.Add(Piece);
 			}
 		}
 	};
@@ -6847,7 +7894,7 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 	{
 		ApplyMeshAndMaterial(Layer.Chunks, PieceMesh, Material);
 
-		TArray<FTransform> NewPieces;
+		TArray<FPlacedPiece> NewPieces;
 		AppendToLayer(Layer, LayerPieces, NewPieces);
 		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
 	};
@@ -6867,7 +7914,7 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 		ResolveStructureLayerLook(Layer, Mesh, Material);
 		ApplyMeshAndMaterial(Layer.Pieces.Chunks, Mesh, Material);
 
-		TArray<FTransform> NewPieces;
+		TArray<FPlacedPiece> NewPieces;
 		AppendToLayer(Layer.Pieces, StructurePieces.Value, NewPieces);
 		AddPiecesToLayer(Layer.Pieces, Layer.Pieces.Chunks[0], NewPieces);
 	}
@@ -6985,8 +8032,7 @@ FStructureLayer& ARoomManager::FindOrAddStructureLayer(UPlatformStructureData* S
 	// lost there is nothing of the layer worth keeping: it starts again.
 	if (Layer->Pieces.Chunks.IsEmpty() || !IsValid(Layer->Pieces.Chunks[0]))
 	{
-		ResetChunks(Layer->Pieces.Chunks, nullptr);
-		Layer->Pieces.PieceStamps.Reset();
+		ResetPieceLayer(Layer->Pieces, nullptr);
 
 		// A stamp of zero means "not drawn yet", so the layer's own has to start above it.
 		Layer->Pieces.SyncStamp = FMath::Max<uint32>(Layer->Pieces.SyncStamp, 1);
@@ -7019,7 +8065,7 @@ void ARoomManager::ResetStructureLayers()
 {
 	for (FStructureLayer& Layer : StructureLayers)
 	{
-		ResetChunks(Layer.Pieces.Chunks, nullptr);
+		ResetPieceLayer(Layer.Pieces, nullptr);
 	}
 
 	StructureLayers.Reset();
@@ -7047,49 +8093,51 @@ int32 ARoomManager::SyncPieceLayer(
 
 	ApplyMeshAndMaterial(Layer.Chunks, Mesh, Material);
 
-	TArray<FTransform> NewPieces;
+	TArray<FPlacedPiece> NewPieces;
 
-	// Marks every piece still wanted and collects the ones not drawn yet. Returns false if a
-	// piece that was drawn is no longer wanted.
-	auto WalkPieces = [&Layer, &Pieces, &NewPieces]() -> bool
+	// Marks every piece still wanted and collects the ones not drawn yet.
+	++Layer.SyncStamp;
+
+	for (const FPlacedPiece& Piece : Pieces)
 	{
-		++Layer.SyncStamp;
-		int32 WantedPieces = 0;
+		uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
 
-		for (const FPlacedPiece& Piece : Pieces)
+		// Named once however often it is named.
+		if (Stamp == Layer.SyncStamp)
 		{
-			uint32& Stamp = Layer.PieceStamps.FindOrAdd(Piece.Key);
-
-			// Counted once however often it is named, so the tally below stays honest.
-			if (Stamp == Layer.SyncStamp)
-			{
-				continue;
-			}
-
-			if (Stamp == 0)
-			{
-				NewPieces.Add(Piece.Transform);
-			}
-
-			Stamp = Layer.SyncStamp;
-			++WantedPieces;
+			continue;
 		}
 
-		return WantedPieces == Layer.PieceStamps.Num();
-	};
+		if (Stamp == 0)
+		{
+			NewPieces.Add(Piece);
+		}
 
-	// Growth only ever adds pieces, so this fails only when something took the structure back -
-	// and then the whole layer is drawn again rather than picked apart.
-	if (!WalkPieces())
+		Stamp = Layer.SyncStamp;
+	}
+
+	// A piece drawn but no longer wanted - its platform taken away - is taken out on its own.
+	TArray<uint64> StalePieces;
+
+	for (const TPair<uint64, uint32>& Drawn : Layer.PieceStamps)
 	{
-		ResetPieceLayer(Layer, FirstChunk);
-		NewPieces.Reset();
-		WalkPieces();
+		if (Drawn.Value != Layer.SyncStamp)
+		{
+			StalePieces.Add(Drawn.Key);
+		}
+	}
+
+	for (const uint64 Key : StalePieces)
+	{
+		if (!RemovePieceFromLayer(Layer, Key))
+		{
+			Layer.PieceStamps.Remove(Key);
+		}
 	}
 
 	AddPiecesToLayer(Layer, FirstChunk, NewPieces);
 
-	return NewPieces.Num();
+	return NewPieces.Num() + StalePieces.Num();
 }
 
 bool ARoomManager::IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInstancedStaticMeshComponent* FirstChunk) const
@@ -7101,9 +8149,12 @@ bool ARoomManager::IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInsta
 
 	int32 DrawnPieces = 0;
 
-	for (const UInstancedStaticMeshComponent* Chunk : Layer.Chunks)
+	for (int32 ChunkIndex = 0; ChunkIndex < Layer.Chunks.Num(); ++ChunkIndex)
 	{
-		if (!IsValid(Chunk))
+		const UInstancedStaticMeshComponent* Chunk = Layer.Chunks[ChunkIndex];
+
+		// Every chunk holds exactly the pieces its record names, in the same number.
+		if (!IsValid(Chunk) || Chunk->GetInstanceCount() != (Layer.ChunkKeys.IsValidIndex(ChunkIndex) ? Layer.ChunkKeys[ChunkIndex].Num() : 0))
 		{
 			return false;
 		}
@@ -7111,35 +8162,52 @@ bool ARoomManager::IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInsta
 		DrawnPieces += Chunk->GetInstanceCount();
 	}
 
-	return DrawnPieces == Layer.PieceStamps.Num();
+	return DrawnPieces == Layer.PieceStamps.Num() && DrawnPieces == Layer.PieceSlots.Num();
 }
 
 void ARoomManager::AddPiecesToLayer(
 	FRoomPieceLayer& Layer,
 	UInstancedStaticMeshComponent* FirstChunk,
-	const TConstArrayView<FTransform> NewPieces)
+	const TConstArrayView<FPlacedPiece> NewPieces)
 {
+	// A chunk made with the layer has no record of its own yet.
+	Layer.ChunkKeys.SetNum(Layer.Chunks.Num());
+
 	// New pieces go into the chunk still being filled, and a fresh chunk is started once that
 	// one is full. Those are the only components whose instance count changes, so they are the
 	// only ones whose surface cache Lumen has to capture again.
 	for (int32 NextPiece = 0; NextPiece < NewPieces.Num();)
 	{
-		UInstancedStaticMeshComponent* OpenChunk = Layer.Chunks.Last();
+		int32 ChunkIndex = Layer.Chunks.Num() - 1;
+		UInstancedStaticMeshComponent* OpenChunk = Layer.Chunks[ChunkIndex];
 		int32 Room = PieceChunkCapacity - OpenChunk->GetInstanceCount();
 
 		if (Room <= 0)
 		{
-			OpenChunk = AddInstancedChunk(Layer.Chunks, FirstChunk);
+			OpenChunk = AddInstancedChunk(Layer.Chunks, FirstChunk ? FirstChunk : Layer.Chunks[0].Get());
+			Layer.ChunkKeys.AddDefaulted();
+			++ChunkIndex;
 			Room = PieceChunkCapacity;
 		}
 
 		const int32 Count = FMath::Min(Room, NewPieces.Num() - NextPiece);
+		TArray<uint64>& Keys = Layer.ChunkKeys[ChunkIndex];
+		const int32 FirstInstance = Keys.Num();
+
+		TArray<FTransform> Transforms;
+		Transforms.Reserve(Count);
+
+		for (int32 Offset = 0; Offset < Count; ++Offset)
+		{
+			const FPlacedPiece& Piece = NewPieces[NextPiece + Offset];
+			Transforms.Add(Piece.Transform);
+			Keys.Add(Piece.Key);
+			Layer.PieceSlots.Add(Piece.Key, FIntPoint(ChunkIndex, FirstInstance + Offset));
+		}
 
 		// One batch per chunk: one instance at a time would redo the component's bookkeeping
 		// for every instance.
-		OpenChunk->AddInstances(
-			TArray<FTransform>(NewPieces.GetData() + NextPiece, Count),
-			/*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+		OpenChunk->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
 
 		NextPiece += Count;
 	}
@@ -7149,6 +8217,50 @@ void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshC
 {
 	ResetChunks(Layer.Chunks, FirstChunk);
 	Layer.PieceStamps.Reset();
+	Layer.PieceSlots.Reset();
+	Layer.ChunkKeys.Reset();
+	Layer.ChunkKeys.SetNum(Layer.Chunks.Num());
+}
+
+bool ARoomManager::RemovePieceFromLayer(FRoomPieceLayer& Layer, const uint64 Key)
+{
+	FIntPoint Slot;
+
+	if (!Layer.PieceSlots.RemoveAndCopyValue(Key, Slot))
+	{
+		return false;
+	}
+
+	Layer.PieceStamps.Remove(Key);
+
+	const int32 Chunk = Slot.X;
+	const int32 Instance = Slot.Y;
+
+	if (!Layer.Chunks.IsValidIndex(Chunk) || !IsValid(Layer.Chunks[Chunk])
+		|| !Layer.ChunkKeys.IsValidIndex(Chunk) || !Layer.ChunkKeys[Chunk].IsValidIndex(Instance))
+	{
+		return true;
+	}
+
+	UInstancedStaticMeshComponent* Component = Layer.Chunks[Chunk];
+	TArray<uint64>& Keys = Layer.ChunkKeys[Chunk];
+	const int32 Last = Keys.Num() - 1;
+
+	// As the overlay's squares are taken out: the chunk's last piece is moved into the hole first, so no other piece
+	// changes index and the record needs one fix-up at most.
+	if (Instance != Last)
+	{
+		FTransform LastTransform;
+		Component->GetInstanceTransform(Last, LastTransform, /*bWorldSpace=*/true);
+		Component->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true);
+
+		Keys[Instance] = Keys[Last];
+		Layer.PieceSlots.FindChecked(Keys[Instance]).Y = Instance;
+	}
+
+	Component->RemoveInstance(Last);
+	Keys.Pop(EAllowShrinking::No);
+	return true;
 }
 
 void ARoomManager::ResetChunks(
@@ -7220,15 +8332,23 @@ void ARoomManager::RebuildDebugGrid()
 	// instead: a line batcher hands every line to the renderer again each frame and is rebuilt
 	// whole whenever one line changes, which a growing structure's worth of surfaces made the
 	// costliest thing in a run.
-	if (!bShowDebugGrid)
+	TArray<FBatchedLine> Lines;
+
+	if (bShowDebugGrid)
 	{
-		return;
+		AppendLatticeLines(Lines);
 	}
 
-	TArray<FBatchedLine> Lines;
-	AppendLatticeLines(Lines);
+	// The zones are drawn on their own switch, off by default.
+	if (bShowZones)
+	{
+		AppendZoneLines(Lines);
+	}
 
-	GridLineBatcher->DrawLines(Lines);
+	if (!Lines.IsEmpty())
+	{
+		GridLineBatcher->DrawLines(Lines);
+	}
 }
 
 void ARoomManager::AppendLatticeLines(TArray<FBatchedLine>& Lines) const
@@ -7633,17 +8753,1195 @@ void ARoomManager::UpdateSurfaceMarks(const TConstArrayView<FGridSurfaceRef> Sur
 	// A surface can be named more than once; after the first it is already the right colour.
 	for (const FGridSurfaceRef& Surface : Surfaces)
 	{
-		// A side its structure closes off is no surface, and never has a square.
+		// A side its structure closes off is no surface, and never has a square; nor has one whose platform has been
+		// taken away, and its square goes.
 		const int32 Layer = ResolveSurfaceMarkLayer(Surface.Cell, Surface.Face);
+		const uint64 Key = MakeFaceKey(Surface.Cell, Surface.Face);
 
 		if (Layer == INDEX_NONE)
 		{
+			FSurfaceMarkSlot Gone;
+
+			if (SurfaceMarkSlots.RemoveAndCopyValue(Key, Gone) && Gone.Instance != INDEX_NONE)
+			{
+				RemoveSurfaceMark(Gone.Layer, Gone.Chunk, Gone.Instance);
+			}
+
 			continue;
 		}
 
-		const uint64 Key = MakeFaceKey(Surface.Cell, Surface.Face);
 		SyncSurfaceMark(Surface.Cell, Surface.Face, Key, Layer, SurfaceMarkSlots.FindOrAdd(Key), Pending);
 	}
 
 	AddPendingSurfaceMarks(Pending);
+}
+
+int32 ARoomManager::GetZoneLine(const int32 Line) const
+{
+	// On lattice lines, a third of the modules apart, so a border never runs through a module face.
+	const int32 Module = GetModule();
+	const int32 Modules = (ResolveGridSize() - 1) / Module;
+
+	return FMath::RoundToInt32(static_cast<double>(Modules) * Line / ZonesPerSide) * Module;
+}
+
+int32 ARoomManager::GetZoneOf(const FGridPlatform& Platform) const
+{
+	// Its middle, doubled so a middle between two cells stays whole, against the borders doubled likewise.
+	const FAirBox Box = GetPlatformBox(Platform);
+
+	int32 Zone = 0;
+	int32 Stride = 1;
+
+	for (const int32 Axis : { 0, 1 })
+	{
+		const int32 TwiceMiddle = Box.Min[Axis] + Box.Max[Axis];
+		int32 Index = 0;
+
+		while (Index < ZonesPerSide - 1 && TwiceMiddle >= 2 * GetZoneLine(Index + 1))
+		{
+			++Index;
+		}
+
+		Zone += Index * Stride;
+		Stride *= ZonesPerSide;
+	}
+
+	return Zone;
+}
+
+ARoomManager::FAirBox ARoomManager::GetZoneBox(const int32 Zone) const
+{
+	const int32 Column = Zone % ZonesPerSide;
+	const int32 Row = Zone / ZonesPerSide;
+
+	FAirBox Box;
+	Box.Min = FIntVector(GetZoneLine(Column), GetZoneLine(Row), 0);
+	Box.Max = FIntVector(GetZoneLine(Column + 1), GetZoneLine(Row + 1), ResolveGridSize() - 1);
+	return Box;
+}
+
+void ARoomManager::AppendZoneLines(TArray<FBatchedLine>& Lines) const
+{
+	// A quarter of a cell inside its borders, so the lines of two zones side by side never lie on each other.
+	const FVector Inset(0.25 * CellSize);
+
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		const FAirBox Box = GetZoneBox(Zone);
+		const FVector Min = GetCellMinCorner(Box.Min) + Inset;
+		const FVector Max = GetCellMinCorner(Box.Max) + FVector(CellSize) - Inset;
+		const FLinearColor Color(ZoneColors.IsValidIndex(Zone) ? ZoneColors[Zone] : DefaultZoneColors[Zone]);
+
+		AppendBoxLines(Lines, Min, Max, Color, BoundaryLineThickness, SDPG_World, /*bWithDiagonals=*/false);
+
+		// A cross over its floor and its roof, so each zone's colour reads from above and below as well as from the side.
+		for (const double Z : { Min.Z, Max.Z })
+		{
+			Lines.Emplace(FVector(Min.X, Min.Y, Z), FVector(Max.X, Max.Y, Z), Color, /*LifeTime=*/0.0f, BoundaryLineThickness, SDPG_World);
+			Lines.Emplace(FVector(Max.X, Min.Y, Z), FVector(Min.X, Max.Y, Z), Color, /*LifeTime=*/0.0f, BoundaryLineThickness, SDPG_World);
+		}
+	}
+}
+
+void ARoomManager::UpdateZoneSummary()
+{
+	int32 Counts[ZoneCount] = {};
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		++Counts[GetZoneOf(Platform)];
+	}
+
+	TArray<FString> Parts;
+
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		Parts.Add(FString::Printf(TEXT("%d"), Counts[Zone]));
+	}
+
+	ZoneSummary = FString::Join(Parts, TEXT(", "));
+}
+
+void ARoomManager::QueueSeeds()
+{
+	SeedQueue.Reset();
+
+	if (!bSeedEveryZone)
+	{
+		return;
+	}
+
+	// The middle zone's first tile is the first platform, laid as it always was; every other zone waits for its own.
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		if (Zone != MiddleZone)
+		{
+			SeedQueue.Add(Zone);
+		}
+	}
+}
+
+bool ARoomManager::PlaceSeed(const int32 Zone)
+{
+	// A first tile is always laid flat, so one kept to walls starts nothing.
+	if (!IsTileUsable(FirstTile) || !FirstTile->AllowsOrientation(/*bVertical=*/false))
+	{
+		return false;
+	}
+
+	// In step with the middle one: whole tiles away from it across the cube, and whole shorter sides up or down, so the
+	// growth of the two lines up where it meets.
+	FIntVector Phase = FIntVector::ZeroValue;
+
+	if (SeedPhase.IsSet())
+	{
+		Phase = SeedPhase.GetValue();
+	}
+	else
+	{
+		TArray<FGridPlatform> FirstCandidates;
+		GatherFirstPlatformCandidates(FirstCandidates);
+		Phase = FirstCandidates.IsEmpty() ? FIntVector::ZeroValue : FirstCandidates[0].MinNode;
+	}
+
+	const int32 StepX = FirstTile->Width;
+	const int32 StepY = FirstTile->Length;
+	const int32 StepZ = FMath::Min(FirstTile->Width, FirstTile->Length);
+	const int32 LastNode = ResolveGridSize() - 1;
+	const FAirBox ZoneBox = GetZoneBox(Zone);
+
+	// Along one axis, every place on the steps from PhaseAt between Lowest and Highest.
+	auto GetPlaces = [](const int32 PhaseAt, const int32 Step, const int32 Lowest, const int32 Highest)
+	{
+		TArray<int32> Places;
+
+		for (int32 At = PhaseAt + FMath::CeilToInt32(static_cast<double>(Lowest - PhaseAt) / Step) * Step; At <= Highest; At += Step)
+		{
+			Places.Add(At);
+		}
+
+		return Places;
+	};
+
+	// The whole tile inside its zone, at any height in the cube.
+	const TArray<int32> PlacesX = GetPlaces(Phase.X, StepX, ZoneBox.Min.X, ZoneBox.Max.X - StepX);
+	const TArray<int32> PlacesY = GetPlaces(Phase.Y, StepY, ZoneBox.Min.Y, ZoneBox.Max.Y - StepY);
+	const TArray<int32> PlacesZ = GetPlaces(Phase.Z, StepZ, 0, LastNode);
+
+	if (PlacesX.IsEmpty() || PlacesY.IsEmpty() || PlacesZ.IsEmpty())
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+
+	for (int32 Attempt = 0; Attempt < MaxSeedPlaces; ++Attempt)
+	{
+		FGridPlatform Seed = MakePlatform(
+			FIntVector(PlacesX[SeedStream.RandRange(0, PlacesX.Num() - 1)], PlacesY[SeedStream.RandRange(0, PlacesY.Num() - 1)], PlacesZ[SeedStream.RandRange(0, PlacesZ.Num() - 1)]),
+			AxisIndex(EGridAxis::Z), FirstTile, /*bTurned=*/false);
+
+		if (!IsPlatformOnGrid(Seed) || !IsSpaceFree(Seed) || !IsClearOfHeldAir(Seed))
+		{
+			continue;
+		}
+
+		// Clear of everything standing, so it starts growth of its own.
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Seed, SpanU, SpanV);
+
+		bool bTouches = false;
+
+		ForEachModuleEdge(Seed, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
+		{
+			bTouches = bTouches || ModuleEdgeUses.Contains(MakeEdgeKey(Edge));
+		});
+
+		// It holds up whatever grows off it, as the middle one does.
+		if (bTouches || !DrawFill(Seed, /*bLoadBearingOnly=*/true))
+		{
+			continue;
+		}
+
+		PlacePlatform(Seed, /*JoinedSide=*/0);
+		return true;
+	}
+
+	return false;
+}
+
+void ARoomManager::GiveHealth(const FGridPlatform& Platform)
+{
+	PlatformHealth.Add(MakePlatformKey(Platform), DamageStream.FRandRange(MinHealth, FMath::Max(MaxHealth, MinHealth)));
+}
+
+bool ARoomManager::IsVulnerable(const FGridPlatform& Platform) const
+{
+	return !IsClearOfHeldAir(Platform);
+}
+
+void ARoomManager::Strike()
+{
+	++StrikeCount;
+
+	const float Chance = FMath::Clamp(StrikeFraction, 0.0f, 1.0f);
+	const float Least = FMath::Max(MinDamage, 0.0f);
+	const float Most = FMath::Max(MaxDamage, Least);
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		if (DamageStream.FRand() >= Chance)
+		{
+			continue;
+		}
+
+		const uint64 Key = MakePlatformKey(Platform);
+		float Damage = DamageStream.FRandRange(Least, Most);
+		++HitCount;
+
+		// Asked only of the platforms hit, which is all it matters for.
+		if (IsVulnerable(Platform))
+		{
+			Damage *= FMath::Max(VulnerableDamageMultiplier, 1.0f);
+			++VulnerableHitCount;
+		}
+
+		float* Health = PlatformHealth.Find(Key);
+
+		if (!Health)
+		{
+			GiveHealth(Platform);
+			Health = PlatformHealth.Find(Key);
+		}
+
+		*Health -= Damage;
+
+		if (*Health <= 0.0f && !DyingKeys.Contains(Key))
+		{
+			DyingKeys.Add(Key);
+			DyingQueue.Add(Key);
+		}
+	}
+
+	UpdateZoneSummary();
+	UpdateDeletionSummary();
+}
+
+void ARoomManager::StrikeSegments()
+{
+	Strike();
+	RemoveDying(MAX_int32);
+}
+
+void ARoomManager::RemoveDying(const int32 Most)
+{
+	if (DyingQueue.IsEmpty() || Most <= 0)
+	{
+		return;
+	}
+
+	// Each as it stands - fill and all - so its pieces can be found. One taken away since it was queued is passed over.
+	TArray<FGridPlatform> Removed;
+	int32 Taken = 0;
+
+	while (Taken < DyingQueue.Num() && Removed.Num() < Most)
+	{
+		const uint64 Key = DyingQueue[Taken++];
+		DyingKeys.Remove(Key);
+
+		const int32* Index = ModuleFaceOwners.Find(Key);
+
+		if (Index && MakePlatformKey(BuiltPlatforms[*Index]) == Key)
+		{
+			Removed.Add(BuiltPlatforms[*Index]);
+		}
+	}
+
+	DyingQueue.RemoveAt(0, Taken, EAllowShrinking::No);
+	DamageRemovals += Removed.Num();
+
+	RemovePlatforms(Removed);
+	UpdateDeletionSummary();
+}
+
+bool ARoomManager::HoldsObject(const FGridPlatform& Platform) const
+{
+	if (Obstacles.IsEmpty())
+	{
+		return false;
+	}
+
+	// An object stands on a face in the cells just off it, so a box reaching one cell out either way finds it.
+	FAirBox Box = GetPlatformBox(Platform);
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+	--Box.Min[NormalAxis];
+	++Box.Max[NormalAxis];
+
+	return Obstacles.ContainsByPredicate([&Box](const FGridObstacle& Obstacle)
+	{
+		return Box.Intersects(FAirBox{ Obstacle.MinCell, Obstacle.MaxCell });
+	});
+}
+
+void ARoomManager::BeginReshuffle()
+{
+	ReshuffleKeys.Reset();
+	ReshuffleEmptied.Reset();
+	ReshuffleZoneIndex = ReshuffleStream.RandRange(0, ZoneCount - 1);
+
+	const int32 Fewest = FMath::Max(MinReshuffleCount, 0);
+	const int32 Count = ReshuffleStream.RandRange(Fewest, FMath::Max(MaxReshuffleCount, Fewest));
+
+	// The platforms in the zone holding no objects, in list order, and as many of them as drawn picked at random.
+	TArray<uint64> Pool;
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		if (GetZoneOf(Platform) == ReshuffleZoneIndex && !HoldsObject(Platform))
+		{
+			Pool.Add(MakePlatformKey(Platform));
+		}
+	}
+
+	for (int32 Pick = 0; Pick < Count && Pick < Pool.Num(); ++Pick)
+	{
+		Pool.Swap(Pick, ReshuffleStream.RandRange(Pick, Pool.Num() - 1));
+		ReshuffleKeys.Add(Pool[Pick]);
+	}
+
+	++ReshuffleCount;
+	UpdateDeletionSummary();
+}
+
+bool ARoomManager::StepReshuffle()
+{
+	while (ReshuffleZoneIndex != INDEX_NONE && !ReshuffleKeys.IsEmpty())
+	{
+		const uint64 Key = ReshuffleKeys[0];
+		ReshuffleKeys.RemoveAt(0);
+
+		// One taken away since it was drawn - struck down, say - is passed over.
+		const int32* Index = ModuleFaceOwners.Find(Key);
+
+		if (!Index || MakePlatformKey(BuiltPlatforms[*Index]) != Key)
+		{
+			continue;
+		}
+
+		const FGridPlatform Platform = BuiltPlatforms[*Index];
+
+		// The spot it empties is kept free for the rest of the reshuffle: the opening between its beams, so a platform
+		// may still share the beams round it.
+		int32 U, V;
+		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+		FAirBox Emptied = GetPlatformBox(Platform);
+		++Emptied.Min[U];
+		++Emptied.Min[V];
+		--Emptied.Max[U];
+		--Emptied.Max[V];
+		ReshuffleEmptied.Add(Emptied);
+
+		RemovePlatforms(MakeArrayView(&Platform, 1));
+		++ReshuffleRemovals;
+
+		// And one laid elsewhere in the same zone, as a beat would lay it, away from every spot the reshuffle emptied.
+		const int32 Zone = ReshuffleZoneIndex;
+		const TFunction<bool(const FGridPlatform&)> InZone = [this, Zone](const FGridPlatform& Candidate)
+		{
+			if (GetZoneOf(Candidate) != Zone)
+			{
+				return false;
+			}
+
+			const FAirBox Box = GetPlatformBox(Candidate);
+			return !ReshuffleEmptied.ContainsByPredicate([&Box](const FAirBox& Spot) { return Spot.Intersects(Box); });
+		};
+
+		const bool bVerticalFirst = PlacementStream.FRand() < VerticalPlacementChance;
+		const EPlatformKind FirstKind = bVerticalFirst ? EPlatformKind::SurfaceVertical : EPlatformKind::SurfaceHorizontal;
+		const EPlatformKind SecondKind = bVerticalFirst ? EPlatformKind::SurfaceHorizontal : EPlatformKind::SurfaceVertical;
+
+		if (PlacePlatformOfKind(FirstKind, &InZone) || PlacePlatformOfKind(SecondKind, &InZone))
+		{
+			++ReshufflePlacements;
+		}
+
+		UpdateDeletionSummary();
+		return true;
+	}
+
+	ReshuffleZoneIndex = INDEX_NONE;
+	ReshuffleEmptied.Reset();
+	return false;
+}
+
+void ARoomManager::ReshuffleZone()
+{
+	BeginReshuffle();
+
+	while (StepReshuffle())
+	{
+	}
+}
+
+void ARoomManager::AdvanceDeletion(const double Now)
+{
+	if (bEnableDamage && Now >= NextStrikeAt)
+	{
+		Strike();
+
+		const float Shortest = FMath::Max(MinStrikeInterval, 0.05f);
+		NextStrikeAt = Now + DamageStream.FRandRange(Shortest, FMath::Max(MaxStrikeInterval, Shortest));
+	}
+
+	if (!bEnableReshuffle)
+	{
+		return;
+	}
+
+	// One reshuffle at a time: the next falls due once the last has started, and starts once that one is over.
+	if (ReshuffleZoneIndex == INDEX_NONE && Now >= NextReshuffleAt)
+	{
+		BeginReshuffle();
+		NextReshuffleAt = Now + FMath::Max(ReshuffleInterval, 0.1f);
+		NextReshuffleStepAt = Now;
+	}
+
+	if (ReshuffleZoneIndex != INDEX_NONE && Now >= NextReshuffleStepAt)
+	{
+		StepReshuffle();
+		NextReshuffleStepAt = Now + FMath::Max(ReshuffleStepInterval, 0.05f);
+	}
+}
+
+void ARoomManager::UpdateDeletionSummary()
+{
+	DeletionSummary = FString::Printf(TEXT("%d strikes, %d hits (%d vulnerable), %d taken away, %d waiting; %d reshuffles, %d taken away and %d laid; %d pocket moves"),
+		StrikeCount, HitCount, VulnerableHitCount, DamageRemovals, DyingQueue.Num(), ReshuffleCount, ReshuffleRemovals, ReshufflePlacements, PocketMoves);
+}
+
+void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
+{
+	// Only those standing, each once, as they stand - fill and all - so their pieces can be found.
+	TSet<uint64> RemovedKeys;
+	TArray<int32> Indices;
+	TArray<FGridPlatform> Standing;
+
+	for (const FGridPlatform& Platform : Removed)
+	{
+		const uint64 Key = MakePlatformKey(Platform);
+		const int32* Index = ModuleFaceOwners.Find(Key);
+
+		if (!Index || MakePlatformKey(BuiltPlatforms[*Index]) != Key || RemovedKeys.Contains(Key))
+		{
+			continue;
+		}
+
+		RemovedKeys.Add(Key);
+		Indices.Add(*Index);
+		Standing.Add(BuiltPlatforms[*Index]);
+	}
+
+	if (Indices.IsEmpty())
+	{
+		return;
+	}
+
+	Indices.Sort();
+
+	auto IsRemoved = [&RemovedKeys](const FGridPlatform& Platform)
+	{
+		return RemovedKeys.Contains(MakePlatformKey(Platform));
+	};
+
+	// The list first, which is what is saved, then whatever waited on them: a fence end on a panel, a field's piece, a
+	// platform's health and its place in the queue to go.
+	Platforms.RemoveAll(IsRemoved);
+	FenceQueue.RemoveAll([&IsRemoved](const FFenceEnd& End) { return IsRemoved(End.Panel); });
+
+	for (FNatureSpill& Spill : SpillQueue)
+	{
+		Spill.Pieces.RemoveAll(IsRemoved);
+	}
+
+	SpillQueue.RemoveAll([](const FNatureSpill& Spill) { return Spill.Pieces.IsEmpty(); });
+
+	for (const uint64 Key : RemovedKeys)
+	{
+		PlatformHealth.Remove(Key);
+		DyingKeys.Remove(Key);
+	}
+
+	DyingQueue.RemoveAll([&RemovedKeys](const uint64 Key) { return RemovedKeys.Contains(Key); });
+
+	const bool bFieldsChanged = Standing.ContainsByPredicate([](const FGridPlatform& Platform) { return IsFieldPiece(Platform); });
+
+	if (CVarRoomManagerRemoveByRebuild.GetValueOnGameThread() != 0)
+	{
+		// Step A: everything derived worked out again from the list, and the visuals brought in line with it.
+		RebuildPlatformState();
+		SyncPieces();
+		SyncSurfaceMarks();
+	}
+	else
+	{
+		// Step B: just what the platforms brought, undone.
+		TArray<FGridSurfaceRef> ChangedSurfaces;
+		TArray<FGridSurfaceRef> FlippedSurfaces;
+		TSet<uint64> EdgeKeys;
+		TSet<uint64> NodeKeys;
+
+		RemovePlacedPlatforms(Indices, ChangedSurfaces, EdgeKeys, NodeKeys, FlippedSurfaces);
+		RefreshCandidatesAfterRemoval(Standing, FlippedSurfaces);
+
+		// A field going can shrink its landscape's mushroom, or split it in two.
+		if (bFieldsChanged)
+		{
+			UpdateFieldAir(/*bRefreshLists=*/true);
+		}
+
+		UpdateVisualsAfterRemoval(Standing, EdgeKeys, NodeKeys, ChangedSurfaces);
+	}
+
+	if (bFieldsChanged)
+	{
+		RebuildAirLines();
+	}
+
+	// With every platform gone, growth starts over: the middle zone's first tile, then every other zone's.
+	if (BuiltPlatforms.IsEmpty())
+	{
+		QueueSeeds();
+	}
+
+	UpdateDebugReadouts();
+
+	const int32 VerifyEvery = CVarRoomManagerVerifyEvery.GetValueOnGameThread();
+
+	if (VerifyEvery > 0 && ++PlacementsSinceVerify >= VerifyEvery)
+	{
+		PlacementsSinceVerify = 0;
+		VerifyIncrementalState();
+	}
+}
+
+void ARoomManager::RemovePlacedPlatforms(
+	const TConstArrayView<int32> Indices,
+	TArray<FGridSurfaceRef>& OutChangedSurfaces,
+	TSet<uint64>& OutEdgeKeys,
+	TSet<uint64>& OutNodeKeys,
+	TArray<FGridSurfaceRef>& OutFlippedSurfaces)
+{
+	OutChangedSurfaces.Reset();
+	OutEdgeKeys.Reset();
+	OutNodeKeys.Reset();
+	OutFlippedSurfaces.Reset();
+
+	if (Indices.IsEmpty())
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+
+	TArray<bool> bRemoved;
+	bRemoved.Init(false, BuiltPlatforms.Num());
+
+	TArray<FLatticeEdge> Edges;
+	TArray<FIntVector> RimCells;
+	TSet<uint64> RimCellKeys;
+
+	// What each platform alone held goes: its module faces. Everything it shared is noted, to be worked out afresh from
+	// what stands once they are all gone.
+	for (const int32 Index : Indices)
+	{
+		bRemoved[Index] = true;
+
+		const FGridPlatform& Platform = BuiltPlatforms[Index];
+		const int32 NormalAxis = AxisIndex(Platform.Normal);
+		const EGridFace FrontFace = MakeFace(NormalAxis, 1);
+		const EGridFace BackFace = MakeFace(NormalAxis, -1);
+
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+
+		ForEachModuleFace(Platform, SpanU, SpanV, Module, [&](const FIntVector& FaceMinNode)
+		{
+			ModuleFaceOwners.Remove(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+		});
+
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
+		{
+			bool bAlreadyNoted = false;
+			OutEdgeKeys.Add(MakeEdgeKey(Edge), &bAlreadyNoted);
+
+			if (!bAlreadyNoted)
+			{
+				Edges.Add(Edge);
+			}
+		});
+
+		ForEachRimNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
+		{
+			OutNodeKeys.Add(MakeCellKey(Node));
+		});
+
+		ForEachPlatformCell(Platform, SpanU, SpanV, [&](const FIntVector& Cell, const bool bRim)
+		{
+			// Its own two broad faces go with it, or are what another platform's rim makes them now.
+			OutChangedSurfaces.Add(MakeSurfaceRef(Cell, FrontFace));
+			OutChangedSurfaces.Add(MakeSurfaceRef(Cell, BackFace));
+
+			if (bRim)
+			{
+				bool bAlreadyNoted = false;
+				RimCellKeys.Add(MakeCellKey(Cell), &bAlreadyNoted);
+
+				if (!bAlreadyNoted)
+				{
+					RimCells.Add(Cell);
+				}
+			}
+		});
+	}
+
+	// The platforms that stay keep their order, and every index that names one is renumbered to match.
+	TArray<int32> Renumbered;
+	Renumbered.SetNumUninitialized(BuiltPlatforms.Num());
+
+	TArray<FGridPlatform> KeptPlatforms;
+	TArray<FFaceFill> KeptFills;
+	KeptPlatforms.Reserve(BuiltPlatforms.Num() - Indices.Num());
+	KeptFills.Reserve(FaceFills.Num());
+
+	for (int32 Index = 0; Index < BuiltPlatforms.Num(); ++Index)
+	{
+		if (bRemoved[Index])
+		{
+			Renumbered[Index] = INDEX_NONE;
+			continue;
+		}
+
+		Renumbered[Index] = KeptPlatforms.Add(BuiltPlatforms[Index]);
+
+		if (FaceFills.IsValidIndex(GetFaceFillIndex(Index, -1)))
+		{
+			KeptFills.Add(MoveTemp(FaceFills[GetFaceFillIndex(Index, 1)]));
+			KeptFills.Add(MoveTemp(FaceFills[GetFaceFillIndex(Index, -1)]));
+		}
+	}
+
+	BuiltPlatforms = MoveTemp(KeptPlatforms);
+	FaceFills = MoveTemp(KeptFills);
+
+	for (TPair<uint64, int32>& FaceOwner : ModuleFaceOwners)
+	{
+		FaceOwner.Value = Renumbered[FaceOwner.Value];
+	}
+
+	for (auto Blocked = BlockedEdges.CreateIterator(); Blocked; ++Blocked)
+	{
+		const int32 Blocker = Renumbered[Blocked.Value()];
+
+		if (Blocker == INDEX_NONE)
+		{
+			Blocked.RemoveCurrent();
+		}
+		else
+		{
+			Blocked.Value() = Blocker;
+		}
+	}
+
+	// Nature by form, and the platforms standing in each path, likewise.
+	auto RenumberAll = [&Renumbered](TArray<int32>& Named)
+	{
+		TArray<int32> Kept;
+		Kept.Reserve(Named.Num());
+
+		for (const int32 Index : Named)
+		{
+			if (Renumbered[Index] != INDEX_NONE)
+			{
+				Kept.Add(Renumbered[Index]);
+			}
+		}
+
+		Named = MoveTemp(Kept);
+	};
+
+	NaturePlatformCount = 0;
+
+	for (TArray<int32>& FormIndices : NatureIndices)
+	{
+		RenumberAll(FormIndices);
+		NaturePlatformCount += FormIndices.Num();
+	}
+
+	GroundCount = NatureIndices[static_cast<int32>(ENatureForm::Ground)].Num();
+	CliffCount = NatureIndices[static_cast<int32>(ENatureForm::Cliff)].Num();
+	WaterCount = NatureIndices[static_cast<int32>(ENatureForm::Water)].Num();
+
+	for (FAirPath& Path : AirPaths)
+	{
+		RenumberAll(Path.Standing);
+	}
+
+	// Every module edge and rim cell they took in, from whatever still stands around it.
+	for (const FLatticeEdge& Edge : Edges)
+	{
+		RecomputeModuleEdge(Edge.Node, Edge.Axis);
+	}
+
+	for (const FIntVector& Cell : RimCells)
+	{
+		RecomputeRimCell(Cell);
+	}
+
+	++StructureRevision;
+	bHasRemovals = true;
+
+	PlatformCount = BuiltPlatforms.Num();
+	HorizontalPlatformCount = Algo::CountIf(BuiltPlatforms, [](const FGridPlatform& Platform) { return Platform.GetKind() == EPlatformKind::SurfaceHorizontal; });
+	VerticalPlatformCount = PlatformCount - HorizontalPlatformCount;
+
+	// Promotion, undone and worked out again. A promotion rests on the surfaces flanking it, in its own plane and on its
+	// own side, and through promotions beside it on theirs - so whatever hung on the platforms taken away is among the
+	// promoted surfaces joined, that way, to their rim. All of those are let go, then promoted again wherever the rule
+	// still holds, worked outward as a placement works it; and the surfaces round the rim, which may no longer be built
+	// against, are asked too. The rule is monotone, so this lands where the rebuild's fixpoint does.
+	TArray<FGridSurfaceRef> Seeds;
+	Seeds.Reserve(RimCells.Num() * 12);
+
+	for (const FIntVector& Cell : RimCells)
+	{
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			for (const int32 Sign : { 1, -1 })
+			{
+				const EGridFace Face = MakeFace(Axis, Sign);
+				Seeds.Add(MakeSurfaceRef(Cell, Face));
+				Seeds.Add(MakeSurfaceRef(Cell + FaceStep(Face), OppositeFace(Face)));
+			}
+		}
+	}
+
+	TArray<FGridSurfaceRef> Demoted;
+	TSet<uint64> DemotedKeys;
+
+	for (const FGridSurfaceRef& Seed : Seeds)
+	{
+		const uint64 Key = MakeFaceKey(Seed.Cell, Seed.Face);
+
+		if (PromotedFaces.Remove(Key) > 0)
+		{
+			Demoted.Add(Seed);
+			DemotedKeys.Add(Key);
+		}
+	}
+
+	for (int32 Index = 0; Index < Demoted.Num(); ++Index)
+	{
+		const FGridSurfaceRef Surface = Demoted[Index];
+
+		for (int32 InPlaneAxis = 0; InPlaneAxis < 3; ++InPlaneAxis)
+		{
+			if (InPlaneAxis == FaceAxis(Surface.Face))
+			{
+				continue;
+			}
+
+			for (const int32 Sign : { 1, -1 })
+			{
+				const FIntVector Beside = Surface.Cell + AxisStep(InPlaneAxis, Sign);
+				const uint64 Key = MakeFaceKey(Beside, Surface.Face);
+
+				if (PromotedFaces.Remove(Key) > 0)
+				{
+					Demoted.Add(MakeSurfaceRef(Beside, Surface.Face));
+					DemotedKeys.Add(Key);
+				}
+			}
+		}
+	}
+
+	OutChangedSurfaces.Append(Seeds);
+	OutChangedSurfaces.Append(Demoted);
+
+	TArray<FGridSurfaceRef> PromotionQueue = Seeds;
+	PromotionQueue.Append(Demoted);
+
+	for (int32 QueueIndex = 0; QueueIndex < PromotionQueue.Num(); ++QueueIndex)
+	{
+		const FGridSurfaceRef Surface = PromotionQueue[QueueIndex];
+		const uint64 FaceKey = MakeFaceKey(Surface.Cell, Surface.Face);
+
+		if (PromotedFaces.Contains(FaceKey))
+		{
+			continue;
+		}
+
+		// As AddPlacedPlatform decides it: only an open rim surface is ever promoted.
+		int32 InteriorOwner = INDEX_NONE;
+		const uint8 SurfaceAxes = GetCellSurfaceAxes(Surface.Cell, InteriorOwner);
+
+		if (InteriorOwner != INDEX_NONE
+			|| (SurfaceAxes & AxisBit(FaceAxis(Surface.Face))) == 0
+			|| IsSolidCell(Surface.Cell + FaceStep(Surface.Face))
+			|| !IsFlankedByOpenFields(Surface.Cell, Surface.Face))
+		{
+			continue;
+		}
+
+		PromotedFaces.Add(FaceKey);
+		OutChangedSurfaces.Add(Surface);
+
+		// Promoted where it was not before: it offers a fold no more.
+		if (!DemotedKeys.Contains(FaceKey))
+		{
+			OutFlippedSurfaces.Add(Surface);
+		}
+
+		for (int32 InPlaneAxis = 0; InPlaneAxis < 3; ++InPlaneAxis)
+		{
+			if (InPlaneAxis != FaceAxis(Surface.Face))
+			{
+				PromotionQueue.Add(MakeSurfaceRef(Surface.Cell - AxisStep(InPlaneAxis), Surface.Face));
+				PromotionQueue.Add(MakeSurfaceRef(Surface.Cell + AxisStep(InPlaneAxis), Surface.Face));
+			}
+		}
+	}
+
+	// Let go and not promoted again: it offers a fold once more.
+	for (const FGridSurfaceRef& Surface : Demoted)
+	{
+		if (!PromotedFaces.Contains(MakeFaceKey(Surface.Cell, Surface.Face)))
+		{
+			OutFlippedSurfaces.Add(Surface);
+		}
+	}
+
+	JournalSurfaceChanges(OutChangedSurfaces);
+}
+
+void ARoomManager::RecomputeModuleEdge(const FIntVector& Node, const int32 Axis)
+{
+	const int32 Module = GetModule();
+	const FLatticeEdge Edge{ Node, Axis };
+	const uint64 EdgeKey = MakeEdgeKey(Edge);
+
+	// Every platform that takes the edge in covers one of the four module faces around it.
+	FModuleFace Faces[4];
+	GetEdgeFaces(Edge, Module, Faces);
+
+	TArray<int32, TInlineAllocator<4>> Users;
+
+	for (const FModuleFace& Face : Faces)
+	{
+		if (const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal)))
+		{
+			Users.AddUnique(*FaceOwner);
+		}
+	}
+
+	// In list order, as the rebuild takes them in: the first that blocks it keeps it, and a floor blocks it only where
+	// no platform before it used it.
+	Users.Sort();
+
+	uint8 Uses = 0;
+	int32 RimUsers = 0;
+	int32 Blocker = INDEX_NONE;
+	bool bUsedBefore = false;
+
+	for (const int32 User : Users)
+	{
+		const FGridPlatform& Platform = BuiltPlatforms[User];
+		const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+		int32 SpanU, SpanV, U, V;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+		GetInPlaneAxes(NormalAxis, U, V);
+
+		// Round its rim, the edge lies on one of its two sides across the edge's run; anywhere else it is interior.
+		const int32 AcrossAxis = Axis == U ? V : U;
+		const int32 AcrossSpan = AcrossAxis == U ? SpanU : SpanV;
+		const bool bRim = Node[AcrossAxis] == Platform.MinNode[AcrossAxis] || Node[AcrossAxis] == Platform.MinNode[AcrossAxis] + AcrossSpan;
+
+		// As RecordPlatform takes it in: a later platform standing on a floor's block lifts it, unless it carries that
+		// floor's fence run on.
+		if (bRim && Blocker != INDEX_NONE)
+		{
+			const FGridPlatform& Blocking = BuiltPlatforms[Blocker];
+
+			if (!Blocking.IsWall() && !IsRunContinuation(Platform, Blocking))
+			{
+				Blocker = INDEX_NONE;
+			}
+		}
+
+		if (bRim && Blocker == INDEX_NONE && !IsLoadBearing(Platform))
+		{
+			if (Platform.IsWall())
+			{
+				const int32 UpAxis = FaceAxis(Platform.Up);
+				const int32 TopCoordinate = Platform.MinNode[UpAxis] + (FaceSign(Platform.Up) > 0 ? (UpAxis == U ? SpanU : SpanV) : 0);
+				Blocker = Axis != UpAxis && Node[UpAxis] == TopCoordinate ? User : INDEX_NONE;
+			}
+			else if (!bUsedBefore)
+			{
+				Blocker = User;
+			}
+		}
+
+		Uses |= bRim ? RimEdgeUse : InteriorEdgeUse;
+		RimUsers += bRim ? 1 : 0;
+		bUsedBefore = true;
+	}
+
+	if (Uses != 0)
+	{
+		ModuleEdgeUses.Add(EdgeKey, Uses);
+	}
+	else
+	{
+		ModuleEdgeUses.Remove(EdgeKey);
+	}
+
+	if (RimUsers > 0)
+	{
+		RimEdgeUsers.Add(EdgeKey, RimUsers);
+	}
+	else
+	{
+		RimEdgeUsers.Remove(EdgeKey);
+	}
+
+	if (Blocker != INDEX_NONE)
+	{
+		BlockedEdges.Add(EdgeKey, Blocker);
+	}
+	else
+	{
+		BlockedEdges.Remove(EdgeKey);
+	}
+}
+
+void ARoomManager::RecomputeRimCell(const FIntVector& Cell)
+{
+	const int32 Module = GetModule();
+	uint8 Normals = 0;
+
+	// In each lattice plane it lies on, the module faces it touches - one, two or four - and of the platforms covering
+	// them, any with the cell on its rim.
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if (Cell[Axis] % Module != 0)
+		{
+			continue;
+		}
+
+		int32 U, V;
+		GetInPlaneAxes(Axis, U, V);
+
+		const int32 FirstModuleU = Cell[U] % Module == 0 ? Cell[U] / Module - 1 : Cell[U] / Module;
+		const int32 FirstModuleV = Cell[V] % Module == 0 ? Cell[V] / Module - 1 : Cell[V] / Module;
+
+		for (int32 ModuleV = FMath::Max(FirstModuleV, 0); ModuleV <= Cell[V] / Module && (Normals & AxisBit(Axis)) == 0; ++ModuleV)
+		{
+			for (int32 ModuleU = FMath::Max(FirstModuleU, 0); ModuleU <= Cell[U] / Module; ++ModuleU)
+			{
+				FIntVector FaceMinNode = Cell;
+				FaceMinNode[U] = ModuleU * Module;
+				FaceMinNode[V] = ModuleV * Module;
+
+				const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, Axis));
+
+				if (!FaceOwner)
+				{
+					continue;
+				}
+
+				const FGridPlatform& Platform = BuiltPlatforms[*FaceOwner];
+
+				int32 SpanU, SpanV;
+				GetPlatformSpans(Platform, SpanU, SpanV);
+
+				if (Cell[U] == Platform.MinNode[U] || Cell[U] == Platform.MinNode[U] + SpanU
+					|| Cell[V] == Platform.MinNode[V] || Cell[V] == Platform.MinNode[V] + SpanV)
+				{
+					Normals |= AxisBit(Axis);
+					break;
+				}
+			}
+		}
+	}
+
+	if (Normals != 0)
+	{
+		RimCellNormals.Add(MakeCellKey(Cell), Normals);
+	}
+	else
+	{
+		RimCellNormals.Remove(MakeCellKey(Cell));
+	}
+}
+
+void ARoomManager::RefreshCandidatesAfterRemoval(const TConstArrayView<FGridPlatform> Removed, const TConstArrayView<FGridSurfaceRef> FlippedSurfaces)
+{
+	// The empty cube has a list of its own, and lists going to be gathered afresh anyway need nothing.
+	if (!CanRefreshCandidateLists() || BuiltPlatforms.IsEmpty())
+	{
+		bPlatformCandidatesStale = true;
+		return;
+	}
+
+	const int32 Module = GetModule();
+
+	TArray<TSet<uint64>> Judged;
+	Judged.SetNum(TileCandidates.Num());
+
+	auto Judge = [&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
+	{
+		bool bAlreadyJudged = false;
+		Judged[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyJudged);
+
+		// Room has come free, so a placement not listed is judged as well as every listed one.
+		if (!bAlreadyJudged)
+		{
+			RefreshPlatformCandidate(TileIndex, Candidate, /*bMayHaveComeFree=*/true);
+		}
+	};
+
+	// Every placement taking in a module edge of theirs: one that stood where they stood, met them - flush or not -
+	// folded off them, grew off them alone, or was held off by a beam one of them blocked.
+	TSet<uint64> Visited;
+
+	for (const FGridPlatform& Platform : Removed)
+	{
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
+		{
+			bool bAlreadyVisited = false;
+			Visited.Add(MakeEdgeKey(Edge), &bAlreadyVisited);
+
+			if (!bAlreadyVisited)
+			{
+				ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/false, Judge);
+			}
+		});
+	}
+
+	// And every placement folding off a run whose promotion has changed: it offers a fold now, or no longer does.
+	for (const FGridSurfaceRef& Surface : FlippedSurfaces)
+	{
+		FLatticeEdge Edge;
+		bool bAlreadyVisited = false;
+
+		if (GetRunEdge(Surface.Cell, Module, Edge))
+		{
+			Visited.Add(MakeEdgeKey(Edge), &bAlreadyVisited);
+
+			if (!bAlreadyVisited)
+			{
+				ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/true, Judge);
+			}
+		}
+	}
+}
+
+void ARoomManager::UpdateVisualsAfterRemoval(
+	const TConstArrayView<FGridPlatform> Removed,
+	const TSet<uint64>& EdgeKeys,
+	const TSet<uint64>& NodeKeys,
+	const TConstArrayView<FGridSurfaceRef> ChangedSurfaces)
+{
+	bool bLayersIntact = IsPieceLayerIntact(EdgeLayer, EdgePieces) && IsPieceLayerIntact(NodeLayer, NodePieces);
+
+	for (const FStructureLayer& Layer : StructureLayers)
+	{
+		bLayersIntact = bLayersIntact && !Layer.Pieces.Chunks.IsEmpty() && IsPieceLayerIntact(Layer.Pieces, Layer.Pieces.Chunks[0]);
+	}
+
+	// Anything but the plain case is left to the full sync, which takes away whatever is no longer wanted.
+	if (!bPiecesComplete || !bShowPieces || !PieceMesh || !bLayersIntact)
+	{
+		SyncPieces();
+	}
+	else
+	{
+		// Each platform's own pieces: what filled its opening.
+		for (const FGridPlatform& Platform : Removed)
+		{
+			const uint64 PlatformKey = MakePlatformKey(Platform);
+
+			for (FStructureLayer& Layer : StructureLayers)
+			{
+				if (Layer.Structure == Platform.PositiveStructure || Layer.Structure == Platform.NegativeStructure)
+				{
+					RemovePieceFromLayer(Layer.Pieces, PlatformKey);
+					RemovePieceFromLayer(Layer.Pieces, PlatformKey | NegativeFacePieceBit);
+				}
+			}
+		}
+
+		// The beams and posts round them, each as it now is: gone where nothing uses it any more, and back where the
+		// platform that blocked it was taken away.
+		const double RunExtent = static_cast<double>(GetModule() - 1) * CellSize;
+
+		auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
+		{
+			return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
+		};
+
+		TArray<FPlacedPiece> NewEdges;
+		TArray<FPlacedPiece> NewNodes;
+
+		for (const uint64 EdgeKey : EdgeKeys)
+		{
+			const bool bWanted = IsEdgeBuilt(EdgeKey);
+			const bool bDrawn = EdgeLayer.PieceSlots.Contains(EdgeKey);
+
+			if (bDrawn && !bWanted)
+			{
+				RemovePieceFromLayer(EdgeLayer, EdgeKey);
+			}
+			else if (bWanted && !bDrawn)
+			{
+				const FIntVector EdgeNode = CellFromKey(EdgeKey);
+				const int32 EdgeAxis = static_cast<int32>(EdgeKey >> KeyTagShift) - 1;
+
+				FVector EdgeExtent(CellSize);
+				EdgeExtent[EdgeAxis] = RunExtent;
+
+				EdgeLayer.PieceStamps.Add(EdgeKey, EdgeLayer.SyncStamp);
+				NewEdges.Add(FPlacedPiece{ EdgeKey, MakeBox(EdgeNode + AxisStep(EdgeAxis), EdgeExtent) });
+			}
+		}
+
+		for (const uint64 NodeKey : NodeKeys)
+		{
+			const FIntVector Node = CellFromKey(NodeKey);
+			const bool bWanted = IsNodeBuilt(Node);
+			const bool bDrawn = NodeLayer.PieceSlots.Contains(NodeKey);
+
+			if (bDrawn && !bWanted)
+			{
+				RemovePieceFromLayer(NodeLayer, NodeKey);
+			}
+			else if (bWanted && !bDrawn)
+			{
+				NodeLayer.PieceStamps.Add(NodeKey, NodeLayer.SyncStamp);
+				NewNodes.Add(FPlacedPiece{ NodeKey, MakeBox(Node, FVector(CellSize)) });
+			}
+		}
+
+		AddPiecesToLayer(EdgeLayer, EdgePieces, NewEdges);
+		AddPiecesToLayer(NodeLayer, NodePieces, NewNodes);
+	}
+
+	UpdateSurfaceMarks(ChangedSurfaces);
 }

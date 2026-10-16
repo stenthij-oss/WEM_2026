@@ -146,10 +146,14 @@ bool FStructureLoadBearingFloorTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("No floor carries it on east"), Manager->CanPlacePlatform(MakeOpen(FIntVector(48, 16, 32), EGridAxis::Z, Square)));
 	TestFalse(TEXT("No wall hangs from its north edge"), Manager->CanPlacePlatform(MakeOpen(FIntVector(32, 32, 16), EGridAxis::Y, Square)));
 
-	// The same two the other way round: the light one first can only be the first platform in a list
-	// written by hand, and then it blocks every beam it has - so the second is refused by the rebuild.
+	// The same two the other way round, as a list reads once what the light one grew from has been taken
+	// away: it blocks every beam it has, but the one the second already stands on is lifted by it. Both stand,
+	// and the rest stay blocked.
 	FRoomManagerTestAccess::Rebuild(*Manager, { East, West });
-	TestEqual(TEXT("A platform taking in a blocked beam is left out of a rebuild"), Manager->GetPlatformCount(), 1);
+	TestEqual(TEXT("A platform standing on a beam blocked before it is kept"), Manager->GetPlatformCount(), 2);
+	TestTrue(TEXT("The beam they share is built"), Manager->IsCellSolid(FIntVector(32, 18, 32)));
+	TestFalse(TEXT("The light one's far beam still is not"), Manager->IsCellSolid(FIntVector(48, 18, 32)));
+	TestFalse(TEXT("Still no wall stands on its far edge"), Manager->CanPlacePlatform(MakeOpen(FIntVector(48, 16, 32), EGridAxis::X, Square)));
 
 	ReleaseRooted(Rooted);
 	return true;

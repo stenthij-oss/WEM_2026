@@ -256,6 +256,12 @@ struct FRoomPieceLayer
 	/** Every piece drawn so far, keyed by what it stands for, with the sync that last found it. */
 	TMap<uint64, uint32> PieceStamps;
 
+	/** Where each piece drawn so far stands - its chunk, and its instance there - so it can be taken out again. */
+	TMap<uint64, FIntPoint> PieceSlots;
+
+	/** Per chunk, the key of the piece each instance stands for, in instance order. */
+	TArray<TArray<uint64>> ChunkKeys;
+
 	/** Bumped once per sync. Never zero after the first, which marks a piece as not yet drawn. */
 	uint32 SyncStamp = 0;
 };
@@ -449,6 +455,13 @@ struct FSurfaceMarkLayer
  * Whenever the cube is cleared, AirPocketCount pockets of air - spheres, cubes, rectangular boxes,
  * ziggurats and cylinders - are drawn at random across it, and nothing is ever built in them. Before
  * them come MoldCount molds: boxes held back but for a shape left open inside, which growth can fill.
+ *
+ * Zones and deletion
+ * ------------------
+ * The cube is split into nine zones, three by three across it, each with a first tile of its own.
+ * Every platform has health; strikes wear a share of them down, and one with none left is taken
+ * away. A zone is reshuffled now and then, and pockets and molds move during play. The whole of it
+ * is told by the deletion code further down.
  *
  * Surfaces
  * --------
@@ -776,6 +789,37 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
 	FColor AirColor = FColor(255, 190, 40);
 
+	/**
+	 * Lets the air above a landscape - ground and water joined across their seams in one plane - grow like a mushroom
+	 * as the landscape does: higher over every piece of it, and capped at the top by a layer reaching out past its edges.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
+	bool bMushroomAir = true;
+
+	/** Storeys of air added over every piece of a landscape for each piece it has beyond its first, rounded down. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0.0", EditCondition = "bMushroomAir"))
+	float MushroomStoreysPerPiece = 0.25f;
+
+	/** The most storeys a landscape's air grows by, however large it gets. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0", EditCondition = "bMushroomAir"))
+	int32 MaxMushroomStoreys = 4;
+
+	/** Cells the cap reaches out past the landscape's edges for each piece it has beyond its first, in whole modules. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0.0", EditCondition = "bMushroomAir"))
+	float MushroomSpreadPerPiece = 2.0f;
+
+	/** The furthest the cap reaches out past the landscape's edges, in cells. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0", EditCondition = "bMushroomAir"))
+	int32 MaxMushroomSpread = 48;
+
+	/** How thick the cap is, in storeys, at the top of the landscape's air. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "1", EditCondition = "bMushroomAir"))
+	int32 MushroomCapStoreys = 1;
+
+	/** The landscapes standing and the air over the largest. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Air")
+	FString AirSummary;
+
 	/** How many pockets of air are drawn across the cube each time it is cleared. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0"))
 	int32 AirPocketCount = 6;
@@ -815,6 +859,21 @@ public:
 	/** Lets a ziggurat or a cylinder stand along any axis, either way, rather than upright in the world. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
 	bool bAirPocketsAlongAnyAxis = true;
+
+	/**
+	 * Lets every pocket and mold break down during play and form again somewhere else, one at a time, the same shape.
+	 * The air kept above ground and water stays where it is.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
+	bool bMovePockets = true;
+
+	/** Seconds by which half the pockets and molds drawn at one time have broken down. Each draws how long it lasts from this. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "1.0", EditCondition = "bMovePockets"))
+	float PocketHalfLife = 120.0f;
+
+	/** The shortest a pocket or mold lasts in one place, in seconds. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0", EditCondition = "bMovePockets"))
+	float MinPocketLife = 30.0f;
 
 	/** Draws each pocket's shape in lines of its shape's colour. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
@@ -902,6 +961,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0"))
 	int32 MoldOpenFloor = 4;
 
+	/** How much likelier a beat draws a placement whose middle lies in a mold's box than one anywhere else. One draws them alike. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "1.0"))
+	float MoldGrowthWeight = 4.0f;
+
 	/** Lets a mold stand along any axis, either way, rather than upright in the world, its floor at the bottom. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds")
 	bool bMoldsAlongAnyAxis = false;
@@ -985,6 +1048,88 @@ public:
 	/** The paths drawn last: how many, their legs, the lattice pieces they hold back, and the platforms standing in them. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Paths")
 	FString PathSummary;
+
+	/** Draws the nine zones as boxes of lines, each in its own colour, the full height of the cube. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
+	bool bShowZones = false;
+
+	/** The zones' colours, in zone order: three along X, then the next three along Y. The fifth is the middle zone. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
+	TArray<FColor> ZoneColors;
+
+	/**
+	 * Gives every zone a first tile of its own, growth starting from all nine: the middle zone's at the heart of the cube
+	 * as before, each other one at a random place in its zone, in step with the middle one so their growth lines up when
+	 * it meets. Off, growth starts from the middle one alone.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
+	bool bSeedEveryZone = true;
+
+	/** Platforms standing in each zone, in zone order, as the last strike or rebuild counted them. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Zones")
+	FString ZoneSummary;
+
+	/** Strikes wear the platforms down during play, and a platform with no health left is taken away. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion")
+	bool bEnableDamage = true;
+
+	/** The least health a platform is laid with. Each draws its own evenly up to MaxHealth. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "1.0"))
+	float MinHealth = 80.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "1.0"))
+	float MaxHealth = 120.0f;
+
+	/** The shortest wait between two strikes, in seconds. Each wait is drawn evenly up to MaxStrikeInterval. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.05"))
+	float MinStrikeInterval = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.05"))
+	float MaxStrikeInterval = 3.0f;
+
+	/** The chance each platform standing is hit by a strike: about this share of them, each strike. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float StrikeFraction = 0.1f;
+
+	/** The least damage a hit does. Each hit draws its own evenly up to MaxDamage. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.0"))
+	float MinDamage = 10.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.0"))
+	float MaxDamage = 20.0f;
+
+	/**
+	 * What a hit does to a platform crossing held-back air - a pocket, a mold's held-back box, a path, or the air over a
+	 * landscape - as a multiple of what it would do anywhere else: 1.6 is 60% more.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "1.0"))
+	float VulnerableDamageMultiplier = 1.6f;
+
+	/**
+	 * Now and then, in a zone drawn at random, a number of platforms holding no objects are taken away one by one, and
+	 * as each goes another is laid somewhere else in the same zone: the zone reshuffled a little.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion")
+	bool bEnableReshuffle = true;
+
+	/** Seconds between reshuffles. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.1", EditCondition = "bEnableReshuffle"))
+	float ReshuffleInterval = 10.0f;
+
+	/** The fewest platforms a reshuffle moves. Each draws its number evenly up to MaxReshuffleCount. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0", EditCondition = "bEnableReshuffle"))
+	int32 MinReshuffleCount = 4;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0", EditCondition = "bEnableReshuffle"))
+	int32 MaxReshuffleCount = 12;
+
+	/** Seconds between one platform of a reshuffle being moved and the next. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.05", EditCondition = "bEnableReshuffle"))
+	float ReshuffleStepInterval = 0.25f;
+
+	/** Strikes, hits and what they took away, reshuffles, and pockets moved, since the cube was cleared. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Deletion")
+	FString DeletionSummary;
 
 	/** Platforms of ground standing. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Nature")
@@ -1339,6 +1484,21 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Paths")
 	void RerollPaths();
 
+	/**
+	 * One strike, and whatever it leaves with no health taken away at once. Play strikes on its own every MinStrikeInterval
+	 * to MaxStrikeInterval seconds, and takes the platforms away a few at a time.
+	 */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Deletion")
+	void StrikeSegments();
+
+	/** Reshuffles a zone drawn at random, all at once. Play reshuffles on its own every ReshuffleInterval, a platform at a time. */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Deletion")
+	void ReshuffleZone();
+
+	/** Breaks every pocket and mold down at once and forms each again somewhere else. Play moves them on its own, one at a time. */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Air Pockets")
+	void MoveAirPockets();
+
 	//~ Begin AActor Interface
 	virtual void OnConstruction(const FTransform& Transform) override;
 	//~ End AActor Interface
@@ -1511,7 +1671,7 @@ private:
 	bool IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInstancedStaticMeshComponent* FirstChunk) const;
 
 	/** Adds pieces to a layer, filling its open chunk and starting a new one whenever that is full. */
-	void AddPiecesToLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, TConstArrayView<FTransform> NewPieces);
+	void AddPiecesToLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, TConstArrayView<FPlacedPiece> NewPieces);
 
 	/** Empties a layer back to its first chunk, cleared. */
 	void ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk);
@@ -1569,9 +1729,10 @@ private:
 	 * and no other platform's interior along the module edges around it. Nor may any of its
 	 * pieces - module faces, module edges and nodes, rim or interior - cut an obstacle, nor any of
 	 * its module edges be one a platform that is not load-bearing has blocked. The half of
-	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well.
+	 * CanPlacePlatform that asks only what is where, which the rebuild holds the list to as well - all
+	 * but the blocked edges (bIgnoreBlockedEdges), which are a rule of growth rather than room taken.
 	 */
-	bool IsSpaceFree(const FGridPlatform& Platform) const;
+	bool IsSpaceFree(const FGridPlatform& Platform, bool bIgnoreBlockedEdges = false) const;
 
 	/**
 	 * CanPlacePlatform less the question of whether its tile may be laid that way round at all.
@@ -1888,11 +2049,28 @@ private:
 	/** Fills a candidate from the nature stream and places it. False when no fill can be drawn, or it is no longer legal. */
 	bool PlaceNatureCandidate(FNatureCandidate& Candidate);
 
-	/** One box of air kept open, inclusive at both corners. */
+	/** One box of air kept open, inclusive at both corners. Also any box of cells, such as a region whose placements are judged again. */
 	struct FAirBox
 	{
 		FIntVector Min = FIntVector::ZeroValue;
 		FIntVector Max = FIntVector::ZeroValue;
+
+		bool operator==(const FAirBox& Other) const
+		{
+			return Min == Other.Min && Max == Other.Max;
+		}
+
+		bool Intersects(const FAirBox& Other) const
+		{
+			return Min.X <= Other.Max.X && Other.Min.X <= Max.X
+				&& Min.Y <= Other.Max.Y && Other.Min.Y <= Max.Y
+				&& Min.Z <= Other.Max.Z && Other.Min.Z <= Max.Z;
+		}
+
+		friend uint32 GetTypeHash(const FAirBox& Box)
+		{
+			return HashCombineFast(GetTypeHash(Box.Min), GetTypeHash(Box.Max));
+		}
 	};
 
 	/** Whether a platform is a piece of a field: ground or water, which keep the air above them open. */
@@ -1904,9 +2082,10 @@ private:
 	/**
 	 * The boxes of air a piece of ground or water keeps open, Height cells out along its Up: one over its
 	 * opening, and one over each run of seam it shares with a piece of a field laid before it - before
-	 * PlatformIndex - in its plane with its Up. Its outline is left open.
+	 * PlatformIndex - in its plane with its Up, as high as the lower of the two, that piece's height raised by
+	 * ExtraHeight as well. Its outline is left open.
 	 */
-	void GatherAirBoxes(const FGridPlatform& Platform, int32 PlatformIndex, int32 Height, TArray<FAirBox>& OutBoxes) const;
+	void GatherAirBoxes(const FGridPlatform& Platform, int32 PlatformIndex, int32 Height, TArray<FAirBox>& OutBoxes, int32 ExtraHeight = 0) const;
 
 	/** Whether a piece of ground or water about to be placed would have MinAirStoreys of air clear of every platform. */
 	bool IsAirClear(const FGridPlatform& Platform) const;
@@ -1914,8 +2093,41 @@ private:
 	/** Adds the lattice pieces an inclusive box of cells cuts to the obstacle keys. */
 	void AddObstacleKeys(const FIntVector& MinCell, const FIntVector& MaxCell);
 
-	/** Judges again every listed placement whose footprint reaches into a box just held back, dropping those it now cuts. */
-	void DropCandidatesCutBy(const FIntVector& MinCell, const FIntVector& MaxCell);
+	/**
+	 * Every box of air the fields standing keep open, worked out afresh: per piece in list order its boxes (see
+	 * GatherAirBoxes), raised by its landscape's mushroom, then a cap over each landscape that has one. A landscape is the
+	 * pieces joined across their seams in one plane with one Up.
+	 */
+	void GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscapes = nullptr, int32* OutLargest = nullptr) const;
+
+	/** How many storeys a landscape of Pieces pieces raises its air by, and how many cells its cap reaches past its edges. */
+	int32 GetMushroomStoreys(int32 Pieces) const;
+	int32 GetMushroomSpread(int32 Pieces) const;
+
+	/**
+	 * Brings the air the fields keep open in line with the fields standing: works it out afresh, swaps in only the boxes
+	 * that changed, and - with bRefreshLists - judges again the placements those reach into or have let go of.
+	 */
+	void UpdateFieldAir(bool bRefreshLists);
+
+	/** Adds a box of air to the buckets it reaches, or takes it out of them. */
+	void AddAirBoxToBuckets(const FAirBox& Box);
+	void RemoveAirBoxFromBuckets(const FAirBox& Box);
+
+	/** The box of cells a platform covers, rim to rim, one cell thick. */
+	FAirBox GetPlatformBox(const FGridPlatform& Platform) const;
+
+	/** Whether a platform keeps clear of every box of air the fields keep open. A platform cuts a box exactly where one of its cells lies in it. */
+	bool IsClearOfAirBoxes(const FGridPlatform& Platform) const;
+
+	/** Judges again every listed placement reaching into one of Regions, dropping those no longer open. */
+	void DropCandidatesIn(TConstArrayView<FAirBox> Regions);
+
+	/**
+	 * Judges every placement reaching into one of Regions that shares a module edge with a platform standing, listed or
+	 * not, so those the regions have let go of come free. Found from the platforms near the regions, not by walking them.
+	 */
+	void FreeCandidatesIn(TConstArrayView<FAirBox> Regions);
 
 	/** Flushes and redraws the air kept open and the air pockets, in their own batcher. */
 	void RebuildAirLines();
@@ -1955,17 +2167,77 @@ private:
 		/** How many cells at the bottom of a mold's box are open all the way across; its shapes start above them. */
 		double OpenFloor = 0.0;
 
-		/** The pieces it cuts, keyed as the obstacle keys are. */
+		/** How many times it has formed again since the cube was cleared. With the run's seed and its index, where it goes. */
+		int32 Draw = 0;
+
+		/** When, in the world's time, play has it break down and form again somewhere else. */
+		double MoveAt = 0.0;
+
+		/**
+		 * The pieces it cuts, keyed as the obstacle keys are, slab by slab from its bottom up - a slab being one layer of
+		 * the lattice, a module deep along Z - and counted into the pocket keys. Where each slab's pieces end in the
+		 * three lists: as many entries as slabs are cut and held, so a pocket can break down and form a slab at a time.
+		 */
 		TArray<uint64> FaceKeys;
 		TArray<uint64> EdgeKeys;
 		TArray<uint64> NodeKeys;
+		TArray<FIntVector> SlabEnds;
 	};
 
 	/**
 	 * Draws MoldCount molds and then AirPocketCount pockets afresh from the run's seed, each clear of the first
-	 * platform's place, the molds clear of each other and the pockets clear of the molds, and summarises them.
+	 * platform's place, the molds clear of each other and the pockets clear of the molds, counts their pieces into the
+	 * pocket keys, sets when each breaks down, and summarises them.
 	 */
 	void SpawnAirPockets();
+
+	/**
+	 * Draws a place for a pocket or mold from Stream, its centre within Spread of the cube's middle - all of it at 1 -
+	 * again while it would meet a mold other than the one at Ignore or, with bKeepFirstPlace, take the first platform's
+	 * place. False when every place drawn does.
+	 */
+	bool PlacePocket(FAirPocket& Pocket, FRandomStream& Stream, double Spread, int32 Ignore, bool bKeepFirstPlace) const;
+
+	/** How long a pocket or mold lasts in one place, drawn from Stream: half of them have broken down by PocketHalfLife. */
+	double DrawPocketLife(FRandomStream& Stream) const;
+
+	/** Breaks the pocket or mold at Index down and forms it again somewhere else, the same shape, all at once: what play does a slab a tick. */
+	void MovePocket(int32 Index);
+
+	/**
+	 * One tick of the move under way: while breaking down, its top slab let go and the placements there judged again; once
+	 * gone, a new place drawn; while forming, its next slab from the bottom cut and held, and the placements there judged
+	 * again. A slab a tick, so a mold as large as a quarter of the cube costs no frame much.
+	 */
+	void StepPocketMove();
+
+	/** How many slabs a pocket spans, and the cells one of them covers, as far as the cube goes. */
+	int32 GetPocketSlabCount(const FAirPocket& Pocket) const;
+	FAirBox GetPocketSlabBox(const FAirPocket& Pocket, int32 Slab) const;
+
+	/** Cuts the pieces of a pocket's next slab, the first not yet cut, onto its lists. */
+	void CutPocketSlab(FAirPocket& Pocket) const;
+
+	/** Counts a pocket's pieces into the pocket keys, or out of them: one slab's, or every slab's. */
+	void CountPocketSlabKeys(const FAirPocket& Pocket, int32 Slab, int32 Delta);
+	void AddPocketKeys(const FAirPocket& Pocket);
+	void RemovePocketKeys(const FAirPocket& Pocket);
+
+	/** The pocket or mold moving now, by index, or INDEX_NONE; and whether it is forming again, rather than breaking down. */
+	int32 MovingPocket = INDEX_NONE;
+	bool bPocketForming = false;
+
+	/** Cuts every pocket's pieces afresh, for the lattice as it stands, and counts them into the pocket keys anew. */
+	void RebuildPocketKeys();
+
+	/** The box of cells a pocket or mold reaches into, as far as the cube goes. */
+	FAirBox GetPocketCellBounds(const FAirPocket& Pocket) const;
+
+	/** Whether a platform keeps clear of every pocket and every mold's held-back box. */
+	bool IsClearOfPockets(const FGridPlatform& Platform) const;
+
+	/** Whether a placement's middle lies in a mold's box, where a beat draws it MoldGrowthWeight times as likely. */
+	bool IsInMoldBox(const FGridPlatform& Platform) const;
 
 	/** Draws the shapes one mold leaves open inside its box, from Stream. */
 	void DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const;
@@ -2045,11 +2317,17 @@ private:
 	/** Lists can be refreshed piece by piece only while they are gathered and match the tiles. */
 	bool CanRefreshCandidateLists() const;
 
-	/** The world's time, which the paths fall due by. */
-	double GetPathClock() const;
+	/** The world's time, which the paths, pockets, strikes and reshuffles fall due by. */
+	double GetClock() const;
 
-	/** Starts the clock the paths fall due by: a short tick that redraws whichever are due. */
-	void StartPathClock();
+	/** Starts the clock everything that moves during play falls due by: a short tick that does whatever is due. */
+	void StartClock();
+
+	/**
+	 * The clock's tick: the path or two longest due redrawn, the pocket or mold longest due moved, a strike or a
+	 * reshuffle begun or carried on when due, and a few of the platforms with no health left taken away.
+	 */
+	void AdvanceClock();
 
 	/**
 	 * Judges again every placement taking in one of a set of path pieces, each placement once across calls by Judged
@@ -2062,8 +2340,11 @@ private:
 		bool bMayHaveComeFree,
 		TArray<TSet<uint64>>& Judged);
 
-	/** The path clock's tick: redraws the path or two longest due. */
-	void AdvancePaths();
+	/** Redraws the path or two longest due at Now. */
+	void AdvancePaths(double Now);
+
+	/** Carries the move under way on a slab, or starts moving the pocket or mold longest due at Now, if any is. */
+	void AdvancePockets(double Now);
 
 	/** Flushes and redraws the paths' lines, in their own batcher, so moving one does not redraw all the air. */
 	void RebuildPathLines();
@@ -2080,6 +2361,147 @@ private:
 
 	/** Whether a platform keeps clear of every path. Only new placements are held to this. */
 	bool IsClearOfPaths(const FGridPlatform& Platform) const;
+
+	/**
+	 * Whether a platform keeps clear of all the air held back - paths, pockets, molds and the air over the fields. Only
+	 * new placements are held to this; a platform standing in it is vulnerable instead.
+	 */
+	bool IsClearOfHeldAir(const FGridPlatform& Platform) const;
+
+	/*
+	 * Zones
+	 * -----
+	 * The cube is split into nine zones, three by three across X and Y, each the full height of the cube, their
+	 * borders on lattice lines a third of the way across. A platform is in the zone its middle lies in. With
+	 * bSeedEveryZone each zone has a first tile of its own: the middle zone's is laid as the first platform always
+	 * was, at the heart of the cube, and the beats after it lay one in each other zone, a zone a beat, before
+	 * anything else. Each lies flat at a place drawn at random in its zone - on the same steps of the first tile's
+	 * width, length and shorter side away from the middle one, so where their growth meets it lines up - clear of
+	 * everything standing and of all the air held back. Should every platform be taken away, the cube is seeded
+	 * again the same way.
+	 *
+	 * Deletion
+	 * --------
+	 * Every platform is laid with health, drawn between MinHealth and MaxHealth. During play a strike falls every
+	 * MinStrikeInterval to MaxStrikeInterval seconds: each platform is hit with StrikeFraction, for between MinDamage
+	 * and MaxDamage, VulnerableDamageMultiplier times that where the platform crosses air held back. One with no
+	 * health left is taken away - no more than that - a few at a time on the clock, so a strike costs no frame
+	 * much.
+	 *
+	 * Taking platforms away undoes just what they brought: their module faces go, every module edge and rim cell
+	 * they took in is worked out afresh from what stands around it, every promotion that hung on them is let go
+	 * and worked out again, and their pieces and overlay squares are swapped out of the chunks. The placements
+	 * round them are judged again, listed or not, since room has come free. The wholesale rebuild stays the
+	 * reference (wem.RoomManager.VerifyEvery checks removals too) and the fallback (wem.RoomManager.RemoveByRebuild).
+	 * Two rules follow from it: a placement demotes promoted surfaces it builds against, and a floor's block on a
+	 * beam holds only while it is the one platform there.
+	 *
+	 * Every ReshuffleInterval a zone is drawn at random and between MinReshuffleCount and MaxReshuffleCount of its
+	 * platforms holding no objects - none standing on either face - are drawn to move. Every ReshuffleStepInterval one
+	 * of them is taken away and a platform laid elsewhere in the same zone, as a beat lays one, away from every spot
+	 * the reshuffle has emptied.
+	 *
+	 * Pockets and molds break down and form again somewhere else during play, one at a time on the clock, each after
+	 * a life drawn so half of them have gone by PocketHalfLife. Like paths they hold back only what is placed from then
+	 * on; what stands where one forms stays, vulnerable, and the rebuild keeps it. Inside a mold's box a beat draws a
+	 * placement MoldGrowthWeight times as likely.
+	 *
+	 * The air over ground and water no longer holds back what stands either, so it can grow. Ground and water joined
+	 * across their seams in one plane make a landscape, and with bMushroomAir its air rises by MushroomStoreysPerPiece
+	 * for every piece beyond the first, and a cap MushroomCapStoreys thick at its top reaches MushroomSpreadPerPiece
+	 * cells further past the landscape's edges for every piece beyond the first. It is kept as boxes, bucketed by
+	 * where they are, rather than as lattice pieces, since it changes whenever a landscape does.
+	 */
+
+	static constexpr int32 ZonesPerSide = 3;
+	static constexpr int32 ZoneCount = ZonesPerSide * ZonesPerSide;
+	static constexpr int32 MiddleZone = ZoneCount / 2;
+
+	/** Where one of the zones' borders lies along X or Y, in cells, from 0 - the cube's near side - to ZonesPerSide, its far side. */
+	int32 GetZoneLine(int32 Line) const;
+
+	/** The zone a platform's middle lies in. */
+	int32 GetZoneOf(const FGridPlatform& Platform) const;
+
+	/** The cells a zone spans, its borders included, the full height of the cube. */
+	FAirBox GetZoneBox(int32 Zone) const;
+
+	/** The zones' outlines, each in its colour, a little inside its borders so neighbours' lines stay apart. */
+	void AppendZoneLines(TArray<FBatchedLine>& Lines) const;
+
+	/** Counts the platforms in each zone into ZoneSummary. */
+	void UpdateZoneSummary();
+
+	/** Queues every zone but the middle one for a first tile of its own, when bSeedEveryZone is on. */
+	void QueueSeeds();
+
+	/** Lays a first tile of the zone's own: FirstTile, flat, on the middle one's steps, at the first free place drawn. False when none is. */
+	bool PlaceSeed(int32 Zone);
+
+	/** Lays health for a platform just taken in, drawn from the damage stream. */
+	void GiveHealth(const FGridPlatform& Platform);
+
+	/** Whether a platform crosses air held back, so a hit does it more damage. */
+	bool IsVulnerable(const FGridPlatform& Platform) const;
+
+	/** One strike: each platform hit with StrikeFraction, and those left with no health queued to be taken away. */
+	void Strike();
+
+	/** Takes away up to Most of the platforms waiting with no health left, oldest first, in one go. */
+	void RemoveDying(int32 Most);
+
+	/** Whether any object stands on either face of a platform: one of the obstacles lies against it. */
+	bool HoldsObject(const FGridPlatform& Platform) const;
+
+	/** Draws a zone and the platforms in it to move, holding no objects, and starts a reshuffle of them. */
+	void BeginReshuffle();
+
+	/** One step of the reshuffle under way: the next platform taken away and another laid elsewhere in its zone. False when it is over. */
+	bool StepReshuffle();
+
+	/** Starts a strike or a reshuffle when due, and carries a reshuffle on. */
+	void AdvanceDeletion(double Now);
+
+	/** Writes DeletionSummary. */
+	void UpdateDeletionSummary();
+
+	/**
+	 * Takes platforms out of the structure: out of the list, and out of everything derived from it - by
+	 * RemovePlacedPlatforms, or by a wholesale rebuild while wem.RoomManager.RemoveByRebuild is set - along with their
+	 * pieces, the overlay's squares, their health, any fence end or field waiting on them, and the air over their fields.
+	 */
+	void RemovePlatforms(TConstArrayView<FGridPlatform> Removed);
+
+	/**
+	 * The inverse of AddPlacedPlatform: takes standing platforms - indices into BuiltPlatforms, ascending - out of the
+	 * derived state without rebuilding it, and renumbers whatever names the platforms that stay. Collects the surfaces
+	 * that may have changed, the module edges and nodes whose beams and posts may have, and the surfaces whose
+	 * promotion now differs.
+	 */
+	void RemovePlacedPlatforms(
+		TConstArrayView<int32> Indices,
+		TArray<FGridSurfaceRef>& OutChangedSurfaces,
+		TSet<uint64>& OutEdgeKeys,
+		TSet<uint64>& OutNodeKeys,
+		TArray<FGridSurfaceRef>& OutFlippedSurfaces);
+
+	/** Works out one module edge afresh from the platforms around it: how it is used, how many run round it, and who blocks it. */
+	void RecomputeModuleEdge(const FIntVector& Node, int32 Axis);
+
+	/** Works out which axes one rim cell carries broad faces along, afresh from the platforms around it. */
+	void RecomputeRimCell(const FIntVector& Cell);
+
+	/**
+	 * Judges again the placements round platforms just taken away - every one taking in a module edge of theirs, listed or
+	 * not - and those folding off a run whose promotion has changed.
+	 */
+	void RefreshCandidatesAfterRemoval(TConstArrayView<FGridPlatform> Removed, TConstArrayView<FGridSurfaceRef> FlippedSurfaces);
+
+	/** What has to follow taking platforms out: their pieces, the beams and posts around them, and the overlay's squares. */
+	void UpdateVisualsAfterRemoval(TConstArrayView<FGridPlatform> Removed, const TSet<uint64>& EdgeKeys, const TSet<uint64>& NodeKeys, TConstArrayView<FGridSurfaceRef> ChangedSurfaces);
+
+	/** Takes one piece out of its layer, moving no piece but its chunk's last. False when the layer has no such piece. */
+	bool RemovePieceFromLayer(FRoomPieceLayer& Layer, uint64 Key);
 
 	/** The category indices a structure carries, each once, leaving out any no usable structure carries. */
 	void GetCategoryIndices(const UPlatformStructureData* Structure, TArray<int32, TInlineAllocator<4>>& OutCategories) const;
@@ -2200,7 +2622,7 @@ private:
 	 * Draws one platform of a kind from the placement stream - a tile by weight, then one of its
 	 * placements - and places it. False when that kind has nowhere to go.
 	 */
-	bool PlacePlatformOfKind(EPlatformKind Kind);
+	bool PlacePlatformOfKind(EPlatformKind Kind, const TFunction<bool(const FGridPlatform&)>* Filter = nullptr);
 
 	/**
 	 * Takes a platform, fill and all, into the structure: the list, everything derived, the visuals,
@@ -2422,10 +2844,62 @@ private:
 	TMap<uint64, int32> PathEdges;
 	TMap<uint64, int32> PathNodes;
 
+	/**
+	 * The lattice pieces the pockets and molds reach into, each with how many reach it - kept apart from the obstacle keys,
+	 * which the rebuild asks, since a pocket moving through platforms leaves them standing.
+	 */
+	TMap<uint64, int32> PocketFaces;
+	TMap<uint64, int32> PocketEdges;
+	TMap<uint64, int32> PocketNodes;
+
+	/** How many times a pocket or mold has formed again since the cube was cleared, all of them together. */
+	int32 PocketMoves = 0;
+
+	/** The boxes of air the fields keep open, by bucket of cells (see AddAirBoxToBuckets), a box in every bucket it reaches. */
+	TMap<uint64, TArray<FAirBox>> AirBoxBuckets;
+
+	/** Every platform's health, by platform key. Beat state, like the streams: never saved, drawn again for any platform missing it. */
+	TMap<uint64, float> PlatformHealth;
+
+	/** Platforms with no health left, by platform key, oldest first, waiting to be taken away; and the same as a set. */
+	TArray<uint64> DyingQueue;
+	TSet<uint64> DyingKeys;
+
+	/** When play next strikes, and next starts and steps a reshuffle. */
+	double NextStrikeAt = 0.0;
+	double NextReshuffleAt = 0.0;
+	double NextReshuffleStepAt = 0.0;
+
+	/** The reshuffle under way: its zone, or INDEX_NONE; the platforms still to move, by key; and the spots it has emptied, kept free. */
+	int32 ReshuffleZoneIndex = INDEX_NONE;
+	TArray<uint64> ReshuffleKeys;
+	TArray<FAirBox> ReshuffleEmptied;
+
+	/** What deletion has done since the cube was cleared, for DeletionSummary. */
+	int32 StrikeCount = 0;
+	int32 HitCount = 0;
+	int32 VulnerableHitCount = 0;
+	int32 DamageRemovals = 0;
+	int32 ReshuffleCount = 0;
+	int32 ReshuffleRemovals = 0;
+	int32 ReshufflePlacements = 0;
+
+	/** The zones waiting for a first tile of their own, in order. */
+	TArray<int32> SeedQueue;
+
+	/** The min node of the first platform laid in the empty cube, which every other zone's first tile keeps in step with. */
+	TOptional<FIntVector> SeedPhase;
+
+	/**
+	 * Set when platforms have been taken out since the last rebuild. The faces' streaks and the category patches are
+	 * history, which a removal leaves as it was, so the check compares them only while growth has only added.
+	 */
+	bool bHasRemovals = false;
+
 	/** How many times a path has been drawn afresh since the cube was cleared, all paths together. Readout only. */
 	int32 PathRedraws = 0;
 
-	FTimerHandle PathTimerHandle;
+	FTimerHandle ClockTimerHandle;
 
 	/** Per usable tile and kind, in that order, the ways round it can be filled (see GetFillableWays). */
 	TArray<uint8> FillableWays;
@@ -2540,6 +3014,13 @@ private:
 
 	/** What the nature beat draws, where and with what, from a stream of its own. */
 	FRandomStream NatureStream;
+
+	/** Health, strikes and damage, and the first tiles' places, from streams of their own. */
+	FRandomStream DamageStream;
+	FRandomStream SeedStream;
+
+	/** Which zone is reshuffled, and which of its platforms move. */
+	FRandomStream ReshuffleStream;
 
 	FTimerHandle NatureTimerHandle;
 

@@ -279,10 +279,129 @@ struct FRoomManagerTestAccess
 		return Manager.IsCellInMoldShape(Manager.AirPockets[Index], Cell);
 	}
 
-	/** How many lattice pieces the obstacles hold back, of every kind - objects, air and pockets together. */
+	/** How many lattice pieces the obstacles hold back - the objects'. */
 	static int32 GetObstaclePieceCount(const ARoomManager& Manager)
 	{
 		return Manager.ObstacleFaces.Num() + Manager.ObstacleEdges.Num() + Manager.ObstacleNodes.Num();
+	}
+
+	/** How many lattice pieces the pockets and molds hold back, each once. */
+	static int32 GetPocketPieceCount(const ARoomManager& Manager)
+	{
+		return Manager.PocketFaces.Num() + Manager.PocketEdges.Num() + Manager.PocketNodes.Num();
+	}
+
+	/** Whether a platform keeps clear of every pocket and every mold's held-back box. */
+	static bool IsClearOfPockets(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsClearOfPockets(Platform);
+	}
+
+	/** Whether a platform keeps clear of all the air held back: paths, pockets, molds and the air over the fields. */
+	static bool IsClearOfHeldAir(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsClearOfHeldAir(Platform);
+	}
+
+	/** Whether a platform crosses air held back, so a hit does it more damage. */
+	static bool IsVulnerable(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsVulnerable(Platform);
+	}
+
+	/** Breaks the pocket or mold at Index down and forms it again elsewhere, all at once. */
+	static void MovePocket(ARoomManager& Manager, const int32 Index)
+	{
+		Manager.MovePocket(Index);
+	}
+
+	/** Starts moving the pocket or mold at Index, and steps the move a slab, as the clock does a tick. */
+	static void StartPocketMove(ARoomManager& Manager, const int32 Index)
+	{
+		Manager.MovingPocket = Index;
+		Manager.bPocketForming = false;
+	}
+
+	static void StepPocketMove(ARoomManager& Manager)
+	{
+		Manager.StepPocketMove();
+	}
+
+	static bool IsPocketMoving(const ARoomManager& Manager)
+	{
+		return Manager.MovingPocket != INDEX_NONE;
+	}
+
+	/** The zone a platform is in, and the cells a zone spans. */
+	static int32 GetZoneOf(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.GetZoneOf(Platform);
+	}
+
+	static TPair<FIntVector, FIntVector> GetZoneBox(const ARoomManager& Manager, const int32 Zone)
+	{
+		const ARoomManager::FAirBox Box = Manager.GetZoneBox(Zone);
+		return TPair<FIntVector, FIntVector>(Box.Min, Box.Max);
+	}
+
+	/** One strike, leaving those with no health waiting, as the clock strikes. */
+	static void Strike(ARoomManager& Manager)
+	{
+		Manager.Strike();
+	}
+
+	/** Takes away up to Most of the platforms waiting with no health, as the clock does a few a tick. */
+	static void RemoveDying(ARoomManager& Manager, const int32 Most)
+	{
+		Manager.RemoveDying(Most);
+	}
+
+	static int32 GetDyingCount(const ARoomManager& Manager)
+	{
+		return Manager.DyingQueue.Num();
+	}
+
+	/** A platform's health, or a negative number when it has none. */
+	static float GetHealth(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		const float* Health = Manager.PlatformHealth.Find(WEMGrid::MakeTaggedKey(Platform.MinNode, static_cast<int32>(Platform.Normal)));
+		return Health ? *Health : -1.0f;
+	}
+
+	/** Takes platforms away, as a strike or a reshuffle does. */
+	static void Remove(ARoomManager& Manager, const TArray<FGridPlatform>& Platforms)
+	{
+		Manager.RemovePlatforms(Platforms);
+	}
+
+	/** Starts a reshuffle, and steps it, as the clock does. */
+	static void BeginReshuffle(ARoomManager& Manager)
+	{
+		Manager.BeginReshuffle();
+	}
+
+	static bool StepReshuffle(ARoomManager& Manager)
+	{
+		return Manager.StepReshuffle();
+	}
+
+	/** The zone the reshuffle under way keeps to, or INDEX_NONE, and the platforms it still has to move. */
+	static int32 GetReshuffleZone(const ARoomManager& Manager, int32& OutWaiting)
+	{
+		OutWaiting = Manager.ReshuffleKeys.Num();
+		return Manager.ReshuffleZoneIndex;
+	}
+
+	/** Whether a placement's middle lies in a mold's box. */
+	static bool IsInMoldBox(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.IsInMoldBox(Platform);
+	}
+
+	/** The zones still waiting for a first tile. */
+	static int32 GetWaitingSeeds(const ARoomManager& Manager)
+	{
+		return Manager.SeedQueue.Num();
 	}
 
 	/** One path of air as drawn: its corners and the box of cells each leg fills. */
@@ -543,7 +662,8 @@ namespace WEMRoomManagerTests
 
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
-	 * pieces off, no air pockets, molds or paths, on a fixed seed. Structures replaces the slabs when given.
+	 * pieces off, no air pockets, molds or paths, one first tile in the middle, no strikes, reshuffles
+	 * or moving pockets, on a fixed seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -560,6 +680,10 @@ namespace WEMRoomManagerTests
 		Manager->AirPocketCount = 0;
 		Manager->MoldCount = 0;
 		Manager->PathCount = 0;
+		Manager->bSeedEveryZone = false;
+		Manager->bEnableDamage = false;
+		Manager->bEnableReshuffle = false;
+		Manager->bMovePockets = false;
 
 		UPlatformTileData* Square = MakeTile(16, 16);
 		UPlatformTileData* Small = MakeTile(8, 8);

@@ -125,7 +125,7 @@ Tests: `WEM.Nature.*`, 13 product tests and 1 stress test (`Perf`). 91/91 produc
 - **The city never meets water or a cliff.** That is the user's rule as written: those forms meet no urban face. The city still builds against their backs, so rooms can sit behind a cliff and under a pool.
 - **Nature is always load-bearing**, whatever stands behind it. Otherwise a non-load-bearing ceiling behind ground would block the field's free beams and stop it spilling.
 - **Air**: a storey is 16 cells (3.2 m). Each piece draws its own height, so the clearance over a field is stepped. A seam takes the lower of its two pieces' heights. The height comes from the run's seed and the piece's key, so a rebuild keeps the same air, but a level loaded later, without the seed, draws other heights. Air may overlap air, pockets and the city above its fewest storeys. It holds back only what comes later.
-- **Air pockets** are drawn only when the cube is cleared, never while platforms stand, because a pocket drawn later could sit through platforms already grown, and the rebuild would then leave those platforms out. A change to their settings mid-run takes effect at the next clear. A pocket that would take the first platform's place is drawn elsewhere, up to 16 times, then left out.
+- **Air pockets** are drawn only when the cube is cleared, never while platforms stand, because a pocket drawn later could sit through platforms already grown, and the rebuild would then leave those platforms out. A change to their settings mid-run takes effect at the next clear. A pocket that would take the first platform's place is drawn elsewhere, up to 16 times, then left out. (Changed 2026-10-15: pockets and molds now move during play, and no longer count as obstacles to the rebuild. See `DELETION.md`.)
 - **"Rectangular" vs "box"**: box is a cube, rectangular is any cuboid (the user's decision).
 - **Pockets reach outside the cube.** A pocket is drawn with its centre inside the cube, and only the pieces inside the cube are held back.
 
@@ -165,7 +165,7 @@ To see more nature, lower *Nature Placement Interval* (each beat costs about 4.5
 
   Deeper floors mostly collect sideways growth. A mold fills as the city reaches it, so it fills over time rather than at once.
 
-- **Nature never goes away.** Eden growth has no removal, so neither does nature. The laplacian branch's living world has removal, and it is a separate system.
+- ~~Nature never goes away.~~ Since 2026-10-15 platforms are struck down and reshuffled, nature among them, and pockets, molds and the air over the fields hold back only new placements. See `DELETION.md`.
 - **Flat colours only.** A nature structure with a mesh is drawn with the mesh, fitted like any structure, but no meshes exist yet.
 - **The object placer treats nature like any surface.** Ground holds items, so the city's objects will stand on meadows. Water and cliffs hold nothing.
 - **The nature beat samples**, so with very few places left it can miss them for a few beats.
