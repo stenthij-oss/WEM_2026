@@ -804,7 +804,7 @@ bool FNatureAirTest::RunTest(const FString& Parameters)
 	FRoomManagerTestAccess::Rebuild(*Manager, { Field, Wall });
 	TestEqual(TEXT("Field and wall stand"), Manager->GetPlatformCount(), 2);
 
-	// Its air: over its opening, out along its Up, between three and five storeys high.
+	// Its air: over its opening, out along its Up, one storey high to start with.
 	TArray<TPair<FIntVector, FIntVector>> Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
 	TestEqual(TEXT("One box of air, over its opening"), Boxes.Num(), 1);
 
@@ -813,7 +813,7 @@ bool FNatureAirTest::RunTest(const FString& Parameters)
 		const int32 Height = Boxes[0].Value.Z - Boxes[0].Key.Z + 1;
 		AddInfo(FString::Printf(TEXT("The field keeps %d cells of air."), Height));
 		TestEqual(TEXT("Between its beams"), Boxes[0].Key, FIntVector(17, 17, 33));
-		TestTrue(TEXT("Between three and five storeys"), Height >= 48 && Height <= 80 && Boxes[0].Value.X == 31 && Boxes[0].Value.Y == 31);
+		TestTrue(TEXT("One storey"), Height == 16 && Boxes[0].Value.X == 31 && Boxes[0].Value.Y == 31);
 	}
 
 	// Nothing is built in it: no floor off the wall's top over the field. Beyond the field the air is free.
@@ -850,7 +850,7 @@ bool FNatureAirTest::RunTest(const FString& Parameters)
 
 	Manager->MinAirStoreys = 0;
 	TestTrue(TEXT("Asking no air, it has enough"), FRoomManagerTestAccess::IsAirClear(*Manager, Under));
-	Manager->MinAirStoreys = 3;
+	Manager->MinAirStoreys = 1;
 
 	const FGridPlatform Open = MakeSegment(FIntVector(0, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
 	TestTrue(TEXT("Beside the roof, with nothing over it, the air is clear"), FRoomManagerTestAccess::IsAirClear(*Manager, Open));
@@ -858,7 +858,7 @@ bool FNatureAirTest::RunTest(const FString& Parameters)
 	// Upside down, the air is kept below it.
 	FRoomManagerTestAccess::Rebuild(*Manager, { MakeSegment(FIntVector(16, 16, 96), EGridAxis::Z, Square, EGridFace::NegZ, Kit.CeilingInterior, Kit.Ground) });
 	Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
-	TestTrue(TEXT("Hanging ground keeps the air below it"), Boxes.Num() == 1 && Boxes[0].Value.Z == 95 && Boxes[0].Key.Z <= 95 - 47);
+	TestTrue(TEXT("Hanging ground keeps the air below it"), Boxes.Num() == 1 && Boxes[0].Value.Z == 95 && Boxes[0].Key.Z == 80);
 
 	// The city growing round fields with their air, and nature growing too, agrees with a full rebuild.
 	Manager->ClearPlatforms();
@@ -1591,8 +1591,6 @@ bool FNatureMushroomTest::RunTest(const FString& Parameters)
 
 	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
 	Manager->GridSize = 129;
-	Manager->MinAirStoreys = 1;
-	Manager->MaxAirStoreys = 2;
 	Manager->ClearPlatforms();
 	UPlatformTileData* Square = Manager->Tiles[0];
 
@@ -1608,13 +1606,13 @@ bool FNatureMushroomTest::RunTest(const FString& Parameters)
 		}
 	}
 
-	auto ReadAir = [&](int32& OutLowest, int32& OutHighest, TPair<FIntVector, FIntVector>& OutCap)
+	// The trunks: a box 15 across over each piece's opening, their heights. The crown, if any, is the last box.
+	auto ReadAir = [&](int32& OutLowest, int32& OutHighest, TPair<FIntVector, FIntVector>& OutCrown)
 	{
 		const TArray<TPair<FIntVector, FIntVector>> Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
 		OutLowest = MAX_int32;
 		OutHighest = 0;
 
-		// The openings' air: a box 15 across over each piece. The cap, last, reaches past the landscape.
 		for (const TPair<FIntVector, FIntVector>& Box : Boxes)
 		{
 			if (Box.Value.X - Box.Key.X == 14 && Box.Value.Y - Box.Key.Y == 14)
@@ -1624,60 +1622,64 @@ bool FNatureMushroomTest::RunTest(const FString& Parameters)
 			}
 		}
 
-		OutCap = Boxes.IsEmpty() ? TPair<FIntVector, FIntVector>() : Boxes.Last();
+		OutCrown = Boxes.IsEmpty() ? TPair<FIntVector, FIntVector>() : Boxes.Last();
 		return Boxes.Num();
 	};
 
-	// Off, each piece keeps its own one or two storeys, and no cap.
+	// Off, every piece keeps its one storey, and no crown.
 	Manager->bMushroomAir = false;
 	FRoomManagerTestAccess::Rebuild(*Manager, Landscape);
 
 	int32 Lowest = 0, Highest = 0;
-	TPair<FIntVector, FIntVector> Cap;
-	const int32 PlainBoxes = ReadAir(Lowest, Highest, Cap);
-	AddInfo(FString::Printf(TEXT("Without the mushroom: %d boxes, air %d to %d cells. %s"), PlainBoxes, Lowest, Highest, *Manager->AirSummary));
-	TestTrue(TEXT("One or two storeys over each piece"), Lowest >= 16 && Highest <= 32);
+	TPair<FIntVector, FIntVector> Crown;
+	const int32 PlainBoxes = ReadAir(Lowest, Highest, Crown);
+	AddInfo(FString::Printf(TEXT("Without the crown: %d boxes, trunks %d to %d cells. %s"), PlainBoxes, Lowest, Highest, *Manager->AirSummary));
+	TestTrue(TEXT("One storey over each piece"), Lowest == 16 && Highest == 16);
 
-	// On, nine pieces: two storeys more over every piece (8 x 0.25), and a cap 16 cells past its edges (8 x 2).
+	// On, nine pieces: the trunks stay one storey, and a crown grows above them, two storeys (8 x 0.25) and reaching 16
+	// cells past the landscape's edges (8 x 2) - never in the first storey.
 	Manager->bMushroomAir = true;
 	FRoomManagerTestAccess::Rebuild(*Manager, Landscape);
 
-	const int32 MushroomBoxes = ReadAir(Lowest, Highest, Cap);
-	AddInfo(FString::Printf(TEXT("With it: %d boxes, air %d to %d cells, cap (%d,%d,%d)-(%d,%d,%d). %s"), MushroomBoxes, Lowest, Highest,
-		Cap.Key.X, Cap.Key.Y, Cap.Key.Z, Cap.Value.X, Cap.Value.Y, Cap.Value.Z, *Manager->AirSummary));
+	const int32 TreeBoxes = ReadAir(Lowest, Highest, Crown);
+	AddInfo(FString::Printf(TEXT("With it: %d boxes, trunks %d to %d cells, crown (%d,%d,%d)-(%d,%d,%d). %s"), TreeBoxes, Lowest, Highest,
+		Crown.Key.X, Crown.Key.Y, Crown.Key.Z, Crown.Value.X, Crown.Value.Y, Crown.Value.Z, *Manager->AirSummary));
 
-	TestEqual(TEXT("One box more: the cap"), MushroomBoxes, PlainBoxes + 1);
-	TestTrue(TEXT("The air over every piece rises two storeys"), Lowest >= 48 && Highest <= 64);
-	TestTrue(TEXT("The cap reaches 16 past its edges"), Cap.Key.X == 0 && Cap.Key.Y == 0 && Cap.Value.X == 80 && Cap.Value.Y == 80);
-	TestTrue(TEXT("At the top of the air, a storey thick"), Cap.Value.Z == 32 + Highest && Cap.Value.Z - Cap.Key.Z == 15);
+	TestEqual(TEXT("One box more: the crown"), TreeBoxes, PlainBoxes + 1);
+	TestTrue(TEXT("The trunks stay one storey"), Lowest == 16 && Highest == 16);
+	TestTrue(TEXT("The crown reaches 16 past the edges"), Crown.Key.X == 0 && Crown.Key.Y == 0 && Crown.Value.X == 80 && Crown.Value.Y == 80);
+	TestTrue(TEXT("From above the first storey, two storeys up"), Crown.Key.Z == 32 + 17 && Crown.Value.Z == 32 + 48);
 
-	// Nothing new is laid in the cap, past the landscape's edge; what stands there stays, and is vulnerable.
-	const int32 CapLayer = (Cap.Key.Z + 3) / 4 * 4;
-	const FGridPlatform UnderCap = MakeSegment(FIntVector(64, 16, CapLayer), EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior);
-	TestFalse(TEXT("Nothing laid in the cap"), FRoomManagerTestAccess::IsClearOfHeldAir(*Manager, UnderCap));
+	// The first storey past the landscape's edge stays free; the crown above it does not.
+	const FGridPlatform BesideTrunk = MakeSegment(FIntVector(64, 16, 48), EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior);
+	const FGridPlatform InCrown = MakeSegment(FIntVector(64, 16, 64), EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior);
+	TestTrue(TEXT("Nothing held back in the first storey past the edge"), FRoomManagerTestAccess::IsClearOfHeldAir(*Manager, BesideTrunk));
+	TestFalse(TEXT("But in the crown above it"), FRoomManagerTestAccess::IsClearOfHeldAir(*Manager, InCrown));
 
+	// What stands in the crown stays, and is vulnerable.
 	TArray<FGridPlatform> WithFloor = Landscape;
-	WithFloor.Add(UnderCap);
+	WithFloor.Add(InCrown);
 	FRoomManagerTestAccess::Rebuild(*Manager, WithFloor);
-	TestEqual(TEXT("What stands in the cap stays"), Manager->GetPlatformCount(), 10);
-	TestTrue(TEXT("And is vulnerable"), FRoomManagerTestAccess::IsVulnerable(*Manager, UnderCap));
+	TestEqual(TEXT("What stands in the crown stays"), Manager->GetPlatformCount(), 10);
+	TestTrue(TEXT("And is vulnerable"), FRoomManagerTestAccess::IsVulnerable(*Manager, InCrown));
 
-	// Taking a corner piece away shrinks it: eight pieces, one storey and 12 cells (14, in whole modules). The air kept
-	// piece by piece agrees with a full rebuild, the lists with it.
+	// Taking a corner piece away shrinks it: eight pieces, one storey of crown, 12 cells out (14, in whole modules). The air
+	// kept piece by piece agrees with a full rebuild, the lists with it.
 	FRoomManagerTestAccess::Rebuild(*Manager, Landscape);
 	FRoomManagerTestAccess::EnsureCandidates(*Manager);
 	FRoomManagerTestAccess::Remove(*Manager, { Landscape[0] });
 
-	ReadAir(Lowest, Highest, Cap);
+	ReadAir(Lowest, Highest, Crown);
 	AddInfo(Manager->AirSummary);
-	TestTrue(TEXT("Eight pieces: a storey less"), Lowest >= 32 && Highest <= 48);
-	TestTrue(TEXT("And a narrower cap"), Cap.Key.X == 4 && Cap.Value.X == 76);
+	TestTrue(TEXT("Eight pieces: a storey of crown"), Crown.Key.Z == 32 + 17 && Crown.Value.Z == 32 + 32);
+	TestTrue(TEXT("And narrower"), Crown.Key.X == 4 && Crown.Value.X == 76);
 	TestEqual(TEXT("It agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
 
-	// Split down the middle, it is two landscapes of three, each with less air.
+	// Split down the middle, it is two landscapes of two and three, too small for a crown.
 	FRoomManagerTestAccess::Remove(*Manager, { Landscape[1], Landscape[4], Landscape[7] });
 	AddInfo(Manager->AirSummary);
 	TestTrue(TEXT("Split in two"), Manager->AirSummary.StartsWith(TEXT("2 landscapes")));
+	TestTrue(TEXT("Only trunks"), !FRoomManagerTestAccess::GetAirBoxes(*Manager).ContainsByPredicate([](const TPair<FIntVector, FIntVector>& Box) { return Box.Key.Z > 32 + 16; }));
 	TestEqual(TEXT("Split, it agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
 
 	ReleaseRooted(Rooted);

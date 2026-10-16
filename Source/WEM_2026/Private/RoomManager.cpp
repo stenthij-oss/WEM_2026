@@ -147,11 +147,17 @@ namespace
 	/** The air over the fields is bucketed in cubes of 2^this cells, so a placement asks only the boxes near it. */
 	constexpr int32 AirBoxBucketShift = 5;
 
-	/** The colours the zones are drawn in when ZoneColors names too few. */
-	const FColor DefaultZoneColors[] = {
-		FColor(255, 60, 60), FColor(255, 150, 0), FColor(255, 230, 0),
-		FColor(120, 230, 0), FColor(255, 255, 255), FColor(0, 220, 200),
-		FColor(0, 120, 255), FColor(150, 70, 255), FColor(255, 70, 200) };
+	/**
+	 * The colour a zone is drawn in when ZoneColors names too few: one of nine hues across its layer, the same nine on
+	 * every layer, darker on the bottom one and paler on the top one.
+	 */
+	FColor GetDefaultZoneColor(const int32 Zone, const int32 ZonesPerLayer)
+	{
+		const int32 Layer = Zone / ZonesPerLayer;
+		const uint8 Hue = static_cast<uint8>((Zone % ZonesPerLayer) * 256 / ZonesPerLayer);
+
+		return FLinearColor::MakeFromHSV8(Hue, Layer >= 2 ? 120 : 255, Layer == 0 ? 150 : 255).ToFColor(/*bSRGB=*/true);
+	}
 
 	/** A bucket of the air over the fields, named by its coordinates in buckets. */
 	FORCEINLINE uint64 MakeAirBucketKey(const int32 X, const int32 Y, const int32 Z)
@@ -657,7 +663,10 @@ ARoomManager::ARoomManager()
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
 
-	ZoneColors.Append(DefaultZoneColors, UE_ARRAY_COUNT(DefaultZoneColors));
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		ZoneColors.Add(GetDefaultZoneColor(Zone, ZonesPerSide * ZonesPerSide));
+	}
 
 	GridLineBatcher = CreateDefaultSubobject<ULineBatchComponent>(TEXT("GridLineBatcher"));
 	GridLineBatcher->SetupAttachment(SceneRoot);
@@ -1666,7 +1675,21 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind, const TFunction
 
 			// Inside a mold's box a placement weighs MoldGrowthWeight, so the city fills a mold sooner than it would
 			// by chance. Weighed only while a mold stands, so without one the draw is as it always was.
-			const bool bMoldPull = MoldGrowthWeight > 1.0f && AirPockets.ContainsByPredicate([](const FAirPocket& Pocket) { return Pocket.bMold; });
+			TArray<TPair<FVector, FVector>, TInlineAllocator<4>> MoldBounds;
+
+			if (MoldGrowthWeight > 1.0f)
+			{
+				for (const FAirPocket& Pocket : AirPockets)
+				{
+					if (Pocket.bMold)
+					{
+						TPair<FVector, FVector>& Bounds = MoldBounds.AddDefaulted_GetRef();
+						GetPocketBounds(Pocket, Bounds.Key, Bounds.Value);
+					}
+				}
+			}
+
+			const bool bMoldPull = !MoldBounds.IsEmpty();
 			TArray<double> PullWeights;
 
 			if (bMoldPull)
@@ -1676,7 +1699,17 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind, const TFunction
 
 				for (const FGridPlatform& Candidate : Candidates)
 				{
-					Running += !IsFillable(ChosenTile, Candidate) ? 0.0 : (IsInMoldBox(Candidate) ? MoldGrowthWeight : 1.0);
+					// As IsInMoldBox asks it, with the molds' bounds worked out once rather than for every placement.
+					const FAirBox Box = GetPlatformBox(Candidate);
+					const FVector Middle = 0.5 * FVector(Box.Min + Box.Max) + FVector(0.5);
+					const bool bInMold = MoldBounds.ContainsByPredicate([&Middle](const TPair<FVector, FVector>& Bounds)
+					{
+						return Middle.X >= Bounds.Key.X && Middle.X <= Bounds.Value.X
+							&& Middle.Y >= Bounds.Key.Y && Middle.Y <= Bounds.Value.Y
+							&& Middle.Z >= Bounds.Key.Z && Middle.Z <= Bounds.Value.Z;
+					});
+
+					Running += !IsFillable(ChosenTile, Candidate) ? 0.0 : (bInMold ? MoldGrowthWeight : 1.0);
 					PullWeights.Add(Running);
 				}
 			}
@@ -3587,7 +3620,7 @@ int32 ARoomManager::GetAirHeight(const FGridPlatform& Platform) const
 	return Stream.RandRange(Fewest, Most);
 }
 
-void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 PlatformIndex, const int32 Height, TArray<FAirBox>& OutBoxes, const int32 ExtraHeight) const
+void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 PlatformIndex, const int32 Height, TArray<FAirBox>& OutBoxes) const
 {
 	OutBoxes.Reset();
 
@@ -3675,7 +3708,7 @@ void ARoomManager::GatherAirBoxes(const FGridPlatform& Platform, const int32 Pla
 						RunStart = Platform.MinNode[AlongAxis] + Step;
 					}
 
-					RunHeight = FMath::Min(RunHeight, GetAirHeight(*Neighbour) + ExtraHeight);
+					RunHeight = FMath::Min(RunHeight, GetAirHeight(*Neighbour));
 				}
 				else
 				{
@@ -3964,47 +3997,49 @@ void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscape
 		++Sizes[FindRoot(Slot)];
 	}
 
-	// Each piece's air, as high as it drew and raised by its landscape's mushroom, its seams the lower of their two.
+	// Each piece's own air - its trunk - as high as it drew, its seams the lower of their two.
 	const int32 Storey = FMath::Max(StoreyCells, 1);
 	TArray<FAirBox> Boxes;
 
-	// Per landscape, by its root: how far it reaches in its plane, and the highest its air goes.
-	TMap<int32, TPair<FAirBox, int32>> Caps;
+	// Per landscape, by its root: how far it reaches in its plane, and the highest its trunks go.
+	TMap<int32, TPair<FAirBox, int32>> Crowns;
 	TArray<int32> Roots;
 
 	for (int32 Slot = 0; Slot < Pieces.Num(); ++Slot)
 	{
 		const FGridPlatform& Piece = BuiltPlatforms[Pieces[Slot]];
 		const int32 Root = FindRoot(Slot);
-		const int32 Extra = GetMushroomStoreys(Sizes[Root]) * Storey;
-		const int32 Height = GetAirHeight(Piece) + Extra;
+		const int32 Height = GetAirHeight(Piece);
 
-		GatherAirBoxes(Piece, Pieces[Slot], Height, Boxes, Extra);
+		GatherAirBoxes(Piece, Pieces[Slot], Height, Boxes);
 		OutBoxes.Append(Boxes);
 
 		const FAirBox PieceBox = GetPlatformBox(Piece);
 
-		if (TPair<FAirBox, int32>* Cap = Caps.Find(Root))
+		if (TPair<FAirBox, int32>* Crown = Crowns.Find(Root))
 		{
-			Cap->Key.Min = ComponentMin(Cap->Key.Min, PieceBox.Min);
-			Cap->Key.Max = ComponentMax(Cap->Key.Max, PieceBox.Max);
-			Cap->Value = FMath::Max(Cap->Value, Height);
+			Crown->Key.Min = ComponentMin(Crown->Key.Min, PieceBox.Min);
+			Crown->Key.Max = ComponentMax(Crown->Key.Max, PieceBox.Max);
+			Crown->Value = FMath::Max(Crown->Value, Height);
 		}
 		else
 		{
-			Caps.Add(Root, TPair<FAirBox, int32>(PieceBox, Height));
+			Crowns.Add(Root, TPair<FAirBox, int32>(PieceBox, Height));
 			Roots.Add(Root);
 		}
 	}
 
-	// Then each landscape's cap: a layer at the top of its air, reaching past its edges in its plane.
+	// Then each landscape's crown, once it has grown a storey: above the trunk - never in the first storey, which stays as
+	// wide as the landscape - up to the trunks' top raised by the storeys it has grown, and reaching past the landscape's
+	// edges in its plane.
 	const int32 LastCell = ResolveGridSize() - 1;
+	const int32 TrunkTop = FMath::Max(MinAirStoreys, 1) * Storey;
 
 	for (const int32 Root : Roots)
 	{
-		const int32 Spread = GetMushroomSpread(Sizes[Root]);
+		const int32 Grown = GetMushroomStoreys(Sizes[Root]) * Storey;
 
-		if (Spread <= 0)
+		if (Grown <= 0)
 		{
 			continue;
 		}
@@ -4012,15 +4047,15 @@ void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscape
 		const FGridPlatform& First = BuiltPlatforms[Pieces[Root]];
 		const int32 NormalAxis = AxisIndex(First.Normal);
 		const bool bOutPositive = FaceSign(First.Up) > 0;
-		const TPair<FAirBox, int32>& Cap = Caps.FindChecked(Root);
-		const int32 Top = Cap.Value;
-		const int32 Thick = FMath::Min(FMath::Max(MushroomCapStoreys, 1) * Storey, Top);
+		const TPair<FAirBox, int32>& Crown = Crowns.FindChecked(Root);
+		const int32 Top = FMath::Max(Crown.Value, TrunkTop) + Grown;
+		const int32 Spread = GetMushroomSpread(Sizes[Root]);
 		const int32 Plane = First.MinNode[NormalAxis];
 
 		int32 U, V;
 		GetInPlaneAxes(NormalAxis, U, V);
 
-		FAirBox Box = Cap.Key;
+		FAirBox Box = Crown.Key;
 
 		for (const int32 Axis : { U, V })
 		{
@@ -4028,8 +4063,8 @@ void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscape
 			Box.Max[Axis] = FMath::Min(Box.Max[Axis] + Spread, LastCell);
 		}
 
-		Box.Min[NormalAxis] = bOutPositive ? Plane + Top - Thick + 1 : Plane - Top;
-		Box.Max[NormalAxis] = bOutPositive ? Plane + Top : Plane - Top + Thick - 1;
+		Box.Min[NormalAxis] = bOutPositive ? Plane + TrunkTop + 1 : Plane - Top;
+		Box.Max[NormalAxis] = bOutPositive ? Plane + Top : Plane - TrunkTop - 1;
 		OutBoxes.Add(Box);
 	}
 
@@ -4147,7 +4182,7 @@ void ARoomManager::UpdateFieldAir(const bool bRefreshLists)
 
 	AirBoxes = MoveTemp(NewBoxes);
 
-	AirSummary = Landscapes == 0 ? TEXT("No landscapes") : FString::Printf(TEXT("%d landscapes, %d boxes of air; the largest, %d pieces, raises its air %d storeys and caps it %d cells past its edges"),
+	AirSummary = Landscapes == 0 ? TEXT("No landscapes") : FString::Printf(TEXT("%d landscapes, %d boxes of air; the largest, %d pieces, grows a crown %d storeys above its trunk, reaching %d cells past its edges"),
 		Landscapes, AirBoxes.Num(), Largest, GetMushroomStoreys(Largest), GetMushroomSpread(Largest));
 
 	if (!bRefreshLists || (Added.IsEmpty() && Gone.IsEmpty()))
@@ -4158,7 +4193,7 @@ void ARoomManager::UpdateFieldAir(const bool bRefreshLists)
 	DropCandidatesIn(Added);
 
 	// Where a box has gone, what it held back may have come free - all but what a box in its place still holds, as when
-	// the air over a piece only rises or sinks, or a cap only widens.
+	// a crown only rises or widens.
 	TArray<FAirBox> Freed;
 
 	for (const FAirBox& Box : Gone)
@@ -8793,7 +8828,7 @@ int32 ARoomManager::GetZoneOf(const FGridPlatform& Platform) const
 	int32 Zone = 0;
 	int32 Stride = 1;
 
-	for (const int32 Axis : { 0, 1 })
+	for (int32 Axis = 0; Axis < 3; ++Axis)
 	{
 		const int32 TwiceMiddle = Box.Min[Axis] + Box.Max[Axis];
 		int32 Index = 0;
@@ -8812,12 +8847,12 @@ int32 ARoomManager::GetZoneOf(const FGridPlatform& Platform) const
 
 ARoomManager::FAirBox ARoomManager::GetZoneBox(const int32 Zone) const
 {
-	const int32 Column = Zone % ZonesPerSide;
-	const int32 Row = Zone / ZonesPerSide;
+	// Along X, then Y, then up a layer.
+	const FIntVector Index(Zone % ZonesPerSide, (Zone / ZonesPerSide) % ZonesPerSide, Zone / (ZonesPerSide * ZonesPerSide));
 
 	FAirBox Box;
-	Box.Min = FIntVector(GetZoneLine(Column), GetZoneLine(Row), 0);
-	Box.Max = FIntVector(GetZoneLine(Column + 1), GetZoneLine(Row + 1), ResolveGridSize() - 1);
+	Box.Min = FIntVector(GetZoneLine(Index.X), GetZoneLine(Index.Y), GetZoneLine(Index.Z));
+	Box.Max = FIntVector(GetZoneLine(Index.X + 1), GetZoneLine(Index.Y + 1), GetZoneLine(Index.Z + 1));
 	return Box;
 }
 
@@ -8831,7 +8866,7 @@ void ARoomManager::AppendZoneLines(TArray<FBatchedLine>& Lines) const
 		const FAirBox Box = GetZoneBox(Zone);
 		const FVector Min = GetCellMinCorner(Box.Min) + Inset;
 		const FVector Max = GetCellMinCorner(Box.Max) + FVector(CellSize) - Inset;
-		const FLinearColor Color(ZoneColors.IsValidIndex(Zone) ? ZoneColors[Zone] : DefaultZoneColors[Zone]);
+		const FLinearColor Color(ZoneColors.IsValidIndex(Zone) ? ZoneColors[Zone] : GetDefaultZoneColor(Zone, ZonesPerSide * ZonesPerSide));
 
 		AppendBoxLines(Lines, Min, Max, Color, BoundaryLineThickness, SDPG_World, /*bWithDiagonals=*/false);
 
@@ -8853,14 +8888,22 @@ void ARoomManager::UpdateZoneSummary()
 		++Counts[GetZoneOf(Platform)];
 	}
 
-	TArray<FString> Parts;
+	// A layer at a time, from the bottom up.
+	TArray<FString> LayerParts;
 
-	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	for (int32 Layer = 0; Layer < ZonesPerSide; ++Layer)
 	{
-		Parts.Add(FString::Printf(TEXT("%d"), Counts[Zone]));
+		TArray<FString> Parts;
+
+		for (int32 Zone = Layer * ZonesPerSide * ZonesPerSide; Zone < (Layer + 1) * ZonesPerSide * ZonesPerSide; ++Zone)
+		{
+			Parts.Add(FString::Printf(TEXT("%d"), Counts[Zone]));
+		}
+
+		LayerParts.Add(FString::Join(Parts, TEXT(", ")));
 	}
 
-	ZoneSummary = FString::Join(Parts, TEXT(", "));
+	ZoneSummary = FString::Join(LayerParts, TEXT(" | "));
 }
 
 void ARoomManager::QueueSeeds()
@@ -8924,10 +8967,10 @@ bool ARoomManager::PlaceSeed(const int32 Zone)
 		return Places;
 	};
 
-	// The whole tile inside its zone, at any height in the cube.
+	// The whole tile inside its zone.
 	const TArray<int32> PlacesX = GetPlaces(Phase.X, StepX, ZoneBox.Min.X, ZoneBox.Max.X - StepX);
 	const TArray<int32> PlacesY = GetPlaces(Phase.Y, StepY, ZoneBox.Min.Y, ZoneBox.Max.Y - StepY);
-	const TArray<int32> PlacesZ = GetPlaces(Phase.Z, StepZ, 0, LastNode);
+	const TArray<int32> PlacesZ = GetPlaces(Phase.Z, StepZ, ZoneBox.Min.Z, FMath::Min(ZoneBox.Max.Z, LastNode));
 
 	if (PlacesX.IsEmpty() || PlacesY.IsEmpty() || PlacesZ.IsEmpty())
 	{

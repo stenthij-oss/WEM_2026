@@ -245,24 +245,26 @@ bool FDeletionSeedsTest::RunTest(const FString& Parameters)
 	Manager->bSeedEveryZone = true;
 	Manager->ClearPlatforms();
 
-	// The zones tile the cube, three by three, the full height, on lattice lines.
+	// The zones tile the cube, three by three by three, on lattice lines.
 	int32 Covered = 0;
 
-	for (int32 Zone = 0; Zone < 9; ++Zone)
+	for (int32 Zone = 0; Zone < 27; ++Zone)
 	{
 		const TPair<FIntVector, FIntVector> Box = FRoomManagerTestAccess::GetZoneBox(*Manager, Zone);
-		TestTrue(TEXT("Zones lie on lattice lines"), Box.Key.X % 4 == 0 && Box.Key.Y % 4 == 0 && Box.Value.X % 4 == 0 && Box.Value.Y % 4 == 0);
-		TestTrue(TEXT("The full height"), Box.Key.Z == 0 && Box.Value.Z == Manager->GridSize - 1);
-		Covered += (Box.Value.X - Box.Key.X) * (Box.Value.Y - Box.Key.Y);
+		TestTrue(TEXT("Zones lie on lattice lines"), Box.Key.X % 4 == 0 && Box.Key.Y % 4 == 0 && Box.Key.Z % 4 == 0
+			&& Box.Value.X % 4 == 0 && Box.Value.Y % 4 == 0 && Box.Value.Z % 4 == 0);
+		Covered += (Box.Value.X - Box.Key.X) * (Box.Value.Y - Box.Key.Y) * (Box.Value.Z - Box.Key.Z);
 	}
 
-	TestEqual(TEXT("And cover it between them"), Covered, (Manager->GridSize - 1) * (Manager->GridSize - 1));
-	TestEqual(TEXT("Eight zones wait for a first tile"), FRoomManagerTestAccess::GetWaitingSeeds(*Manager), 8);
+	const TPair<FIntVector, FIntVector> Top = FRoomManagerTestAccess::GetZoneBox(*Manager, 26);
+	TestEqual(TEXT("And cover it between them"), Covered, (Manager->GridSize - 1) * (Manager->GridSize - 1) * (Manager->GridSize - 1));
+	TestTrue(TEXT("The last at the cube's far corner, up top"), Top.Value == FIntVector(Manager->GridSize - 1));
+	TestEqual(TEXT("26 zones wait for a first tile"), FRoomManagerTestAccess::GetWaitingSeeds(*Manager), 26);
 
 	// The middle one first, at the heart of the cube, then one in every other zone, a beat each.
-	Grow(*Manager, 9);
+	Grow(*Manager, 27);
 	const TArray<FGridPlatform>& Built = FRoomManagerTestAccess::GetBuilt(*Manager);
-	TestEqual(TEXT("Nine first tiles"), Built.Num(), 9);
+	TestEqual(TEXT("27 first tiles"), Built.Num(), 27);
 
 	TSet<int32> Zones;
 	bool bInStep = true;
@@ -283,15 +285,15 @@ bool FDeletionSeedsTest::RunTest(const FString& Parameters)
 		bApart = bApart && (FMath::Abs(Step.X) > 16 || FMath::Abs(Step.Y) > 16 || Step.Z != 0);
 	}
 
-	TestEqual(TEXT("The first in the middle zone"), FRoomManagerTestAccess::GetZoneOf(*Manager, Built[0]), 4);
-	TestEqual(TEXT("One in every zone"), Zones.Num(), 9);
+	TestEqual(TEXT("The first in the middle zone"), FRoomManagerTestAccess::GetZoneOf(*Manager, Built[0]), 13);
+	TestEqual(TEXT("One in every zone"), Zones.Num(), 27);
 	TestTrue(TEXT("All flat, in step with the middle one"), bInStep);
 	TestTrue(TEXT("None touching the middle one"), bApart);
 
 	// Growth from all of them agrees with a full rebuild, which keeps every first tile.
 	Grow(*Manager, 400);
 	AddInfo(FString::Printf(TEXT("%d platforms; per zone %s."), Manager->GetPlatformCount(), *Manager->ZoneSummary));
-	TestEqual(TEXT("Growth from nine first tiles agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+	TestEqual(TEXT("Growth from 27 first tiles agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
 
 	FRoomManagerTestAccess::Rebuild(*Manager, Manager->Platforms);
 	TestEqual(TEXT("The rebuild keeps them all"), FRoomManagerTestAccess::GetBuilt(*Manager).Num(), Manager->Platforms.Num());
@@ -299,7 +301,7 @@ bool FDeletionSeedsTest::RunTest(const FString& Parameters)
 	// Off, the middle one alone.
 	Manager->bSeedEveryZone = false;
 	Manager->ClearPlatforms();
-	Grow(*Manager, 9);
+	Grow(*Manager, 27);
 	TestEqual(TEXT("Off, growth starts from the middle alone"), FRoomManagerTestAccess::GetWaitingSeeds(*Manager), 0);
 
 	ReleaseRooted(Rooted);
@@ -345,7 +347,7 @@ bool FDeletionReshuffleTest::RunTest(const FString& Parameters)
 
 		int32 Waiting = 0;
 		const int32 Zone = FRoomManagerTestAccess::GetReshuffleZone(*Manager, Waiting);
-		TestTrue(TEXT("A zone is drawn, and between 4 and 12 to move"), Zone >= 0 && Zone < 9 && Waiting >= 0 && Waiting <= 12);
+		TestTrue(TEXT("A zone is drawn, and between 4 and 12 to move"), Zone >= 0 && Zone < 27 && Waiting >= 0 && Waiting <= 12);
 
 		const TArray<FGridPlatform> StoodBefore = FRoomManagerTestAccess::GetBuilt(*Manager);
 
@@ -527,7 +529,7 @@ bool FDeletionPerfTest::RunTest(const FString& Parameters)
 {
 	using namespace DeletionTestsPrivate;
 
-	// A NewMap-sized cube, nine first tiles, six pockets and two molds, grown to 3000 platforms. Then play's deletion as the
+	// A NewMap-sized cube, 27 first tiles, six pockets and two molds, grown to 3000 platforms. Then play's deletion as the
 	// clock does it, timed: strikes, the removals a few a tick, reshuffle steps, pocket moves - with growth going on.
 	FScopedTestWorld TestWorld;
 	TArray<UObject*> Rooted;

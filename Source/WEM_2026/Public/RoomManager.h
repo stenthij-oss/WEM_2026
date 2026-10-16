@@ -458,7 +458,7 @@ struct FSurfaceMarkLayer
  *
  * Zones and deletion
  * ------------------
- * The cube is split into nine zones, three by three across it, each with a first tile of its own.
+ * The cube is split into 27 zones, three by three by three, each with a first tile of its own.
  * Every platform has health; strikes wear a share of them down, and one with none left is taken
  * away. A zone is reshuffled now and then, and pockets and molds move during play. The whole of it
  * is told by the deletion code further down.
@@ -771,15 +771,16 @@ public:
 	int32 StoreyCells = 16;
 
 	/**
-	 * The fewest storeys of air kept open above every piece of ground and water, out along its Up. A piece is
-	 * only laid where this much is clear of every platform. Zero keeps no air.
+	 * The fewest storeys of air kept open above every piece of ground and water, out along its Up: what every piece
+	 * starts with, before its landscape grows. A piece is only laid where this much is clear of every platform. Zero
+	 * keeps no air.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0"))
-	int32 MinAirStoreys = 3;
+	int32 MinAirStoreys = 1;
 
-	/** The most storeys of air a piece keeps open. Each piece keeps a height of its own, drawn between the two. */
+	/** The most storeys of air a piece keeps open to start with. Each piece keeps a height of its own, drawn between the two. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0"))
-	int32 MaxAirStoreys = 5;
+	int32 MaxAirStoreys = 1;
 
 	/** Draws the air kept open above ground and water as boxes of lines. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
@@ -790,31 +791,29 @@ public:
 	FColor AirColor = FColor(255, 190, 40);
 
 	/**
-	 * Lets the air above a landscape - ground and water joined across their seams in one plane - grow like a mushroom
-	 * as the landscape does: higher over every piece of it, and capped at the top by a layer reaching out past its edges.
+	 * Lets the air above a landscape - ground and water joined across their seams in one plane - grow like a tree as the
+	 * landscape does. Every piece keeps its own storey of air, the trunk, as wide as the landscape. As pieces join, a crown
+	 * grows above the trunk - never in the first storey - that rises a storey at a time and reaches out past the
+	 * landscape's edges.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air")
 	bool bMushroomAir = true;
 
-	/** Storeys of air added over every piece of a landscape for each piece it has beyond its first, rounded down. */
+	/** Storeys the crown rises above the trunk for each piece the landscape has beyond its first, rounded down. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0.0", EditCondition = "bMushroomAir"))
 	float MushroomStoreysPerPiece = 0.25f;
 
-	/** The most storeys a landscape's air grows by, however large it gets. */
+	/** The most storeys the crown rises, however large the landscape gets. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0", EditCondition = "bMushroomAir"))
 	int32 MaxMushroomStoreys = 4;
 
-	/** Cells the cap reaches out past the landscape's edges for each piece it has beyond its first, in whole modules. */
+	/** Cells the crown reaches out past the landscape's edges for each piece it has beyond its first, in whole modules. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0.0", EditCondition = "bMushroomAir"))
 	float MushroomSpreadPerPiece = 2.0f;
 
-	/** The furthest the cap reaches out past the landscape's edges, in cells. */
+	/** The furthest the crown reaches out past the landscape's edges, in cells. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0", EditCondition = "bMushroomAir"))
 	int32 MaxMushroomSpread = 48;
-
-	/** How thick the cap is, in storeys, at the top of the landscape's air. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "1", EditCondition = "bMushroomAir"))
-	int32 MushroomCapStoreys = 1;
 
 	/** The landscapes standing and the air over the largest. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Air")
@@ -1049,23 +1048,26 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Paths")
 	FString PathSummary;
 
-	/** Draws the nine zones as boxes of lines, each in its own colour, the full height of the cube. */
+	/** Draws the 27 zones as boxes of lines, each in its own colour. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
 	bool bShowZones = false;
 
-	/** The zones' colours, in zone order: three along X, then the next three along Y. The fifth is the middle zone. */
+	/**
+	 * The zones' colours, in zone order: three along X, then the next three along Y, then the next nine a layer up. The
+	 * fourteenth is the middle zone. By default the same nine hues on every layer, darker below and paler above.
+	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
 	TArray<FColor> ZoneColors;
 
 	/**
-	 * Gives every zone a first tile of its own, growth starting from all nine: the middle zone's at the heart of the cube
+	 * Gives every zone a first tile of its own, growth starting from all 27: the middle zone's at the heart of the cube
 	 * as before, each other one at a random place in its zone, in step with the middle one so their growth lines up when
 	 * it meets. Off, growth starts from the middle one alone.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
 	bool bSeedEveryZone = true;
 
-	/** Platforms standing in each zone, in zone order, as the last strike or rebuild counted them. Readout only. */
+	/** Platforms standing in each zone, in zone order, a layer at a time from the bottom, as the last strike or rebuild counted them. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Zones")
 	FString ZoneSummary;
 
@@ -2082,10 +2084,9 @@ private:
 	/**
 	 * The boxes of air a piece of ground or water keeps open, Height cells out along its Up: one over its
 	 * opening, and one over each run of seam it shares with a piece of a field laid before it - before
-	 * PlatformIndex - in its plane with its Up, as high as the lower of the two, that piece's height raised by
-	 * ExtraHeight as well. Its outline is left open.
+	 * PlatformIndex - in its plane with its Up, as high as the lower of the two. Its outline is left open.
 	 */
-	void GatherAirBoxes(const FGridPlatform& Platform, int32 PlatformIndex, int32 Height, TArray<FAirBox>& OutBoxes, int32 ExtraHeight = 0) const;
+	void GatherAirBoxes(const FGridPlatform& Platform, int32 PlatformIndex, int32 Height, TArray<FAirBox>& OutBoxes) const;
 
 	/** Whether a piece of ground or water about to be placed would have MinAirStoreys of air clear of every platform. */
 	bool IsAirClear(const FGridPlatform& Platform) const;
@@ -2094,13 +2095,13 @@ private:
 	void AddObstacleKeys(const FIntVector& MinCell, const FIntVector& MaxCell);
 
 	/**
-	 * Every box of air the fields standing keep open, worked out afresh: per piece in list order its boxes (see
-	 * GatherAirBoxes), raised by its landscape's mushroom, then a cap over each landscape that has one. A landscape is the
-	 * pieces joined across their seams in one plane with one Up.
+	 * Every box of air the fields standing keep open, worked out afresh: per piece in list order its boxes - its trunk (see
+	 * GatherAirBoxes) - then the crown over each landscape that has grown one. A landscape is the pieces joined across
+	 * their seams in one plane with one Up.
 	 */
 	void GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscapes = nullptr, int32* OutLargest = nullptr) const;
 
-	/** How many storeys a landscape of Pieces pieces raises its air by, and how many cells its cap reaches past its edges. */
+	/** How many storeys a landscape of Pieces pieces grows its crown, and how many cells the crown reaches past its edges. */
 	int32 GetMushroomStoreys(int32 Pieces) const;
 	int32 GetMushroomSpread(int32 Pieces) const;
 
@@ -2371,8 +2372,8 @@ private:
 	/*
 	 * Zones
 	 * -----
-	 * The cube is split into nine zones, three by three across X and Y, each the full height of the cube, their
-	 * borders on lattice lines a third of the way across. A platform is in the zone its middle lies in. With
+	 * The cube is split into 27 zones, three by three by three - three layers of nine - their borders on lattice
+	 * lines a third of the way across along each axis. A platform is in the zone its middle lies in. With
 	 * bSeedEveryZone each zone has a first tile of its own: the middle zone's is laid as the first platform always
 	 * was, at the heart of the cube, and the beats after it lay one in each other zone, a zone a beat, before
 	 * anything else. Each lies flat at a place drawn at random in its zone - on the same steps of the first tile's
@@ -2407,23 +2408,24 @@ private:
 	 * placement MoldGrowthWeight times as likely.
 	 *
 	 * The air over ground and water no longer holds back what stands either, so it can grow. Ground and water joined
-	 * across their seams in one plane make a landscape, and with bMushroomAir its air rises by MushroomStoreysPerPiece
-	 * for every piece beyond the first, and a cap MushroomCapStoreys thick at its top reaches MushroomSpreadPerPiece
-	 * cells further past the landscape's edges for every piece beyond the first. It is kept as boxes, bucketed by
+	 * across their seams in one plane make a landscape. Every piece keeps MinAirStoreys to MaxAirStoreys of air - one
+	 * storey by default - its trunk; with bMushroomAir a crown grows over the landscape like a tree's, from above its
+	 * first storey up, MushroomStoreysPerPiece taller and MushroomSpreadPerPiece cells further past the landscape's edges
+	 * for every piece beyond the first. It is kept as boxes, bucketed by
 	 * where they are, rather than as lattice pieces, since it changes whenever a landscape does.
 	 */
 
 	static constexpr int32 ZonesPerSide = 3;
-	static constexpr int32 ZoneCount = ZonesPerSide * ZonesPerSide;
+	static constexpr int32 ZoneCount = ZonesPerSide * ZonesPerSide * ZonesPerSide;
 	static constexpr int32 MiddleZone = ZoneCount / 2;
 
-	/** Where one of the zones' borders lies along X or Y, in cells, from 0 - the cube's near side - to ZonesPerSide, its far side. */
+	/** Where one of the zones' borders lies along an axis, in cells, from 0 - the cube's near side - to ZonesPerSide, its far side. */
 	int32 GetZoneLine(int32 Line) const;
 
 	/** The zone a platform's middle lies in. */
 	int32 GetZoneOf(const FGridPlatform& Platform) const;
 
-	/** The cells a zone spans, its borders included, the full height of the cube. */
+	/** The cells a zone spans, its borders included. */
 	FAirBox GetZoneBox(int32 Zone) const;
 
 	/** The zones' outlines, each in its colour, a little inside its borders so neighbours' lines stay apart. */
