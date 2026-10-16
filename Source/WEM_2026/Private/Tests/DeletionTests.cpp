@@ -298,7 +298,58 @@ bool FDeletionSeedsTest::RunTest(const FString& Parameters)
 	FRoomManagerTestAccess::Rebuild(*Manager, Manager->Platforms);
 	TestEqual(TEXT("The rebuild keeps them all"), FRoomManagerTestAccess::GetBuilt(*Manager).Num(), Manager->Platforms.Num());
 
+	// Three a zone: laid a round at a time, every zone its first before any its second, none touching another.
+	Manager->SeedsPerZone = 3;
+	Manager->ClearPlatforms();
+	TestEqual(TEXT("80 more wait: three a zone, the middle one's first aside"), FRoomManagerTestAccess::GetWaitingSeeds(*Manager), 80);
+
+	Grow(*Manager, 27);
+	TSet<int32> FirstRound;
+
+	for (const FGridPlatform& Seed : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		FirstRound.Add(FRoomManagerTestAccess::GetZoneOf(*Manager, Seed));
+	}
+
+	TestEqual(TEXT("The first round reaches every zone"), FirstRound.Num(), 27);
+
+	Grow(*Manager, 54);
+	int32 PerZone[27] = {};
+
+	for (const FGridPlatform& Seed : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		++PerZone[FRoomManagerTestAccess::GetZoneOf(*Manager, Seed)];
+	}
+
+	int32 Fewest = MAX_int32;
+	int32 Most = 0;
+
+	for (const int32 Count : PerZone)
+	{
+		Fewest = FMath::Min(Fewest, Count);
+		Most = FMath::Max(Most, Count);
+	}
+
+	AddInfo(FString::Printf(TEXT("Three a zone: %d first tiles, %d to %d a zone."), Manager->GetPlatformCount(), Fewest, Most));
+	TestEqual(TEXT("Three in every zone"), Fewest == 3 && Most == 3, true);
+	// Flat, so two touch only lying in one layer with their rims meeting.
+	const TArray<FGridPlatform>& Seeds = FRoomManagerTestAccess::GetBuilt(*Manager);
+	int32 Touching = 0;
+
+	for (int32 First = 0; First < Seeds.Num(); ++First)
+	{
+		for (int32 Second = First + 1; Second < Seeds.Num(); ++Second)
+		{
+			const FIntVector Step = Seeds[Second].MinNode - Seeds[First].MinNode;
+			Touching += Step.Z == 0 && FMath::Abs(Step.X) <= 16 && FMath::Abs(Step.Y) <= 16 ? 1 : 0;
+		}
+	}
+
+	TestEqual(TEXT("None touches another: each starts growth of its own"), Touching, 0);
+	TestEqual(TEXT("Growth from them agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
 	// Off, the middle one alone.
+	Manager->SeedsPerZone = 1;
 	Manager->bSeedEveryZone = false;
 	Manager->ClearPlatforms();
 	Grow(*Manager, 27);

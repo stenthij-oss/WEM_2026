@@ -1067,6 +1067,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
 	bool bSeedEveryZone = true;
 
+	/**
+	 * How many first tiles each zone gets, the middle zone's at the heart of the cube among them. They are laid a round
+	 * at a time - one in every zone, then a second in every zone - each clear of everything standing, so none touches
+	 * another. A zone with no free place left goes without the rest.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones", meta = (ClampMin = "1", ClampMax = "32", EditCondition = "bSeedEveryZone"))
+	int32 SeedsPerZone = 1;
+
 	/** Platforms standing in each zone, in zone order, a layer at a time from the bottom, as the last strike or rebuild counted them. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Zones")
 	FString ZoneSummary;
@@ -2374,9 +2382,9 @@ private:
 	 * -----
 	 * The cube is split into 27 zones, three by three by three - three layers of nine - their borders on lattice
 	 * lines a third of the way across along each axis. A platform is in the zone its middle lies in. With
-	 * bSeedEveryZone each zone has a first tile of its own: the middle zone's is laid as the first platform always
-	 * was, at the heart of the cube, and the beats after it lay one in each other zone, a zone a beat, before
-	 * anything else. Each lies flat at a place drawn at random in its zone - on the same steps of the first tile's
+	 * bSeedEveryZone each zone has SeedsPerZone first tiles of its own: the middle zone's first is laid as the first
+	 * platform always was, at the heart of the cube, and the beats after it lay the rest, a tile a beat and a round of
+	 * zones at a time, before anything else. Each lies flat at a place drawn at random in its zone - on the same steps of the first tile's
 	 * width, length and shorter side away from the middle one, so where their growth meets it lines up - clear of
 	 * everything standing and of all the air held back. Should every platform be taken away, the cube is seeded
 	 * again the same way.

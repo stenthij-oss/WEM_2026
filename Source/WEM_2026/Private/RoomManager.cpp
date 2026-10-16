@@ -8915,12 +8915,18 @@ void ARoomManager::QueueSeeds()
 		return;
 	}
 
-	// The middle zone's first tile is the first platform, laid as it always was; every other zone waits for its own.
-	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	// The middle zone's first tile is the first platform, laid as it always was; every other zone waits for its own. A
+	// round at a time, so every zone has its first before any has its second.
+	const int32 Rounds = FMath::Clamp(SeedsPerZone, 1, 32);
+
+	for (int32 Round = 0; Round < Rounds; ++Round)
 	{
-		if (Zone != MiddleZone)
+		for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
 		{
-			SeedQueue.Add(Zone);
+			if (Round > 0 || Zone != MiddleZone)
+			{
+				SeedQueue.Add(Zone);
+			}
 		}
 	}
 }
@@ -8990,7 +8996,7 @@ bool ARoomManager::PlaceSeed(const int32 Zone)
 			continue;
 		}
 
-		// Clear of everything standing, so it starts growth of its own.
+		// Clear of everything standing - sharing no beam, nor even a post at a corner - so it starts growth of its own.
 		int32 SpanU, SpanV;
 		GetPlatformSpans(Seed, SpanU, SpanV);
 
@@ -8999,6 +9005,11 @@ bool ARoomManager::PlaceSeed(const int32 Zone)
 		ForEachModuleEdge(Seed, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, bool)
 		{
 			bTouches = bTouches || ModuleEdgeUses.Contains(MakeEdgeKey(Edge));
+		});
+
+		ForEachRimNode(Seed, SpanU, SpanV, Module, [&](const FIntVector& Node)
+		{
+			bTouches = bTouches || RimCellNormals.Contains(MakeCellKey(Node));
 		});
 
 		// It holds up whatever grows off it, as the middle one does.
