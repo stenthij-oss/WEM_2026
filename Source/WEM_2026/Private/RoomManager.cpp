@@ -831,10 +831,14 @@ void ARoomManager::BeginPlay()
 		BeatParameters.bLoop = true;
 		BeatParameters.FirstDelay = PlatformPlacementInterval;
 
-		// A beat that falls behind is dropped, not made up. Catching up would stack several
-		// placements into one frame that is already slow, which only makes the next one slower,
-		// and it would break the rhythm of one piece arriving at a time.
+		// The timer fires at most once a frame. Beats owed beyond that run in the same frame only as far as
+		// MaxBeatsPerFrame and the frame budget allow (see AdvancePlacement); the rest are dropped, not made up.
+		// Catching up without a bound would stack placements into a frame that is already slow, which only makes
+		// the next one slower.
 		BeatParameters.bMaxOncePerFrame = true;
+		BeatClock = Now;
+		PlacementSecondStart = Now;
+		PlacementsThisSecond = 0;
 
 		GetWorldTimerManager().SetTimer(
 			PlacementTimerHandle, this, &ARoomManager::AdvancePlacement,
@@ -2251,8 +2255,42 @@ void ARoomManager::ResetPlacementStream()
 
 void ARoomManager::AdvancePlacement()
 {
-	// A beat with nowhere to grow is simply lost. The beat keeps going, since platforms taken away give room back.
-	PlaceNextPlatform();
+	// The timer fires at most once a frame. With an interval shorter than a frame more beats than that are owed, and up to
+	// MaxBeatsPerFrame of them run now, within the frame budget, each placing one platform as a beat always has.
+	const double Now = GetClock();
+	const double Interval = FMath::Max(static_cast<double>(PlatformPlacementInterval), UE_DOUBLE_KINDA_SMALL_NUMBER);
+	const int32 Most = FMath::Clamp(MaxBeatsPerFrame, 1, 64);
+	const int32 Owed = FMath::Clamp(FMath::FloorToInt32((Now - BeatClock) / Interval), 1, Most);
+
+	// Beats owed beyond what a frame may run are dropped, not made up.
+	BeatClock = Owed >= Most ? Now : BeatClock + Owed * Interval;
+
+	const double Start = FPlatformTime::Seconds();
+	const double Budget = FMath::Max(BeatBudgetMilliseconds, 0.0f) / 1000.0;
+
+	for (int32 Beat = 0; Beat < Owed; ++Beat)
+	{
+		if (Beat > 0 && FPlatformTime::Seconds() - Start >= Budget)
+		{
+			break;
+		}
+
+		// A beat with nowhere to grow is simply lost, and so is the rest of the frame's. The beat keeps going, since
+		// platforms taken away give room back.
+		if (!PlaceNextPlatform())
+		{
+			break;
+		}
+
+		++PlacementsThisSecond;
+	}
+
+	if (Now - PlacementSecondStart >= 1.0)
+	{
+		PlacementsPerSecond = FMath::RoundToInt32(PlacementsThisSecond / (Now - PlacementSecondStart));
+		PlacementsThisSecond = 0;
+		PlacementSecondStart = Now;
+	}
 }
 
 int32 ARoomManager::GetModule() const

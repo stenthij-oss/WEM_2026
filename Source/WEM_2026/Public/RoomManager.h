@@ -575,6 +575,25 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
 	bool bAutoPlacePlatforms = true;
 
+	/**
+	 * The most beats one frame may run when the interval is shorter than a frame. Each beat still places one platform,
+	 * but more of them arrive per frame: at 60 frames a second, 1 tops growth out at 60 platforms a second however short
+	 * the interval, 8 at 480. Beats owed beyond this are dropped rather than made up.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "1", ClampMax = "64"))
+	int32 MaxBeatsPerFrame = 1;
+
+	/**
+	 * Milliseconds of a frame the beats may take between them before the rest owed that frame are dropped, so a frame
+	 * already slow is not made slower. The first beat of a frame always runs.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms", meta = (ClampMin = "0.0"))
+	float BeatBudgetMilliseconds = 8.0f;
+
+	/** Platforms placed in the last second of play. Readout only. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Platforms")
+	int32 PlacementsPerSecond = 0;
+
 	/** Discards platforms placed in the editor at BeginPlay, so a run starts from an empty cube. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Platforms")
 	bool bClearPlatformsOnBeginPlay = true;
@@ -2709,6 +2728,13 @@ private:
 
 	/** The placement beat. Stops its own timer once the structure has no room left. */
 	void AdvancePlacement();
+
+	/** When the beats were last caught up to, in the world's time: the beats owed since are what a frame may run. */
+	double BeatClock = 0.0;
+
+	/** Placements counted towards PlacementsPerSecond, and when that count started. */
+	int32 PlacementsThisSecond = 0;
+	double PlacementSecondStart = 0.0;
 
 	void ResetPlacementStream();
 

@@ -574,6 +574,51 @@ bool FDeletionMoldPullTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBeatsPerFrameTest, "WEM.Platforms.BeatsPerFrame", WEMRoomManagerTests::TestFlags)
+
+bool FBeatsPerFrameTest::RunTest(const FString& Parameters)
+{
+	using namespace DeletionTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	Manager->GridSize = 129;
+	Manager->PlatformPlacementInterval = 0.01f;
+	Manager->ClearPlatforms();
+	Grow(*Manager, 20);
+
+	// A frame that owes eight beats - 85 ms at a 10 ms interval - runs one by default, as before.
+	int32 Before = Manager->GetPlatformCount();
+	FRoomManagerTestAccess::AdvancePlacement(*Manager, 0.085);
+	TestEqual(TEXT("One beat a frame by default"), Manager->GetPlatformCount() - Before, 1);
+
+	// Allowed eight, with time to spare, it runs all eight; owed a hundred, still eight, and the rest are dropped.
+	Manager->MaxBeatsPerFrame = 8;
+	Manager->BeatBudgetMilliseconds = 1000.0f;
+	Before = Manager->GetPlatformCount();
+	const double Start = FPlatformTime::Seconds();
+	FRoomManagerTestAccess::AdvancePlacement(*Manager, 0.085);
+	AddInfo(FString::Printf(TEXT("Eight beats took %.2f ms."), 1000.0 * (FPlatformTime::Seconds() - Start)));
+	TestEqual(TEXT("Eight owed, eight run"), Manager->GetPlatformCount() - Before, 8);
+
+	Before = Manager->GetPlatformCount();
+	FRoomManagerTestAccess::AdvancePlacement(*Manager, 1.0);
+	TestEqual(TEXT("A hundred owed, eight run"), Manager->GetPlatformCount() - Before, 8);
+
+	// With no time to spare, only the frame's first runs.
+	Manager->BeatBudgetMilliseconds = 0.0f;
+	Before = Manager->GetPlatformCount();
+	FRoomManagerTestAccess::AdvancePlacement(*Manager, 0.085);
+	TestEqual(TEXT("Out of budget, the first beat only"), Manager->GetPlatformCount() - Before, 1);
+
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDeletionPerfTest, "WEM.Deletion.Perf", WEMRoomManagerTests::SlowTestFlags)
 
 bool FDeletionPerfTest::RunTest(const FString& Parameters)

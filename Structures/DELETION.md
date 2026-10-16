@@ -97,6 +97,18 @@ The field air is worked out afresh on every field change (`GatherFieldAir`), but
 - **Each ground plane starts with one storey** (`MinAirStoreys` = `MaxAirStoreys` = 1). A piece is laid only where that storey is clear. Before, it was 3-5 storeys drawn per piece. The settings still allow a range.
 - **The crown widens only once it has a storey** to widen in: below 5 pieces (at the defaults) there is no crown, just trunks.
 
+## Growth speed
+
+Asked the same day: "Can growth be more multiplied and fast?" The placement timer fires at most once a frame. NewMap's beat (0.0107 s) is already shorter than a frame at 60 fps, so growth topped out at about 60 platforms a second, however short the interval.
+
+- **Max Beats Per Frame** (`MaxBeatsPerFrame`, Grid | Platforms, default 1, up to 64): how many of the beats owed since the last frame may run in this one. Each still places one platform, one after another. 8 at 60 fps is up to 480 a second. Beats owed beyond it are dropped, not made up.
+- **Beat Budget Milliseconds** (`BeatBudgetMilliseconds`, default 8): the frame time the beats may take between them. Once it is spent, the rest owed that frame are dropped, so a slow frame is not made slower. The first beat of a frame always runs.
+- **Placements Per Second** (readout): platforms placed in the last second of play.
+
+A beat costs about what `WEM.Deletion.Perf` shows: 0.5 ms early on, about 2 ms at 5,000 platforms. With the default budget that is up to about 16 beats a frame early on, and 4 at 5,000 platforms (240 a second). Raise the budget for more, at the frame rate's cost. Faster growth also fills the cube sooner, so strikes find more to kill: see the steady-state note under Measurements.
+
+More fronts also make growth look more multiplied: *Seeds Per Zone* starts every zone from several first tiles.
+
 ## Measurements
 
 `WEM.Deletion.Perf` uses a NewMap-sized cube (509 cells), 27 first tiles, the test kit's slabs, six pockets and two molds, grown to 3000 platforms. It then simulates 40 s of play at NewMap's pace:

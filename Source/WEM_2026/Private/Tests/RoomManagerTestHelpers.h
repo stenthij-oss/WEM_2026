@@ -398,6 +398,13 @@ struct FRoomManagerTestAccess
 		return Manager.IsInMoldBox(Platform);
 	}
 
+	/** One firing of the placement timer, as play does it, with the beats last caught up to SecondsAgo seconds back. */
+	static void AdvancePlacement(ARoomManager& Manager, const double SecondsAgo)
+	{
+		Manager.BeatClock = Manager.GetClock() - SecondsAgo;
+		Manager.AdvancePlacement();
+	}
+
 	/** The zones still waiting for a first tile. */
 	static int32 GetWaitingSeeds(const ARoomManager& Manager)
 	{
