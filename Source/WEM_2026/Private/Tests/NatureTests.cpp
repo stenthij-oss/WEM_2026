@@ -504,6 +504,112 @@ bool FNatureFlatPiecesTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureWaterSheetTest, "WEM.Nature.WaterSheet", WEMRoomManagerTests::TestFlags)
+
+bool FNatureWaterSheetTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	UMaterialInterface* WaterMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineMaterials/WorldGridMaterial.WorldGridMaterial"));
+	Kit.Water->FlatColor = FLinearColor(0.02f, 0.1f, 0.3f);
+	Kit.Water->FlatMaterial = WaterMaterial;
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+	Manager->bShowPieces = true;
+	UPlatformTileData* Square = Manager->Tiles[0];
+	const int32 Module = FRoomManagerTestAccess::GetModule(*Manager);
+	const double Cell = Manager->CellSize;
+
+	// The water's layer of the lattice: the ceilings' half below its mid-plane, the water's above it.
+	const double Bottom = Manager->GetCellMinCorner(FIntVector(0, 0, 32)).Z;
+	const double Middle = Bottom + 0.5 * Cell;
+	const double Top = Bottom + Cell;
+
+	int32 Edges, CutEdges, Nodes, CutNodes;
+	UStaticMesh* Mesh = nullptr;
+	UMaterialInterface* Material = nullptr;
+
+	auto ExpectSheet = [&](const TCHAR* Step, const int32 WantCutEdges, const int32 WantCutNodes, const int32 WantWaterPieces)
+	{
+		FRoomManagerTestAccess::GetLatticePieceCounts(*Manager, Edges, CutEdges, Nodes, CutNodes);
+		TestEqual(FString::Printf(TEXT("%s: beams cut down"), Step), CutEdges, WantCutEdges);
+		TestEqual(FString::Printf(TEXT("%s: posts cut down"), Step), CutNodes, WantCutNodes);
+		TestEqual(FString::Printf(TEXT("%s: water pieces, slabs and seams"), Step), FRoomManagerTestAccess::GetStructureLayerPieces(*Manager, Kit.Water, Mesh, Material), WantWaterPieces);
+
+		// What was drawn a piece at a time is what a full rebuild draws: it has nothing to add or take away.
+		TestEqual(FString::Printf(TEXT("%s: in step with a full sync"), Step), FRoomManagerTestAccess::SyncPieces(*Manager), 0);
+	};
+
+	// One pool alone is all outline.
+	const FGridPlatform West = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Water, Kit.CeilingInterior);
+	FRoomManagerTestAccess::Place(*Manager, West);
+	ExpectSheet(TEXT("One pool"), 0, 0, 1);
+
+	// Its slab is in the water's own material, tinted to its colour.
+	const UMaterialInstanceDynamic* Tinted = Cast<UMaterialInstanceDynamic>(Material);
+	TestTrue(TEXT("Water is drawn in its flat material"), Tinted && Tinted->Parent == WaterMaterial);
+	TestTrue(TEXT("On the beams' box"), Mesh == Manager->PieceMesh);
+
+	// A second beside it along X: the four beams between them, and the three posts inside that line, are seams.
+	const FGridPlatform East = MakeSegment(FIntVector(32, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, Kit.Water, Kit.CeilingInterior);
+	FRoomManagerTestAccess::Place(*Manager, East);
+	ExpectSheet(TEXT("Two pools"), 16 / Module, 16 / Module - 1, 2 + 16 / Module + (16 / Module - 1));
+
+	bool bCut = false;
+	FBox Box;
+
+	// A seam beam keeps the half below the mid-plane; the water over it fills the half above, level with the slabs.
+	TestTrue(TEXT("The seam beam is drawn"), FRoomManagerTestAccess::GetBeamBox(*Manager, FIntVector(32, 20, 32), 1, bCut, Box));
+	TestTrue(TEXT("Cut down"), bCut);
+	TestEqual(TEXT("Its foot"), Box.Min.Z, Bottom, 0.01);
+	TestEqual(TEXT("Its top, at the mid-plane"), Box.Max.Z, Middle, 0.01);
+
+	TestTrue(TEXT("Water lies over the seam"), FRoomManagerTestAccess::GetSeamWaterBox(*Manager, Kit.Water, FIntVector(32, 20, 32), 1, Box));
+	TestEqual(TEXT("From the mid-plane"), Box.Min.Z, Middle, 0.01);
+	TestEqual(TEXT("Up to the face"), Box.Max.Z, Top, 0.01);
+	TestEqual(TEXT("Across the beam's width"), Box.Max.X - Box.Min.X, Cell, 0.01);
+	TestEqual(TEXT("Along the beam's run"), Box.Max.Y - Box.Min.Y, (Module - 1) * Cell, 0.01);
+
+	TestTrue(TEXT("A post inside the seam is drawn"), FRoomManagerTestAccess::GetPostBox(*Manager, FIntVector(32, 24, 32), bCut, Box));
+	TestTrue(TEXT("Cut down"), bCut);
+	TestTrue(TEXT("Water lies over that post"), FRoomManagerTestAccess::GetSeamWaterBox(*Manager, Kit.Water, FIntVector(32, 24, 32), -1, Box));
+
+	// The outline stays whole, the posts where the seam meets it included.
+	TestTrue(TEXT("An outline beam is drawn"), FRoomManagerTestAccess::GetBeamBox(*Manager, FIntVector(16, 16, 32), 0, bCut, Box));
+	TestFalse(TEXT("Whole"), bCut);
+	TestEqual(TEXT("Level with the water"), Box.Max.Z, Top, 0.01);
+
+	TestTrue(TEXT("The post where the seam meets the outline is drawn"), FRoomManagerTestAccess::GetPostBox(*Manager, FIntVector(32, 16, 32), bCut, Box));
+	TestFalse(TEXT("Whole"), bCut);
+
+	// A wall hanging from the seam, under the water, is carried by the half that is left.
+	const FGridPlatform Hanging = MakeSegment(FIntVector(32, 16, 16), EGridAxis::X, Square, EGridFace::PosZ, Kit.WallInterior, Kit.WallInterior);
+	FRoomManagerTestAccess::Place(*Manager, Hanging);
+	ExpectSheet(TEXT("A wall hanging under the seam"), 16 / Module, 16 / Module - 1, 2 + 16 / Module + (16 / Module - 1));
+
+	// A cliff standing on it on the water's side parts the pools: the beam is whole and outline again.
+	const FGridPlatform Cliff = MakeSegment(FIntVector(32, 16, 32), EGridAxis::X, Square, EGridFace::PosZ, Kit.Cliff, Kit.WallExterior);
+	FRoomManagerTestAccess::Place(*Manager, Cliff);
+	ExpectSheet(TEXT("A cliff on the seam"), 0, 0, 2);
+
+	// Taking the cliff away joins them again; taking a pool away leaves the other whole.
+	FRoomManagerTestAccess::Remove(*Manager, { Cliff });
+	ExpectSheet(TEXT("The cliff gone"), 16 / Module, 16 / Module - 1, 2 + 16 / Module + (16 / Module - 1));
+
+	FRoomManagerTestAccess::Remove(*Manager, { East });
+	ExpectSheet(TEXT("One pool gone"), 0, 0, 1);
+
+	TestTrue(TEXT("The beam that was a seam is still built, for the wall"), FRoomManagerTestAccess::GetBeamBox(*Manager, FIntVector(32, 20, 32), 1, bCut, Box));
+	TestFalse(TEXT("Whole again"), bCut);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 namespace NatureTestsPrivate
 {
 	/** The nature on a platform's nature face, and that face, or false for one of the city. */
@@ -779,7 +885,7 @@ bool FNatureCliffBeatTest::RunTest(const FString& Parameters)
 
 	FRoomManagerTestAccess::Rebuild(*Manager, Field);
 
-	// Cliffs alone: each beat raises one off the field's outline or carries one on.
+	// Cliffs alone: each beat raises one off the field's outline or carries a run on along it.
 	KeepToForm(*Manager, ENatureForm::Cliff, 1);
 
 	for (int32 Beat = 0; Beat < 8; ++Beat)
@@ -818,6 +924,134 @@ bool FNatureCliffBeatTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Looking out along its Up"), Pool.Up == WEMGrid::MakeFace(static_cast<int32>(Pool.Normal), Sign));
 	TestEqual(TEXT("Still no two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
 	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureCliffRunTest, "WEM.Nature.CliffRun", WEMRoomManagerTests::TestFlags)
+
+bool FNatureCliffRunTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	// One piece of ground, X and Y 16 to 32 at Z 32: an outline of four edges, each with room for a cliff rising off it
+	// or one dropping from it. Not both: the one dropping would look into the back of the one rising.
+	auto SpawnOnField = [&](UPlatformStructureData* FieldNature, const TArray<FIntVector>& Pieces = { FIntVector(16, 16, 32) })
+	{
+		ARoomManager* Spawned = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
+
+		TArray<FGridPlatform> Field;
+		for (const FIntVector& MinNode : Pieces)
+		{
+			Field.Add(MakeSegment(MinNode, EGridAxis::Z, Spawned->Tiles[0], EGridFace::PosZ, FieldNature, Kit.CeilingInterior));
+		}
+
+		FRoomManagerTestAccess::Rebuild(*Spawned, Field);
+		KeepToForm(*Spawned, ENatureForm::Cliff, 1);
+		return Spawned;
+	};
+
+	auto LaysCliff = [&](ARoomManager& Manager, const int32 Beat, FGridPlatform& OutLaid)
+	{
+		const int32 Before = Manager.GetPlatformCount();
+		const bool bLaid = Manager.PlaceNextNature() && Manager.GetPlatformCount() == Before + 1;
+		OutLaid = FRoomManagerTestAccess::GetBuilt(Manager).Last();
+
+		ENatureForm Form = ENatureForm::Ground;
+		int32 Sign = 0;
+		TestTrue(FString::Printf(TEXT("Beat %d lays one cliff"), Beat), bLaid && GetNature(OutLaid, Form, Sign) && Form == ENatureForm::Cliff);
+	};
+
+	// Every end carries on, so the first cliff runs round the outline, turning each corner, until it meets itself.
+	ARoomManager* Manager = SpawnOnField(Kit.Ground);
+	Manager->CliffContinueChance = 1.0f;
+
+	TArray<FGridPlatform> Cliffs;
+	for (int32 Beat = 0; Beat < 4; ++Beat)
+	{
+		FGridPlatform Laid;
+		LaysCliff(*Manager, Beat, Laid);
+		Cliffs.Add(Laid);
+
+		TestTrue(FString::Printf(TEXT("Beat %d keeps to the run's height and Up"), Beat), Laid.MinNode.Z == Cliffs[0].MinNode.Z && Laid.Up == Cliffs[0].Up);
+
+		if (Beat == 0)
+		{
+			TestEqual(TEXT("Both ends of the first cliff wait to carry it on"), FRoomManagerTestAccess::GetWaitingCliffEnds(*Manager), 2);
+		}
+	}
+
+	int32 AlongX = 0;
+	for (const FGridPlatform& Cliff : Cliffs)
+	{
+		AlongX += Cliff.Normal == EGridAxis::Y ? 1 : 0;
+	}
+
+	TestEqual(TEXT("The run stands on all four edges: two along X, two along Y"), AlongX, 2);
+	TestFalse(TEXT("With the outline used up, no cliff stands on another alone"), Manager->PlaceNextNature());
+	TestEqual(TEXT("Four cliffs stand"), Manager->CliffCount, 4);
+	TestEqual(TEXT("No end waits"), FRoomManagerTestAccess::GetWaitingCliffEnds(*Manager), 0);
+	TestEqual(TEXT("No two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Manager), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// An L of three pieces: the run turns in at the inner corner as well as out at the others, never along a seam.
+	ARoomManager* Ell = SpawnOnField(Kit.Ground, { FIntVector(16, 16, 32), FIntVector(32, 16, 32), FIntVector(16, 32, 32) });
+	Ell->CliffContinueChance = 1.0f;
+
+	FGridPlatform EllStart;
+	for (int32 Beat = 0; Beat < 8; ++Beat)
+	{
+		FGridPlatform Laid;
+		LaysCliff(*Ell, Beat, Laid);
+		EllStart = Beat == 0 ? Laid : EllStart;
+		TestTrue(FString::Printf(TEXT("L beat %d keeps to the run's height"), Beat), Laid.MinNode.Z == EllStart.MinNode.Z);
+	}
+
+	TestFalse(TEXT("The L's outline is all used"), Ell->PlaceNextNature());
+	TestEqual(TEXT("A cliff on each of its eight edges"), Ell->CliffCount, 8);
+	TestEqual(TEXT("Round the L, no two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Ell), 0);
+
+	// A seam within a field is no outline, whatever air there is.
+	ARoomManager* Seam = SpawnOnField(Kit.Ground, { FIntVector(16, 16, 32), FIntVector(16, 32, 32) });
+	TestFalse(TEXT("No cliff stands on the seam between two pieces"),
+		FRoomManagerTestAccess::StandsOnOutline(*Seam, MakeSegment(FIntVector(16, 32, 32), EGridAxis::Y, Seam->Tiles[0], EGridFace::PosZ, Kit.WallExterior, Kit.Cliff), -1));
+
+	// Only wholly on the outline: a cliff rising off the north edge, its nature looking back over the field, stands on it;
+	// one shifted half off the edge's end does not.
+	ARoomManager* Bare = SpawnOnField(Kit.Ground);
+	UPlatformTileData* Square = Bare->Tiles[0];
+	TestTrue(TEXT("A cliff wholly on the outline stands on it"),
+		FRoomManagerTestAccess::StandsOnOutline(*Bare, MakeSegment(FIntVector(16, 32, 32), EGridAxis::Y, Square, EGridFace::PosZ, Kit.WallExterior, Kit.Cliff), -1));
+	TestFalse(TEXT("One half off it does not"),
+		FRoomManagerTestAccess::StandsOnOutline(*Bare, MakeSegment(FIntVector(24, 32, 32), EGridAxis::Y, Square, EGridFace::PosZ, Kit.WallExterior, Kit.Cliff), -1));
+	TestFalse(TEXT("Nor one looking away from the field"),
+		FRoomManagerTestAccess::StandsOnOutline(*Bare, MakeSegment(FIntVector(16, 32, 32), EGridAxis::Y, Square, EGridFace::PosZ, Kit.Cliff, Kit.WallExterior), 1));
+
+	// With no chance of carrying on, every cliff starts on its own, and each still stands on the outline.
+	ARoomManager* Alone = SpawnOnField(Kit.Ground);
+	Alone->CliffContinueChance = 0.0f;
+
+	int32 Waited = 0;
+	for (int32 Beat = 0; Beat < 20; ++Beat)
+	{
+		Alone->PlaceNextNature();
+		Waited += FRoomManagerTestAccess::GetWaitingCliffEnds(*Alone);
+	}
+
+	TestEqual(TEXT("Alone, a cliff stands on each edge"), Alone->CliffCount, 4);
+	TestEqual(TEXT("And no end ever waits"), Waited, 0);
+	TestEqual(TEXT("Alone, still no two faces meet against nature's rules"), FRoomManagerTestAccess::CountIllegalNatureMeetings(*Alone), 0);
+
+	// Water's outline carries cliffs as ground's does.
+	ARoomManager* Pool = SpawnOnField(Kit.Water);
+	FGridPlatform OffWater;
+	LaysCliff(*Pool, 0, OffWater);
+	TestEqual(TEXT("A cliff stands at the pool's edge"), Pool->CliffCount, 1);
 
 	ReleaseRooted(Rooted);
 	return true;

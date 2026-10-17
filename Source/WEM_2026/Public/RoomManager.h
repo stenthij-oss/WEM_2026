@@ -20,6 +20,8 @@ class UStaticMesh;
 
 /** Defined in PlatformStructureData.h. */
 enum class ENatureForm : uint8;
+enum class EStructureSide : uint8;
+enum class EStructureType : uint8;
 
 /** Defined in Components/LineBatchComponent.h; only the drawing code in the .cpp needs it. */
 struct FBatchedLine;
@@ -287,7 +289,7 @@ struct FStructureLayer
 	UPROPERTY(Transient)
 	FRoomPieceLayer Pieces;
 
-	/** The beams' material tinted to the structure's flat colour, for a nature structure drawn as a slab for want of a mesh. */
+	/** Its flat material, or the beams', tinted to the structure's flat colour, for a nature structure drawn as a slab for want of a mesh. */
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> FlatMaterial;
 };
@@ -448,6 +450,10 @@ struct FSurfaceMarkLayer
  * closing round a roof, or meeting another of the same fence - is closed. A platform a normal beat
  * happens to lay on a waiting spot, laid as the run is, carries the run on. A fence that is not
  * load-bearing may carry on across the edge its own run blocked.
+ *
+ * A floor growth lays with an interior or exterior ground on top may spill out into a patch of grounds of that
+ * side, a piece a beat, as a field of nature does (InteriorGroundSpillChance, ExteriorGroundSpillChance). A wall
+ * standing on the outline of grounds of its side may run on round it as a fence does (InteriorWallRunChance and on).
  *
  * Nature
  * ------
@@ -686,6 +692,62 @@ public:
 	float FenceTurnChance = 0.25f;
 
 	/**
+	 * The chance a floor growth lays with an interior ground - its face looking along its Up a Ground of side Interior -
+	 * spills out into a patch, a piece a beat, as a field of nature does: more floors beside it in its plane, with its
+	 * Up, each with an interior ground on top (one of both sides counts) and filled behind as any floor is. Each piece is
+	 * placed only where a floor could be. Zero never.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float InteriorGroundSpillChance = 0.1f;
+
+	/** The fewest pieces a patch of interior ground spills out to, the one it started from included. Drawn evenly up to InteriorGroundSpillMax. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "1"))
+	int32 InteriorGroundSpillMin = 2;
+
+	/** The most pieces a patch of interior ground spills out to. It stops sooner where it has no room. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "1"))
+	int32 InteriorGroundSpillMax = 4;
+
+	/** The same as InteriorGroundSpillChance, for a floor laid with an exterior ground on top: a patch of exterior grounds. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ExteriorGroundSpillChance = 0.1f;
+
+	/** The fewest pieces a patch of exterior ground spills out to, the one it started from included. Drawn evenly up to ExteriorGroundSpillMax. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "1"))
+	int32 ExteriorGroundSpillMin = 2;
+
+	/** The most pieces a patch of exterior ground spills out to. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Ground Spill", meta = (ClampMin = "1"))
+	int32 ExteriorGroundSpillMax = 4;
+
+	/**
+	 * The chance a wall growth lays standing wholly on the outline of interior grounds - its face over them an interior,
+	 * with no interior ground behind it - starts a run of walls round that outline, as a fence's run goes: a wall a beat
+	 * from each end (WallRunContinueChance), straight on or round the corner, wherever the next wall stands on the outline
+	 * too. Each keeps an interior over the ground, drawn as usual, and its back follows the usual rules. Zero never.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Wall Runs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float InteriorWallRunChance = 0.25f;
+
+	/** The same for a wall whose face over exterior grounds is an exterior: a run round a plaza or a street. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Wall Runs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ExteriorWallRunChance = 0.25f;
+
+	/**
+	 * The chance each end of a run of walls, with room beyond it, carries the run on by another wall. Each end goes on for
+	 * p / (1 - p) walls on average.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Wall Runs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WallRunContinueChance = 0.8f;
+
+	/**
+	 * The chance a run of walls that could both go straight on and turn the corner, on the outline either way, turns, split
+	 * evenly between the ways it could turn. Where it can only turn, it turns.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Wall Runs", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float WallRunTurnChance = 0.25f;
+
+	/**
 	 * Lets a platform folding off another take the opposite Up, with FlipChance, so it stands upside
 	 * down against the one it grew off - and everything growing off it after.
 	 */
@@ -769,7 +831,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
 	float GroundWeight = 1.0f;
 
-	/** How often such a beat raises a cliff off a field's outline, or carries a cliff on. */
+	/** How often such a beat raises a cliff off the outline of ground or water, to run along it (CliffContinueChance). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0"))
 	float CliffWeight = 1.0f;
 
@@ -792,6 +854,22 @@ public:
 	/** The most pieces a pool of water spills out to. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "1"))
 	int32 WaterSpillMax = 6;
+
+	/**
+	 * The chance each end of a cliff, with room beyond it, carries the cliff on by another, as a fence's run does: a piece a
+	 * beat, the same cliff on the same tile with the same Up, straight on or round the corner. Every piece stands on the
+	 * outline of ground or water, so a run follows the outline and stops where it ends. Each end goes on for a run of
+	 * p / (1 - p) cliffs on average.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float CliffContinueChance = 0.8f;
+
+	/**
+	 * The chance a cliff that could both go straight on and turn the corner, on an outline either way, turns, split evenly
+	 * between the ways it could turn. Where it can only turn, it turns.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Nature", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float CliffTurnChance = 0.25f;
 
 	/** Cells in one storey, the measure of the air kept open above ground and water. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "1"))
@@ -1591,7 +1669,8 @@ private:
 	/**
 	 * What has to follow one placement. A placement only ever adds to the structure, so the
 	 * lattice stays as it is, the pieces take just the new platform's, and the overlay just the
-	 * surfaces the placement changed.
+	 * surfaces the placement changed. Where there is water, the beams and posts it takes in are
+	 * brought in line too, as a placement can start or end a seam in a sheet of water.
 	 */
 	void UpdateVisualsAfterPlacement(const FGridPlatform& Platform, TConstArrayView<FGridSurfaceRef> ChangedSurfaces);
 
@@ -1679,6 +1758,64 @@ private:
 
 	/** One platform's pieces, appended to the list for each kind. */
 	void GatherPlatformPieces(const FGridPlatform& Platform, FGatheredPieces& OutPieces) const;
+
+	/** The beam along one module edge, as it is built now, appended to the edges; across a seam, the water over it too. */
+	void GatherEdgePieces(const FIntVector& Node, int32 Axis, FGatheredPieces& OutPieces) const;
+
+	/** The post at one lattice node, as it is built now, appended to the nodes; across a seam, the water over it too. */
+	void GatherNodePieces(const FIntVector& Node, FGatheredPieces& OutPieces) const;
+
+	/**
+	 * Whether the pieces were built in full and every layer is in step with its record, so a change can be drawn into
+	 * them where it falls rather than by the full sync.
+	 */
+	bool ArePiecesInStep() const;
+
+	/**
+	 * Brings the beams and posts named, and the water over any cut down at a seam, in line with what the lattice holds
+	 * now: whole or cut down where built, gone where not. Keys as MakeEdgeKey and MakeCellKey give them. Nothing while
+	 * the pieces are not in step.
+	 */
+	void RefreshLatticePieces(const TSet<uint64>& EdgeKeys, const TSet<uint64>& NodeKeys);
+
+	/*
+	 * Water as one sheet. Flat water - a water face drawn as its slab, with no mesh and no cover - fills the half of its
+	 * platform's layer on the side it looks out from. Where two pieces of the same water lie side by side in one plane,
+	 * looking the same way, with nothing standing on the beam between them on the water's side, that beam is a seam:
+	 * it keeps only the half behind the water, and the water runs on across the other half, so the sheet shows no line
+	 * there. A wall hanging under the water from that beam is still carried by the half that is left. A post is cut
+	 * down the same way where every beam built at it is a seam of the same sheet or hangs behind it. Beams and posts
+	 * round the sheet's outline stay whole. A cut-down piece, and the water over it, are keyed apart from the whole piece
+	 * (WaterSeamPieceBit), so a sync that wants the other kind takes one away and draws the other.
+	 */
+
+	/** A beam or post inside one sheet of water: the water, the axis it looks along, and which way along it. */
+	struct FWaterSeam
+	{
+		UPlatformStructureData* Water = nullptr;
+		int32 NormalAxis = 0;
+		int32 Sign = 0;
+
+		bool operator==(const FWaterSeam& Other) const
+		{
+			return Water == Other.Water && NormalAxis == Other.NormalAxis && Sign == Other.Sign;
+		}
+	};
+
+	/** The flat water a module face shows, and which way it looks, where the face is part of a piece of it. */
+	UPlatformStructureData* GetFlatWater(const FIntVector& FaceMinNode, int32 NormalAxis, int32& OutSign) const;
+
+	/** Whether the module edge from Node along Axis is a seam inside one sheet of water, and of which. */
+	bool FindWaterSeam(const FIntVector& Node, int32 Axis, FWaterSeam& OutSeam) const;
+
+	/** Whether a lattice node lies inside one sheet of water, every beam built at it a seam of it or hanging behind it. */
+	bool FindWaterSeamAtNode(const FIntVector& Node, FWaterSeam& OutSeam) const;
+
+	/**
+	 * A beam's or a post's box, from its min cell and extent: whole, or across a seam the half behind the water, or with
+	 * bWater the water over the other half.
+	 */
+	FTransform MakeLatticePieceTransform(const FIntVector& MinCell, FVector Extent, const FWaterSeam* Seam, bool bWater) const;
 
 	/** Drops every piece of every kind, so the next sync builds the lot. */
 	void ResetPieces();
@@ -1865,8 +2002,19 @@ private:
 	 * face behind that pairs with it. Interiors and exteriors are drawn where bWallsFaceInteriorGrounds
 	 * and bInteriorBacksExterior say so, and a face meeting nature ground is always an exterior. False
 	 * when nothing fits, or when the platform would meet water or a cliff.
+	 *
+	 * Given a Wish, as a patch of ground or a run of walls asks it, the face it names is drawn first, from the structures
+	 * of its type standing for its side - those of both sides among them - and no fence; what goes behind it is drawn
+	 * as ever. False with none.
 	 */
-	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly);
+	struct FFaceWish
+	{
+		int32 Sign = 1;
+		EStructureType Type{};
+		EStructureSide Side{};
+	};
+
+	bool DrawFill(FGridPlatform& Platform, bool bLoadBearingOnly, const FFaceWish* Wish = nullptr);
 
 	/**
 	 * Which faces of a wall about to be placed look over an interior ground it stands on, as bits:
@@ -1913,10 +2061,15 @@ private:
 	 * stream of its own. A field still spilling out takes the beat: ground and water are laid as fields,
 	 * each spilling out, a piece a beat, to the size it drew when it started (GroundSpillMin and Max,
 	 * WaterSpillMin and Max) - in its own plane, beside the pieces it has laid, likelier where it would
-	 * meet more of them - and the oldest still spilling goes first. Otherwise the beat starts something,
+	 * meet more of them - and the oldest still spilling goes first. A cliff still running takes it next: a
+	 * cliff carries on from each end as a fence's run does (CliffContinueChance, CliffTurnChance), the same
+	 * cliff on the same tile with the same Up, straight on or round the corner, a piece a beat, the oldest
+	 * end first. Otherwise the beat starts something,
 	 * drawn by GroundWeight, CliffWeight and WaterWeight among what has somewhere to go: a field of ground,
-	 * against an exterior or at a cliff's top or foot; a cliff, off a field's outline or carrying one on;
-	 * or a pool of water, beside ground or at a cliff's top or foot. Where they could go is sampled
+	 * against an exterior or at a cliff's top or foot; a cliff, off the outline of ground or water;
+	 * or a pool of water, beside ground or at a cliff's top or foot. Every cliff, carried on or not, stands
+	 * on the outline of ground or water - its nature face meets it all along its foot or all along its top - so
+	 * a run follows the outline and ends where it does, and no cliff stands on another alone. Where they could go is sampled
 	 * rather than walked in full, so a beat costs the same however far nature has spread.
 	 *
 	 * Every piece of ground and water keeps the air above it open: a box of cells out along its Up, as
@@ -1980,7 +2133,7 @@ private:
 	static bool AcceptsMeeting(const FGridPlatform& Nature, int32 NatureSign, const FGridPlatform& Other, int32 OtherSign);
 
 	/**
-	 * Calls Visit(OwnSign, NeighbourIndex, NeighbourSign) for every pair of faces a platform meets others in:
+	 * Calls Visit(OwnSign, NeighbourIndex, NeighbourSign, Edge) for every pair of faces a platform meets others in:
 	 * around every module edge of its rim another platform shares, each face of it meeting the face of
 	 * the platform next round the edge, either way. The platform is BuiltPlatforms[PlatformIndex], or the
 	 * one about to be placed there.
@@ -2000,6 +2153,9 @@ private:
 
 	static uint8 GetNatureMeetsBit(ENatureForm Form);
 
+	/** What every cliff's nature face has to meet, as AreNatureMeetingsLegal reports it: ground or water, along the cliff's top or foot - the outline it stands on. */
+	static uint8 GetOutlineMeets();
+
 	/**
 	 * Whether a placement not yet filled would meet water or a cliff, which take no face of the city. The
 	 * faces of it that would meet ground, and so have to be drawn from exteriors, go into OutFacesOnGround
@@ -2008,14 +2164,38 @@ private:
 	bool MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFacesOnGround = nullptr) const;
 
 	/**
+	 * Whether a cliff about to be placed, its nature on the face NatureSign looks out from, stands on the outline of ground
+	 * or water: its nature face meets ground or water round every module edge along its foot, or every one along its top,
+	 * and its back meets none round them. Its foot and top run across its Up. Only part of it on an outline is not enough,
+	 * and nor is a seam within a field.
+	 */
+	bool StandsOnOutline(const FGridPlatform& Cliff, int32 NatureSign) const;
+
+	/**
+	 * Whether a wall, standing or about to, stands on the outline of the city's grounds of one side: its face FaceSign looks
+	 * out from meets a Ground of that side - one of both sides among them - round every module edge along its foot, or
+	 * every one along its top, and its other face meets none round them. As StandsOnOutline asks it of a cliff.
+	 */
+	bool StandsOnGroundOutline(const FGridPlatform& Wall, int32 FaceSign, EStructureSide Side) const;
+
+	/**
+	 * What StandsOnOutline and StandsOnGroundOutline share: whether a wall's face FaceSign meets a face IsOutlineFace(Face,
+	 * Platform, Sign) accepts - the structure on the face Sign of Platform - round every module edge along its foot or every
+	 * one along its top, with its other face meeting none there.
+	 */
+	template <typename FunctorType>
+	bool IsOnOutline(const FGridPlatform& Wall, int32 FaceSign, FunctorType&& IsOutlineFace) const;
+
+	/**
 	 * Fills a platform about to be placed with nature of one form on the face NatureSign looks out from,
 	 * and one-sided urban structure behind it - any of the face's type there, an exterior where the back
 	 * meets ground - both from Stream, and then the city structure covering the nature face, where the
 	 * nature names cover categories and one fits. Its Up has to suit the form already: along its normal and looking
 	 * out of the nature face for ground and water, in its plane for a cliff. False when that is not so,
 	 * when the back would meet water or a cliff, or when nothing fits either face. A missing cover is no failure.
+	 * Nature, where given - a cliff carrying its run on - is the nature laid, rather than one drawn among the form's.
 	 */
-	bool DrawNatureFill(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, FRandomStream& Stream);
+	bool DrawNatureFill(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, FRandomStream& Stream, UPlatformStructureData* Nature = nullptr);
 
 	/** Where a nature structure with no mesh is drawn on one face of a platform: a slab across the opening, from the mid-plane out to the face. */
 	FTransform MakeFlatSlabTransform(const FGridPlatform& Platform, int32 FaceSign) const;
@@ -2038,6 +2218,9 @@ private:
 
 		/** How many module edges it was found growing off. A field's spill is drawn by it. */
 		int32 Weight = 1;
+
+		/** The nature to lay, where a cliff carries its own on. Null draws one among the form's. */
+		UPlatformStructureData* Nature = nullptr;
 	};
 
 	/** A placement as the nature beat tells them apart: its candidate key, its tile's index in UsableTiles, and its Up and nature face. */
@@ -2075,7 +2258,8 @@ private:
 	 * Whether a placement, given its Up, could be laid as nature of Form on the face NatureSign looks out
 	 * from: it faces a way NatureFacing allows, its tile may lie that way, nature and something behind it fit, and it is free and legal to
 	 * place filled with them - its meetings included - with its nature face meeting one of Starts, as
-	 * AreNatureMeetingsLegal reports them: what it may start against, or the field it spills from. On
+	 * AreNatureMeetingsLegal reports them: what it may start against, or the field it spills from. A cliff
+	 * has to stand wholly on an outline too (StandsOnOutline), and ground and water need their air clear. On
 	 * success it is left filled with stand-ins (see FindNatureFill).
 	 */
 	bool JudgeNatureCandidate(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, uint8 Starts);
@@ -2087,8 +2271,18 @@ private:
 	 */
 	bool FindNatureFill(const FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, UPlatformStructureData*& OutFront, UPlatformStructureData*& OutBack);
 
-	/** Fills a candidate from the nature stream and places it. False when no fill can be drawn, or it is no longer legal. */
-	bool PlaceNatureCandidate(FNatureCandidate& Candidate);
+	/**
+	 * Fills a candidate from the nature stream and places it, and when it is a cliff draws for the ends its run may carry
+	 * on from - all but JoinedSide, the end of a cliff carrying a run on that meets it (see PlacePlatform). False when no
+	 * fill can be drawn, or it is no longer legal.
+	 */
+	bool PlaceNatureCandidate(FNatureCandidate& Candidate, int32 JoinedSide = 0);
+
+	/**
+	 * A cliff beat: places the next cliff of the oldest waiting end, straight on or round the corner wherever that stands
+	 * on the outline of ground or water, as a fence beat does. False when no end has anywhere to go.
+	 */
+	bool PlaceCliffPanel();
 
 	/** One box of air kept open, inclusive at both corners. Also any box of cells, such as a region whose placements are judged again. */
 	struct FAirBox
@@ -2672,17 +2866,26 @@ private:
 	 */
 	void PlacePlatform(const FGridPlatform& Platform, int32 JoinedSide);
 
-	/** One end of a fence run waiting to grow: the panel it belongs to, fill and all, and which end of it. */
+	/**
+	 * One end of a fence run - or of a cliff or a run of walls, which run as a fence does - waiting to grow: the panel it
+	 * belongs to, fill and all, and which end of it.
+	 */
 	struct FFenceEnd
 	{
 		FGridPlatform Panel;
 
 		/** -1 for the end at the panel's min node along its run, +1 for the far end. */
 		int32 Side = 0;
+
+		/** For a run of walls: the side of the grounds it runs round, which its walls keep on the face over them. */
+		EStructureSide RunSide{};
 	};
 
 	/** Whether a platform is filled with a fence: a two-sided fence structure on both faces. */
 	static bool IsFencePanel(const FGridPlatform& Platform);
+
+	/** What a run is a run of: a fence panel's fence, or a cliff's nature. Null for a platform that carries no run. */
+	static UPlatformStructureData* GetRunStructure(const FGridPlatform& Platform);
 
 	/** The in-plane axis a fence panel's run goes along: across its Up on a wall, along the fence's width across a floor. */
 	int32 GetRunAxis(const FGridPlatform& Panel) const;
@@ -2701,10 +2904,11 @@ private:
 	void GatherFenceContinuations(const FFenceEnd& End, FGridPlatform& OutStraight, TArray<FGridPlatform, TInlineAllocator<2>>& OutTurns) const;
 
 	/**
-	 * Whether a run has met itself at an end: one of the end's continuations already stands, a panel
-	 * of the same fence laid the same way. Such an end is closed rather than carried on elsewhere.
+	 * Whether a run has met itself at an end: one of the end's continuations already stands, a panel of the same fence,
+	 * a cliff of the same nature, or a wall on the outline a run of walls follows, laid the same way. Such an end is
+	 * closed rather than carried on elsewhere.
 	 */
-	bool IsFenceEndClosed(const FGridPlatform& Straight, TConstArrayView<FGridPlatform> Turns) const;
+	bool IsRunEndClosed(const FFenceEnd& End, const FGridPlatform& Straight, TConstArrayView<FGridPlatform> Turns) const;
 
 	/** The end of a continuation of End that meets End: the side of it lying on End's beam. */
 	int32 GetJoinedSide(const FFenceEnd& End, const FGridPlatform& Continuation) const;
@@ -2717,10 +2921,10 @@ private:
 	bool StandsOnSomething(const FGridPlatform& Platform) const;
 
 	/**
-	 * For each end of a newly placed fence panel with room left beyond it, draws whether its run
-	 * carries on, and queues the end if so.
+	 * For each end of a newly placed fence panel, cliff or wall of a run with room left beyond it, draws from Stream whether
+	 * its run carries on, with Chance, and queues the end on Queue if so. RunSide is a run of walls' (see FFenceEnd).
 	 */
-	void QueueFenceEnds(const FGridPlatform& Panel, int32 JoinedSide);
+	void QueueRunEnds(const FGridPlatform& Panel, int32 JoinedSide, float Chance, FRandomStream& Stream, TArray<FFenceEnd>& Queue, EStructureSide RunSide = {});
 
 	/** A fence beat: places the next panel of the oldest waiting end that still has somewhere to go. False when none has. */
 	bool PlaceFencePanel();
@@ -2731,6 +2935,48 @@ private:
 	 * off the queue.
 	 */
 	bool TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoinedSide);
+
+	/** A patch of the city's ground still spilling out: the side its grounds stand for, the pieces it has laid, and how many more it may. */
+	struct FGroundSpill
+	{
+		EStructureSide Side{};
+		TArray<FGridPlatform> Pieces;
+		int32 Remaining = 0;
+	};
+
+	/**
+	 * Draws whether a platform growth has just laid starts a patch of ground spilling out, and queues it if so: a floor
+	 * whose face looking along its Up is a Ground of side Interior or Exterior, no fence, with that side's chance and a
+	 * size drawn between that side's fewest and most pieces.
+	 */
+	void QueueGroundSpill(const FGridPlatform& Platform);
+
+	/**
+	 * A ground spill beat: the oldest patch still spilling lays its next piece, a floor beside the pieces it has laid in
+	 * their plane with their Up - likelier where it would meet more of them - topped with a ground of the patch's side. A
+	 * patch with nowhere left to go stops. False when none has anywhere.
+	 */
+	bool PlaceGroundSpillPiece();
+
+	/**
+	 * Draws whether a platform growth or a patch of ground has just laid starts runs of walls round the outline of grounds.
+	 * A wall may start one itself (TryStartWallRun). A floor with a ground of the city gives the walls already standing
+	 * round its rim a new outline, so each of them may start one, unless a run of it waits already.
+	 */
+	void QueueWallRun(const FGridPlatform& Platform);
+
+	/**
+	 * Draws whether a wall standing starts a run of walls round the outline of grounds, and queues its ends if so: a wall of
+	 * the city, no fence, standing wholly on the outline of grounds of the side its face over them stands for - Interior
+	 * or Exterior - with that side's chance.
+	 */
+	void TryStartWallRun(const FGridPlatform& Wall);
+
+	/**
+	 * A wall run beat: places the next wall of the oldest waiting end, straight on or round the corner wherever that stands
+	 * on the outline of the run's grounds, its face over them drawn from the run's side. False when no end has anywhere.
+	 */
+	bool PlaceWallRunPanel();
 
 	/**
 	 * Rebuilds the derived state and the visuals from scratch and reports anything the placements
@@ -2864,6 +3110,9 @@ private:
 
 	/** Fields of ground and water still spilling out, oldest first. Beat state, like FenceQueue. */
 	TArray<FNatureSpill> SpillQueue;
+
+	/** Cliff ends waiting to carry their run on, oldest first. Beat state, like FenceQueue. */
+	TArray<FFenceEnd> CliffQueue;
 
 	/** Stand-ins for nature's fills (see FindNatureFill), by opening, Up and form. Cleared whenever the structures are resolved. */
 	struct FNatureFillStandIns
@@ -3077,6 +3326,12 @@ private:
 	 * rebuild, emptied by ClearPlatforms. Each is judged again when it is used.
 	 */
 	TArray<FFenceEnd> FenceQueue;
+
+	/** Patches of the city's ground still spilling out, oldest first. Beat state, like FenceQueue. */
+	TArray<FGroundSpill> GroundSpillQueue;
+
+	/** Ends of runs of walls round the outline of grounds, waiting to carry on, oldest first. Beat state, like FenceQueue. */
+	TArray<FFenceEnd> WallRunQueue;
 
 	FTimerHandle PlacementTimerHandle;
 

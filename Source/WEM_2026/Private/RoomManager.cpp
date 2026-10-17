@@ -168,6 +168,12 @@ namespace
 	/** A one-sided structure on a platform's negative face is keyed apart from the one on its positive face. */
 	constexpr uint64 NegativeFacePieceBit = uint64(1) << 63;
 
+	/**
+	 * A beam or post cut down at a seam in a sheet of water, and the water over it, keyed apart from the whole piece. No
+	 * tag reaches this bit, so in a structure's layer it cannot meet a platform's key either.
+	 */
+	constexpr uint64 WaterSeamPieceBit = uint64(1) << 62;
+
 	/** Where one face of a platform is kept in ARoomManager::FaceFills: its positive face, then its negative one. */
 	FORCEINLINE int32 GetFaceFillIndex(const int32 PlatformIndex, const int32 FaceSign)
 	{
@@ -341,6 +347,27 @@ namespace
 			for (int32 StepV = 0; StepV < SpanV; StepV += Module)
 			{
 				Visit(FLatticeEdge{ Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), V }, StepU == 0 || StepU == SpanU);
+			}
+		}
+	}
+
+	/** Calls Visit(Node) for every lattice node a platform takes in: those round its rim, and those across its inside. */
+	template <typename FunctorType>
+	void ForEachPlatformNode(
+		const FGridPlatform& Platform,
+		const int32 SpanU,
+		const int32 SpanV,
+		const int32 Module,
+		FunctorType&& Visit)
+	{
+		int32 U, V;
+		GetInPlaneAxes(AxisIndex(Platform.Normal), U, V);
+
+		for (int32 StepV = 0; StepV <= SpanV; StepV += Module)
+		{
+			for (int32 StepU = 0; StepU <= SpanU; StepU += Module)
+			{
+				Visit(Platform.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV));
 			}
 		}
 	}
@@ -1778,6 +1805,15 @@ bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind, const TFunction
 	}
 
 	PlacePlatform(Platform, JoinedSide);
+
+	// A ground it is laid with may spill out from here, and a wall standing on the outline of grounds run on round it. A
+	// reshuffle keeps to its zone, so it starts neither.
+	if (!Filter)
+	{
+		QueueGroundSpill(Platform);
+		QueueWallRun(Platform);
+	}
+
 	return true;
 }
 
@@ -1808,7 +1844,7 @@ void ARoomManager::PlacePlatform(const FGridPlatform& Platform, const int32 Join
 	// Taken in first, so the room each end has left is judged with this panel standing.
 	if (IsFencePanel(Platform))
 	{
-		QueueFenceEnds(Platform, JoinedSide);
+		QueueRunEnds(Platform, JoinedSide, FenceContinueChance, StructureStream, FenceQueue);
 	}
 }
 
@@ -1817,6 +1853,18 @@ bool ARoomManager::IsFencePanel(const FGridPlatform& Platform)
 	const UPlatformStructureData* Fence = Platform.PositiveStructure;
 
 	return Fence && Fence == Platform.NegativeStructure && Fence->bFence && Fence->bTwoSided;
+}
+
+UPlatformStructureData* ARoomManager::GetRunStructure(const FGridPlatform& Platform)
+{
+	if (IsFencePanel(Platform))
+	{
+		return Platform.PositiveStructure;
+	}
+
+	int32 Sign = 0;
+	ENatureForm Form = ENatureForm::Ground;
+	return GetNatureFace(Platform, Sign, Form) && Form == ENatureForm::Cliff ? GetFaceStructure(Platform, Sign) : nullptr;
 }
 
 int32 ARoomManager::GetRunAxis(const FGridPlatform& Panel) const
@@ -1948,9 +1996,12 @@ void ARoomManager::GatherFenceContinuations(
 	}
 }
 
-bool ARoomManager::IsFenceEndClosed(const FGridPlatform& Straight, const TConstArrayView<FGridPlatform> Turns) const
+bool ARoomManager::IsRunEndClosed(const FFenceEnd& End, const FGridPlatform& Straight, const TConstArrayView<FGridPlatform> Turns) const
 {
-	auto IsStanding = [this](const FGridPlatform& Spot)
+	// A fence or a cliff meets more of itself; a run of walls, which varies as it goes, meets a wall on the outline it follows.
+	const UPlatformStructureData* Run = GetRunStructure(End.Panel);
+
+	auto IsStanding = [this, Run, &End](const FGridPlatform& Spot)
 	{
 		const int32* Owner = ModuleFaceOwners.Find(MakePlatformKey(Spot));
 
@@ -1961,8 +2012,13 @@ bool ARoomManager::IsFenceEndClosed(const FGridPlatform& Straight, const TConstA
 
 		const FGridPlatform& Standing = BuiltPlatforms[*Owner];
 
-		return Standing.MinNode == Spot.MinNode && Standing.Normal == Spot.Normal && Standing.Tile == Spot.Tile
-			&& Standing.bTurned == Spot.bTurned && IsFencePanel(Standing) && Standing.PositiveStructure == Spot.PositiveStructure;
+		if (Standing.MinNode != Spot.MinNode || Standing.Normal != Spot.Normal || Standing.Tile != Spot.Tile || Standing.bTurned != Spot.bTurned)
+		{
+			return false;
+		}
+
+		return Run ? GetRunStructure(Standing) == Run
+			: StandsOnGroundOutline(Standing, 1, End.RunSide) || StandsOnGroundOutline(Standing, -1, End.RunSide);
 	};
 
 	return IsStanding(Straight) || Turns.ContainsByPredicate(IsStanding);
@@ -2016,7 +2072,13 @@ bool ARoomManager::StandsOnSomething(const FGridPlatform& Platform) const
 	return bMinEndUsed || bMaxEndUsed;
 }
 
-void ARoomManager::QueueFenceEnds(const FGridPlatform& Panel, const int32 JoinedSide)
+void ARoomManager::QueueRunEnds(
+	const FGridPlatform& Panel,
+	const int32 JoinedSide,
+	const float Chance,
+	FRandomStream& Stream,
+	TArray<FFenceEnd>& Queue,
+	const EStructureSide RunSide)
 {
 	for (const int32 Side : { -1, 1 })
 	{
@@ -2025,7 +2087,7 @@ void ARoomManager::QueueFenceEnds(const FGridPlatform& Panel, const int32 Joined
 			continue;
 		}
 
-		const FFenceEnd End{ Panel, Side };
+		const FFenceEnd End{ Panel, Side, RunSide };
 
 		FGridPlatform Straight;
 		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
@@ -2040,11 +2102,11 @@ void ARoomManager::QueueFenceEnds(const FGridPlatform& Panel, const int32 Joined
 			bHasRoom = bHasRoom || (IsPlatformOnGrid(Turn) && IsSpaceFree(Turn));
 		}
 
-		bHasRoom = bHasRoom && !IsFenceEndClosed(Straight, Turns);
+		bHasRoom = bHasRoom && !IsRunEndClosed(End, Straight, Turns);
 
-		if (bHasRoom && StructureStream.FRand() < FenceContinueChance)
+		if (bHasRoom && Stream.FRand() < Chance)
 		{
-			FenceQueue.Add(End);
+			Queue.Add(End);
 		}
 	}
 }
@@ -2068,7 +2130,7 @@ bool ARoomManager::PlaceFencePanel()
 
 		// A run that has met its own fence here since the end was queued - closing round a roof, or
 		// meeting another run of it - stops rather than heading off somewhere else.
-		if (IsFenceEndClosed(Straight, Turns))
+		if (IsRunEndClosed(End, Straight, Turns))
 		{
 			continue;
 		}
@@ -2161,6 +2223,337 @@ bool ARoomManager::TakeWaitingFenceSpot(FGridPlatform& Platform, int32& OutJoine
 	return false;
 }
 
+void ARoomManager::QueueGroundSpill(const FGridPlatform& Platform)
+{
+	// Only a floor of the city, in its own frame, whose face looking along its Up is walked on.
+	if (Platform.IsWall() || IsFencePanel(Platform) || IsNatureSegment(Platform))
+	{
+		return;
+	}
+
+	const int32 UpSign = FaceSign(Platform.Up);
+	const UPlatformStructureData* Top = GetFaceStructure(Platform, UpSign);
+
+	// One of both sides binds nothing, so it starts a patch of neither.
+	if (!Top || Top->Side == EStructureSide::Both
+		|| !EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Top, AxisIndex(Platform.Normal), UpSign, Platform.Up), EStructureType::Ground))
+	{
+		return;
+	}
+
+	const bool bInterior = Top->Side == EStructureSide::Interior;
+	const float Chance = bInterior ? InteriorGroundSpillChance : ExteriorGroundSpillChance;
+
+	// Nothing is drawn at a chance of zero, so with spills off growth draws just as it did before there were any.
+	if (Chance <= 0.0f || StructureStream.FRand() >= Chance)
+	{
+		return;
+	}
+
+	const int32 Fewest = FMath::Max(bInterior ? InteriorGroundSpillMin : ExteriorGroundSpillMin, 1);
+	const int32 Most = FMath::Max(bInterior ? InteriorGroundSpillMax : ExteriorGroundSpillMax, Fewest);
+	const int32 Size = StructureStream.RandRange(Fewest, Most);
+
+	if (Size > 1)
+	{
+		FGroundSpill& Spill = GroundSpillQueue.AddDefaulted_GetRef();
+		Spill.Side = Top->Side;
+		Spill.Pieces.Add(Platform);
+		Spill.Remaining = Size - 1;
+	}
+}
+
+bool ARoomManager::PlaceGroundSpillPiece()
+{
+	const int32 Module = GetModule();
+
+	while (!GroundSpillQueue.IsEmpty())
+	{
+		FGroundSpill& Spill = GroundSpillQueue[0];
+		const EGridAxis Normal = Spill.Pieces[0].Normal;
+		const EGridFace Up = Spill.Pieces[0].Up;
+
+		// Every free placement beside the patch in its plane, each once, weighing as many module edges as it shares with
+		// the patch's pieces.
+		TMap<TPair<uint64, int32>, int32> Seen;
+		TArray<FGridPlatform> Candidates;
+		TArray<int32> Weights;
+
+		for (const FGridPlatform& Piece : Spill.Pieces)
+		{
+			int32 SpanU, SpanV;
+			GetPlatformSpans(Piece, SpanU, SpanV);
+
+			ForEachModuleEdge(Piece, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+			{
+				if (!bRim)
+				{
+					return;
+				}
+
+				ForEachPlacementAround(Edge, UsableTiles, Module, /*bRimOnly=*/true, [&](const int32 TileIndex, const FGridPlatform& Placement, bool)
+				{
+					if (Placement.Normal != Normal)
+					{
+						return;
+					}
+
+					const TPair<uint64, int32> Key(MakeCandidateKey(Placement), TileIndex);
+
+					if (const int32* Found = Seen.Find(Key))
+					{
+						if (*Found != INDEX_NONE)
+						{
+							++Weights[*Found];
+						}
+
+						return;
+					}
+
+					const bool bFree = IsPlatformOnGrid(Placement) && IsSpaceFree(Placement);
+					Seen.Add(Key, bFree ? Candidates.Num() : INDEX_NONE);
+
+					if (bFree)
+					{
+						Candidates.Add_GetRef(Placement).Up = Up;
+						Weights.Add(1);
+					}
+				});
+			});
+		}
+
+		// Likelier where it would meet more of the patch, so it spills out as a patch rather than a line. Each is held to
+		// what any floor is held to there, and then topped with a ground of the patch's side.
+		while (!Candidates.IsEmpty())
+		{
+			int32 TotalWeight = 0;
+			for (const int32 Weight : Weights)
+			{
+				TotalWeight += Weight;
+			}
+
+			int32 Roll = PlacementStream.RandRange(0, TotalWeight - 1);
+			int32 Chosen = 0;
+
+			while (Roll >= Weights[Chosen])
+			{
+				Roll -= Weights[Chosen];
+				++Chosen;
+			}
+
+			FGridPlatform Platform = Candidates[Chosen];
+			const FFaceWish Wish{ FaceSign(Up), EStructureType::Ground, Spill.Side };
+
+			if (CanPlacePlatform(Platform) && DrawFill(Platform, /*bLoadBearingOnly=*/false, &Wish) && CanPlacePlatform(Platform))
+			{
+				Spill.Pieces.Add(Platform);
+
+				if (--Spill.Remaining <= 0)
+				{
+					GroundSpillQueue.RemoveAt(0);
+				}
+
+				// A ground laid beside walls standing may start them running round it.
+				PlacePlatform(Platform, /*JoinedSide=*/0);
+				QueueWallRun(Platform);
+				return true;
+			}
+
+			Candidates.RemoveAt(Chosen);
+			Weights.RemoveAt(Chosen);
+		}
+
+		GroundSpillQueue.RemoveAt(0);
+	}
+
+	return false;
+}
+
+void ARoomManager::QueueWallRun(const FGridPlatform& Platform)
+{
+	// Nothing is looked for or drawn while both chances are zero, so with runs off growth goes just as it did before.
+	if (IsFencePanel(Platform) || IsNatureSegment(Platform) || (InteriorWallRunChance <= 0.0f && ExteriorWallRunChance <= 0.0f))
+	{
+		return;
+	}
+
+	if (Platform.IsWall())
+	{
+		TryStartWallRun(Platform);
+		return;
+	}
+
+	// A floor laid with a ground of the city gives the walls already standing round its rim a new outline to stand on.
+	const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+	bool bHasGround = false;
+
+	for (const int32 Sign : { 1, -1 })
+	{
+		const UPlatformStructureData* Face = GetFaceStructure(Platform, Sign);
+		bHasGround = bHasGround || (Face && EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Face, NormalAxis, Sign, Platform.Up), EStructureType::Ground));
+	}
+
+	int32 SpanU, SpanV;
+	if (!bHasGround || !GetPlatformSpans(Platform, SpanU, SpanV))
+	{
+		return;
+	}
+
+	const int32 Module = GetModule();
+	TArray<int32, TInlineAllocator<8>> Walls;
+
+	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
+	{
+		if (!bRim || !ModuleEdgeUses.Contains(MakeEdgeKey(Edge)))
+		{
+			return;
+		}
+
+		FModuleFace Faces[4];
+		GetEdgeFaces(Edge, Module, Faces);
+
+		for (const FModuleFace& Face : Faces)
+		{
+			const int32* Owner = Face.Normal == NormalAxis ? nullptr : ModuleFaceOwners.Find(MakeModuleFaceKey(Face.MinNode, Face.Normal));
+
+			if (Owner && BuiltPlatforms[*Owner].IsWall())
+			{
+				Walls.AddUnique(*Owner);
+			}
+		}
+	});
+
+	// Each of them standing on it wholly may start a run, as if it had just been laid - unless a run of it waits already.
+	for (const int32 Index : Walls)
+	{
+		const FGridPlatform Wall = BuiltPlatforms[Index];
+		const uint64 Key = MakePlatformKey(Wall);
+
+		if (!IsFencePanel(Wall) && !IsNatureSegment(Wall)
+			&& !WallRunQueue.ContainsByPredicate([Key](const FFenceEnd& End) { return MakePlatformKey(End.Panel) == Key; }))
+		{
+			TryStartWallRun(Wall);
+		}
+	}
+}
+
+void ARoomManager::TryStartWallRun(const FGridPlatform& Wall)
+{
+	// The face over the grounds sets the run's side. One of both sides binds nothing, so it starts no run.
+	for (const int32 Sign : { 1, -1 })
+	{
+		const UPlatformStructureData* Face = GetFaceStructure(Wall, Sign);
+
+		if (!Face || Face->Side == EStructureSide::Both)
+		{
+			continue;
+		}
+
+		// Nothing is drawn at a chance of zero, so with runs off growth draws just as it did before there were any.
+		const float Chance = Face->Side == EStructureSide::Interior ? InteriorWallRunChance : ExteriorWallRunChance;
+
+		if (Chance <= 0.0f || !StandsOnGroundOutline(Wall, Sign, Face->Side))
+		{
+			continue;
+		}
+
+		if (StructureStream.FRand() < Chance)
+		{
+			QueueRunEnds(Wall, /*JoinedSide=*/0, WallRunContinueChance, StructureStream, WallRunQueue, Face->Side);
+		}
+
+		return;
+	}
+}
+
+bool ARoomManager::PlaceWallRunPanel()
+{
+	while (!WallRunQueue.IsEmpty())
+	{
+		const FFenceEnd End = WallRunQueue[0];
+		WallRunQueue.RemoveAt(0, EAllowShrinking::No);
+
+		FGridPlatform Straight;
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		GatherFenceContinuations(End, Straight, Turns);
+
+		// A run that has met itself here since the end was queued - closing round a room - stops.
+		if (IsRunEndClosed(End, Straight, Turns))
+		{
+			continue;
+		}
+
+		// Each spot as a wall, still to be filled, standing on the outline of the run's grounds with either face over them.
+		// Straight on, that is the face the run's last wall looked over them with; round a corner, the one looking into it.
+		using FSpot = TPair<FGridPlatform, int32>;
+		TArray<FSpot, TInlineAllocator<2>> StraightOn;
+		TArray<FSpot, TInlineAllocator<4>> RoundCorners;
+
+		auto Judge = [&](const FGridPlatform& Spot, auto& Out)
+		{
+			FGridPlatform Platform = Spot;
+			Platform.PositiveStructure = nullptr;
+			Platform.NegativeStructure = nullptr;
+			Platform.NatureCover = nullptr;
+
+			if (!CanPlacePlatform(Platform))
+			{
+				return;
+			}
+
+			for (const int32 Sign : { 1, -1 })
+			{
+				if (StandsOnGroundOutline(Platform, Sign, End.RunSide))
+				{
+					Out.Emplace(Platform, Sign);
+					return;
+				}
+			}
+		};
+
+		Judge(Straight, StraightOn);
+
+		for (const FGridPlatform& Turn : Turns)
+		{
+			Judge(Turn, RoundCorners);
+		}
+
+		// Straight on when nothing else is left, round a corner when only that is, and where both are, round a corner with
+		// WallRunTurnChance, split evenly between the ways left. One that cannot be filled after all gives way to the rest.
+		while (!StraightOn.IsEmpty() || !RoundCorners.IsEmpty())
+		{
+			const bool bTurn = StraightOn.IsEmpty() || (!RoundCorners.IsEmpty() && StructureStream.FRand() < WallRunTurnChance);
+			FSpot Spot;
+
+			if (bTurn)
+			{
+				const int32 Chosen = RoundCorners.Num() > 1 ? StructureStream.RandRange(0, RoundCorners.Num() - 1) : 0;
+				Spot = RoundCorners[Chosen];
+				RoundCorners.RemoveAt(Chosen);
+			}
+			else
+			{
+				Spot = StraightOn[0];
+				StraightOn.RemoveAt(0);
+			}
+
+			// Its face over the grounds is of the run's side, drawn as usual; its back follows the usual rules.
+			FGridPlatform& Platform = Spot.Key;
+			const FFaceWish Wish{ Spot.Value, EStructureType::Wall, End.RunSide };
+
+			if (DrawFill(Platform, /*bLoadBearingOnly=*/false, &Wish) && CanPlacePlatform(Platform))
+			{
+				PlacePlatform(Platform, /*JoinedSide=*/0);
+				QueueRunEnds(Platform, GetJoinedSide(End, Platform), WallRunContinueChance, StructureStream, WallRunQueue, End.RunSide);
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 bool ARoomManager::PlaceNextPlatform()
 {
 	// Once the middle zone's first tile stands, every other zone's is laid before anything else, a zone a beat. A zone
@@ -2176,8 +2569,9 @@ bool ARoomManager::PlaceNextPlatform()
 		}
 	}
 
-	// A fence run waiting to grow takes the beat before anything else, a panel a beat.
-	if (PlaceFencePanel())
+	// A fence run waiting to grow takes the beat before anything else, a panel a beat, then a patch of ground spilling out,
+	// a piece a beat, then a run of walls round the outline of grounds, a wall a beat.
+	if (PlaceFencePanel() || PlaceGroundSpillPiece() || PlaceWallRunPanel())
 	{
 		return true;
 	}
@@ -2197,7 +2591,10 @@ void ARoomManager::ClearPlatforms()
 {
 	Platforms.Reset();
 	FenceQueue.Reset();
+	GroundSpillQueue.Reset();
+	WallRunQueue.Reset();
 	SpillQueue.Reset();
+	CliffQueue.Reset();
 
 	// Nothing has health or is waiting to go, no reshuffle is under way, and every zone waits for a first tile again.
 	PlatformHealth.Reset();
@@ -2835,12 +3232,12 @@ void ARoomManager::ForEachMeeting(const FGridPlatform& Platform, const int32 Pla
 
 			if (Owners[First] == PlatformIndex && Owners[Second] != PlatformIndex)
 			{
-				Visit(FirstSign, Owners[Second], SecondSign);
+				Visit(FirstSign, Owners[Second], SecondSign, Edge);
 			}
 
 			if (Owners[Second] == PlatformIndex && Owners[First] != PlatformIndex)
 			{
-				Visit(SecondSign, Owners[First], FirstSign);
+				Visit(SecondSign, Owners[First], FirstSign, Edge);
 			}
 		}
 	});
@@ -2854,7 +3251,7 @@ void ARoomManager::GatherFaceNeighbours(
 {
 	OutNeighbours.Reset();
 
-	ForEachMeeting(Platform, PlatformIndex, [&OutNeighbours, FaceSign](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	ForEachMeeting(Platform, PlatformIndex, [&OutNeighbours, FaceSign](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign, const FLatticeEdge&)
 	{
 		if (OwnSign == FaceSign)
 		{
@@ -2938,12 +3335,17 @@ uint8 ARoomManager::GetNatureMeetsBit(const ENatureForm Form)
 	return static_cast<uint8>(1 << (1 + static_cast<int32>(Form)));
 }
 
+uint8 ARoomManager::GetOutlineMeets()
+{
+	return GetNatureMeetsBit(ENatureForm::Ground) | GetNatureMeetsBit(ENatureForm::Water);
+}
+
 bool ARoomManager::AreNatureMeetingsLegal(const FGridPlatform& Platform, uint8* OutNatureMeets) const
 {
 	bool bLegal = true;
 	uint8 NatureMeets = 0;
 
-	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign, const FLatticeEdge&)
 	{
 		const FGridPlatform& Other = BuiltPlatforms[Neighbour];
 		const UPlatformStructureData* OwnFace = GetFaceStructure(Platform, OwnSign);
@@ -2975,7 +3377,7 @@ void ARoomManager::GetNatureNeighbourFaces(const FGridPlatform& Platform, uint8&
 	OutOnGround = 0;
 	OutOnClosed = 0;
 
-	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign)
+	ForEachMeeting(Platform, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign, const FLatticeEdge&)
 	{
 		const UPlatformStructureData* OtherFace = GetFaceStructure(BuiltPlatforms[Neighbour], NeighbourSign);
 
@@ -2983,6 +3385,71 @@ void ARoomManager::GetNatureNeighbourFaces(const FGridPlatform& Platform, uint8&
 		{
 			(OtherFace->NatureForm == ENatureForm::Ground ? OutOnGround : OutOnClosed) |= FaceBit(OwnSign);
 		}
+	});
+}
+
+template <typename FunctorType>
+bool ARoomManager::IsOnOutline(const FGridPlatform& Wall, const int32 FaceSign, FunctorType&& IsOutlineFace) const
+{
+	int32 SpanU, SpanV, U, V;
+	if (!Wall.IsWall() || !GetPlatformSpans(Wall, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	GetInPlaneAxes(AxisIndex(Wall.Normal), U, V);
+
+	// Its foot and its top are the rim running across its Up, at either end of it.
+	const int32 Module = GetModule();
+	const int32 UpAxis = FaceAxis(Wall.Up);
+	const int32 AcrossAxis = UpAxis == U ? V : U;
+	const int32 EdgesAcross = (AcrossAxis == U ? SpanU : SpanV) / Module;
+
+	TArray<uint64, TInlineAllocator<16>> FootEdges;
+	TArray<uint64, TInlineAllocator<16>> TopEdges;
+	TArray<uint64, TInlineAllocator<16>> SeamEdges;
+
+	ForEachMeeting(Wall, BuiltPlatforms.Num(), [&](const int32 OwnSign, const int32 Neighbour, const int32 NeighbourSign, const FLatticeEdge& Edge)
+	{
+		const FGridPlatform& Other = BuiltPlatforms[Neighbour];
+
+		if (Edge.Axis != AcrossAxis || !IsOutlineFace(GetFaceStructure(Other, NeighbourSign), Other, NeighbourSign))
+		{
+			return;
+		}
+
+		// The same behind it as well as in front makes the edge a seam within, not the outline.
+		if (OwnSign != FaceSign)
+		{
+			SeamEdges.AddUnique(MakeEdgeKey(Edge));
+			return;
+		}
+
+		(Edge.Node[UpAxis] == Wall.MinNode[UpAxis] ? FootEdges : TopEdges).AddUnique(MakeEdgeKey(Edge));
+	});
+
+	auto IsWholeOutline = [&SeamEdges, EdgesAcross](const TConstArrayView<uint64> Edges)
+	{
+		return Edges.Num() == EdgesAcross && !Edges.ContainsByPredicate([&SeamEdges](const uint64 Key) { return SeamEdges.Contains(Key); });
+	};
+
+	return IsWholeOutline(FootEdges) || IsWholeOutline(TopEdges);
+}
+
+bool ARoomManager::StandsOnOutline(const FGridPlatform& Cliff, const int32 NatureSign) const
+{
+	return IsOnOutline(Cliff, NatureSign, [](const UPlatformStructureData* Face, const FGridPlatform&, int32)
+	{
+		return Face && Face->IsNature() && Face->NatureForm != ENatureForm::Cliff;
+	});
+}
+
+bool ARoomManager::StandsOnGroundOutline(const FGridPlatform& Wall, const int32 FaceSign, const EStructureSide Side) const
+{
+	return IsOnOutline(Wall, FaceSign, [Side](const UPlatformStructureData* Face, const FGridPlatform& Floor, const int32 FloorSign)
+	{
+		return Face && !Face->IsNature() && Face->StandsFor(Side)
+			&& EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Face, AxisIndex(Floor.Normal), FloorSign, Floor.Up), EStructureType::Ground);
 	});
 }
 
@@ -3000,7 +3467,7 @@ bool ARoomManager::MeetsClosedNature(const FGridPlatform& Platform, uint8* OutFa
 	return OnClosed != 0;
 }
 
-bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, FRandomStream& Stream)
+bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm Form, const int32 NatureSign, FRandomStream& Stream, UPlatformStructureData* Nature)
 {
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
@@ -3027,12 +3494,12 @@ bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm For
 		return WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned);
 	};
 
-	// The nature face, from the nature of the form - a slab of its colour fits any opening.
+	// The nature face, from the nature of the form - a slab of its colour fits any opening - or the one a run carries on.
 	TArray<UPlatformStructureData*> Options;
 
 	for (UPlatformStructureData* Structure : UsableNatureStructures)
 	{
-		if (Structure->NatureForm == Form && (!Structure->Mesh || Fits(Structure)))
+		if (Structure->NatureForm == Form && (!Nature || Structure == Nature) && (!Structure->Mesh || Fits(Structure)))
 		{
 			Options.Add(Structure);
 		}
@@ -3207,6 +3674,12 @@ bool ARoomManager::PlaceNextNature()
 		SpillQueue.RemoveAt(0);
 	}
 
+	// Then a cliff still running along an outline, a piece a beat.
+	if (PlaceCliffPanel())
+	{
+		return true;
+	}
+
 	// Otherwise something new, its form drawn by weight - and another drawn in its place where the one drawn has
 	// nowhere to go, so a beat is only lost when nature has nowhere at all.
 	TArray<ENatureForm, TInlineAllocator<NatureFormCount>> Forms = { ENatureForm::Ground, ENatureForm::Cliff, ENatureForm::Water };
@@ -3267,11 +3740,11 @@ bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
 	TMap<FNatureCandidateKey, int32> Seen;
 	TArray<FNatureCandidate> Candidates;
 
-	// What each starts against: ground an exterior or a cliff's top or foot, a cliff ground or another cliff, water
-	// ground or a cliff's top or foot. Only a field's own spill grows off more of itself.
+	// What each starts against: ground an exterior or a cliff's top or foot, a cliff the outline of ground or water,
+	// water ground or a cliff's top or foot. Only a field's own spill grows off more of itself.
 	const uint8 Starts = Form == ENatureForm::Ground
 		? (NatureMeetsCity | GetNatureMeetsBit(ENatureForm::Cliff))
-		: (GetNatureMeetsBit(ENatureForm::Ground) | GetNatureMeetsBit(ENatureForm::Cliff));
+		: (Form == ENatureForm::Cliff ? GetOutlineMeets() : (GetNatureMeetsBit(ENatureForm::Ground) | GetNatureMeetsBit(ENatureForm::Cliff)));
 
 	// Ground starts against an exterior: a sample of the city's own open placements - only those lying flat,
 	// unless it may face any way - each looking whichever ways NatureFacing allows.
@@ -3352,13 +3825,23 @@ bool ARoomManager::PlaceNatureOfForm(const ENatureForm Form)
 		}
 	}
 
-	// What grows off nature, off a sample of nature's rim: ground at a cliff's top or foot; a cliff off ground or
-	// carrying a cliff on; water beside ground or at a cliff's top or foot.
-	TArray<int32> Anchors = NatureIndices[static_cast<int32>(ENatureForm::Cliff)];
+	// What grows off nature, off a sample of nature's rim: ground at a cliff's top or foot; a cliff off the outline of
+	// ground or water, never off a cliff alone; water beside ground or at a cliff's top or foot.
+	TArray<int32> Anchors;
+
+	if (Form != ENatureForm::Cliff)
+	{
+		Anchors.Append(NatureIndices[static_cast<int32>(ENatureForm::Cliff)]);
+	}
 
 	if (Form != ENatureForm::Ground)
 	{
 		Anchors.Append(NatureIndices[static_cast<int32>(ENatureForm::Ground)]);
+	}
+
+	if (Form == ENatureForm::Cliff)
+	{
+		Anchors.Append(NatureIndices[static_cast<int32>(ENatureForm::Water)]);
 	}
 
 	const int32 Module = GetModule();
@@ -3438,12 +3921,16 @@ void ARoomManager::GatherNatureAround(
 	const int32 AnchorNormal = AxisIndex(Anchor.Normal);
 	const int32 AnchorUpAxis = FaceAxis(Anchor.Up);
 
-	// How it grows off the anchor: a field carries a field on in its plane, and a cliff a cliff; a cliff stands on a
-	// field's outline, a field lies at a cliff's top or foot, and a cliff turns a corner round another's side.
+	// How it grows off the anchor: a field carries a field on in its plane, a cliff stands on a field's outline, and a
+	// field lies at a cliff's top or foot. A cliff carries a cliff on only as its run does (see PlaceCliffPanel).
+	if (Form == ENatureForm::Cliff && AnchorForm == ENatureForm::Cliff)
+	{
+		return;
+	}
+
 	const bool bFieldOffField = Form != ENatureForm::Cliff && AnchorForm != ENatureForm::Cliff;
-	const bool bCliffOffCliff = Form == ENatureForm::Cliff && AnchorForm == ENatureForm::Cliff;
-	const bool bInPlane = bFieldOffField || bCliffOffCliff;
-	const bool bAcross = !bFieldOffField && (!bCliffOffCliff || EdgeAxis == AnchorUpAxis);
+	const bool bInPlane = bFieldOffField;
+	const bool bAcross = !bFieldOffField;
 
 	// Nothing to judge where every half-plane it could take round the edge is already taken.
 	FModuleFace EdgeFaces[4];
@@ -3566,8 +4053,9 @@ bool ARoomManager::JudgeNatureCandidate(FGridPlatform& Platform, const ENatureFo
 		return false;
 	}
 
-	// Ground and water only go where the air above them is clear.
-	return Form == ENatureForm::Cliff || IsAirClear(Platform);
+	// A cliff stands wholly on the outline of ground or water, its foot or its top; ground and water only go where the
+	// air above them is clear.
+	return Form == ENatureForm::Cliff ? StandsOnOutline(Platform, NatureSign) : IsAirClear(Platform);
 }
 
 bool ARoomManager::FindNatureFill(
@@ -3656,16 +4144,102 @@ bool ARoomManager::FindNatureFill(
 	return OutFront && OutBack;
 }
 
-bool ARoomManager::PlaceNatureCandidate(FNatureCandidate& Candidate)
+bool ARoomManager::PlaceNatureCandidate(FNatureCandidate& Candidate, const int32 JoinedSide)
 {
 	// Its stand-ins only said it could be filled. What fills it is drawn now, and held to the rules again.
-	if (!DrawNatureFill(Candidate.Platform, Candidate.Form, Candidate.NatureSign, NatureStream) || !CanPlacePlatform(Candidate.Platform))
+	if (!DrawNatureFill(Candidate.Platform, Candidate.Form, Candidate.NatureSign, NatureStream, Candidate.Nature) || !CanPlacePlatform(Candidate.Platform))
 	{
 		return false;
 	}
 
 	PlacePlatform(Candidate.Platform, /*JoinedSide=*/0);
+
+	// A cliff carries on from its ends as a fence does, the room each has judged with it standing.
+	if (Candidate.Form == ENatureForm::Cliff)
+	{
+		QueueRunEnds(Candidate.Platform, JoinedSide, CliffContinueChance, NatureStream, CliffQueue);
+	}
+
 	return true;
+}
+
+bool ARoomManager::PlaceCliffPanel()
+{
+	while (!CliffQueue.IsEmpty())
+	{
+		const FFenceEnd End = CliffQueue[0];
+		CliffQueue.RemoveAt(0, EAllowShrinking::No);
+
+		// A run of a cliff no longer among the structures stops where it is.
+		UPlatformStructureData* Cliff = GetRunStructure(End.Panel);
+
+		if (!Cliff || !UsableNatureStructures.Contains(Cliff))
+		{
+			continue;
+		}
+
+		FGridPlatform Straight;
+		TArray<FGridPlatform, TInlineAllocator<2>> Turns;
+		GatherFenceContinuations(End, Straight, Turns);
+
+		// A run that has met itself here since the end was queued - closing round a field - stops.
+		if (IsRunEndClosed(End, Straight, Turns))
+		{
+			continue;
+		}
+
+		// Each spot as a cliff on the outline of ground or water, its nature face looking either way. Straight on, only the
+		// way the run's looks meets it legally; round a corner, only the way that meets the run's nature face.
+		TArray<FNatureCandidate, TInlineAllocator<2>> StraightOn;
+		TArray<FNatureCandidate, TInlineAllocator<4>> RoundCorners;
+
+		auto Judge = [&](const FGridPlatform& Spot, auto& Out)
+		{
+			for (const int32 Sign : { 1, -1 })
+			{
+				FGridPlatform Platform = Spot;
+
+				if (JudgeNatureCandidate(Platform, ENatureForm::Cliff, Sign, GetOutlineMeets()))
+				{
+					Out.Add(FNatureCandidate{ Platform, ENatureForm::Cliff, Sign, 1, Cliff });
+				}
+			}
+		};
+
+		Judge(Straight, StraightOn);
+
+		for (const FGridPlatform& Turn : Turns)
+		{
+			Judge(Turn, RoundCorners);
+		}
+
+		// Straight on when nothing else is left, round a corner when only that is, and where both are, round a corner with
+		// CliffTurnChance, split evenly between the ways left. One that cannot be filled after all gives way to the rest.
+		while (!StraightOn.IsEmpty() || !RoundCorners.IsEmpty())
+		{
+			const bool bTurn = StraightOn.IsEmpty() || (!RoundCorners.IsEmpty() && NatureStream.FRand() < CliffTurnChance);
+			FNatureCandidate Candidate;
+
+			if (bTurn)
+			{
+				const int32 Chosen = RoundCorners.Num() > 1 ? NatureStream.RandRange(0, RoundCorners.Num() - 1) : 0;
+				Candidate = RoundCorners[Chosen];
+				RoundCorners.RemoveAt(Chosen);
+			}
+			else
+			{
+				Candidate = StraightOn[0];
+				StraightOn.RemoveAt(0);
+			}
+
+			if (PlaceNatureCandidate(Candidate, GetJoinedSide(End, Candidate.Platform)))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
 }
 
 void ARoomManager::AdvanceNature()
@@ -6212,7 +6786,7 @@ void ARoomManager::GatherFillOptions(
 	}
 }
 
-bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly)
+bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly, const FFaceWish* Wish)
 {
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
@@ -6250,12 +6824,16 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 		return true;
 	};
 
-	// A floor is filled from the face looking along its Up, its roof or the ground it is walked on. A
-	// wall over an interior ground on one side only is filled from that side, so what goes behind it
-	// follows from it; any other wall from either face, evenly.
+	// A face a patch or a run asks for is filled first. Otherwise a floor is filled from the face looking along its Up,
+	// its roof or the ground it is walked on. A wall over an interior ground on one side only is filled from that side,
+	// so what goes behind it follows from it; any other wall from either face, evenly.
 	int32 FirstSign = 1;
 
-	if (!Platform.IsWall())
+	if (Wish)
+	{
+		FirstSign = Wish->Sign;
+	}
+	else if (!Platform.IsWall())
 	{
 		FirstSign = FaceSign(Platform.Up);
 	}
@@ -6272,6 +6850,19 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 	GatherFillOptions(Platform, FirstSign, /*Front=*/nullptr, bLoadBearingOnly, Options, /*bExteriorBackOnly=*/(FacesOnGround & FaceBit(-FirstSign)) != 0);
 	KeepExteriorsOnGround(Options, FirstSign);
 	KeepInteriorOverGround(Options, FirstSign);
+
+	// A patch of ground tops each floor it lays with a ground of its side, and a run of walls faces the ground it runs
+	// round with a wall of its side, and nothing else.
+	if (Wish)
+	{
+		const int32 NormalAxis = AxisIndex(Platform.Normal);
+
+		Options.RemoveAll([&](const UPlatformStructureData* Option)
+		{
+			return Option->bFence || !Option->StandsFor(Wish->Side)
+				|| !EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Option, NormalAxis, FirstSign, Platform.Up), Wish->Type);
+		});
+	}
 
 	UPlatformStructureData* First = DrawStructure(Options, Platform, FirstSign);
 
@@ -7870,6 +8461,24 @@ void ARoomManager::UpdateVisualsAfterPlacement(
 	const TConstArrayView<FGridSurfaceRef> ChangedSurfaces)
 {
 	AppendPlatformPieces(Platform);
+
+	// Water laid beside water makes a seam of the beam between them, and anything standing on that beam ends it. Either
+	// can happen on any beam or post the platform takes in, inside it as well as round it.
+	if (!NatureIndices[static_cast<int32>(ENatureForm::Water)].IsEmpty())
+	{
+		int32 SpanU, SpanV;
+		GetPlatformSpans(Platform, SpanU, SpanV);
+
+		const int32 Module = GetModule();
+		TSet<uint64> EdgeKeys;
+		TSet<uint64> NodeKeys;
+
+		ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&EdgeKeys](const FLatticeEdge& Edge, bool) { EdgeKeys.Add(MakeEdgeKey(Edge)); });
+		ForEachPlatformNode(Platform, SpanU, SpanV, Module, [&NodeKeys](const FIntVector& Node) { NodeKeys.Add(MakeCellKey(Node)); });
+
+		RefreshLatticePieces(EdgeKeys, NodeKeys);
+	}
+
 	UpdateSurfaceMarks(ChangedSurfaces);
 
 	if (IsFieldPiece(Platform))
@@ -7966,18 +8575,9 @@ int32 ARoomManager::SyncPieces()
 
 void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 {
-	bool bLayersIntact = IsPieceLayerIntact(EdgeLayer, EdgePieces) && IsPieceLayerIntact(NodeLayer, NodePieces);
-
-	for (const FStructureLayer& Layer : StructureLayers)
-	{
-		bLayersIntact = bLayersIntact
-			&& !Layer.Pieces.Chunks.IsEmpty()
-			&& IsPieceLayerIntact(Layer.Pieces, Layer.Pieces.Chunks[0]);
-	}
-
 	// Anything but the plain case - pieces switched off, never built in full, or a layer out of
 	// step with its record - is left to the full sync.
-	if (!bPiecesComplete || !bShowPieces || !PieceMesh || !bLayersIntact)
+	if (!ArePiecesInStep())
 	{
 		SyncPieces();
 		return;
@@ -8048,13 +8648,6 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 	const int32 Module = GetModule();
 	const int32 NormalAxis = AxisIndex(Platform.Normal);
 
-	// Everything on the lattice is axis-aligned, so every box is the unit cube scaled to the
-	// cells it fills, and none needs turning.
-	auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
-	{
-		return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
-	};
-
 	// The opening is filled by its structures, each laid on the face it fills. A two-sided one is a
 	// single piece through both faces; a one-sided pair is two, keyed apart. A structure that no
 	// longer fits the opening - its size changed since it was drawn - is not drawn across it.
@@ -8112,29 +8705,313 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 	// platform that brought it. A neighbour sharing one names the same piece, so it is built
 	// once - even where a neighbour shares only part of a side - and no two beams, nor a beam
 	// and a post, can ever overlap.
-	const double RunExtent = static_cast<double>(Module - 1) * CellSize;
-
-	// A beam every platform around it has blocked is not built, nor a post no built beam ends at.
 	ForEachModuleEdge(Platform, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
 	{
-		if (!bRim || !IsEdgeBuilt(MakeEdgeKey(Edge)))
+		if (bRim)
 		{
-			return;
+			GatherEdgePieces(Edge.Node, Edge.Axis, OutPieces);
 		}
-
-		FVector EdgeExtent(CellSize);
-		EdgeExtent[Edge.Axis] = RunExtent;
-
-		OutPieces.Edges.Add(FPlacedPiece{ MakeEdgeKey(Edge), MakeBox(Edge.Node + AxisStep(Edge.Axis), EdgeExtent) });
 	});
 
 	ForEachRimNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
 	{
-		if (IsNodeBuilt(Node))
-		{
-			OutPieces.Nodes.Add(FPlacedPiece{ MakeCellKey(Node), MakeBox(Node, FVector(CellSize)) });
-		}
+		GatherNodePieces(Node, OutPieces);
 	});
+}
+
+void ARoomManager::GatherEdgePieces(const FIntVector& Node, const int32 Axis, FGatheredPieces& OutPieces) const
+{
+	const uint64 EdgeKey = MakeEdgeKey(FLatticeEdge{ Node, Axis });
+
+	// A beam every platform around it has blocked is not built.
+	if (!IsEdgeBuilt(EdgeKey))
+	{
+		return;
+	}
+
+	// The run between the posts at its two ends.
+	const FIntVector MinCell = Node + AxisStep(Axis);
+	FVector Extent(CellSize);
+	Extent[Axis] = static_cast<double>(GetModule() - 1) * CellSize;
+
+	FWaterSeam Seam;
+
+	if (FindWaterSeam(Node, Axis, Seam))
+	{
+		OutPieces.Edges.Add(FPlacedPiece{ EdgeKey | WaterSeamPieceBit, MakeLatticePieceTransform(MinCell, Extent, &Seam, /*bWater=*/false) });
+		OutPieces.Structures.FindOrAdd(Seam.Water).Add(FPlacedPiece{ EdgeKey | WaterSeamPieceBit, MakeLatticePieceTransform(MinCell, Extent, &Seam, /*bWater=*/true) });
+		return;
+	}
+
+	OutPieces.Edges.Add(FPlacedPiece{ EdgeKey, MakeLatticePieceTransform(MinCell, Extent, nullptr, /*bWater=*/false) });
+}
+
+void ARoomManager::GatherNodePieces(const FIntVector& Node, FGatheredPieces& OutPieces) const
+{
+	// Nor a post no built beam ends at.
+	if (!IsNodeBuilt(Node))
+	{
+		return;
+	}
+
+	const uint64 NodeKey = MakeCellKey(Node);
+	const FVector Extent(CellSize);
+
+	FWaterSeam Seam;
+
+	if (FindWaterSeamAtNode(Node, Seam))
+	{
+		OutPieces.Nodes.Add(FPlacedPiece{ NodeKey | WaterSeamPieceBit, MakeLatticePieceTransform(Node, Extent, &Seam, /*bWater=*/false) });
+		OutPieces.Structures.FindOrAdd(Seam.Water).Add(FPlacedPiece{ NodeKey | WaterSeamPieceBit, MakeLatticePieceTransform(Node, Extent, &Seam, /*bWater=*/true) });
+		return;
+	}
+
+	OutPieces.Nodes.Add(FPlacedPiece{ NodeKey, MakeLatticePieceTransform(Node, Extent, nullptr, /*bWater=*/false) });
+}
+
+FTransform ARoomManager::MakeLatticePieceTransform(const FIntVector& MinCell, FVector Extent, const FWaterSeam* Seam, const bool bWater) const
+{
+	FVector Min = GetCellMinCorner(MinCell);
+
+	// Across a seam the water takes the half of the layer on the side it looks out from, where its slabs lie, and the
+	// beam or post keeps the half behind.
+	if (Seam)
+	{
+		Extent[Seam->NormalAxis] = 0.5 * CellSize;
+
+		if ((Seam->Sign > 0) == bWater)
+		{
+			Min[Seam->NormalAxis] += 0.5 * CellSize;
+		}
+	}
+
+	// Everything on the lattice is axis-aligned, so every box is the unit cube scaled to the cells it fills.
+	return FTransform(FRotator::ZeroRotator, Min + 0.5 * Extent, Extent / UnitCubeSize);
+}
+
+UPlatformStructureData* ARoomManager::GetFlatWater(const FIntVector& FaceMinNode, const int32 NormalAxis, int32& OutSign) const
+{
+	const int32* FaceOwner = ModuleFaceOwners.Find(MakeModuleFaceKey(FaceMinNode, NormalAxis));
+
+	if (!FaceOwner || !BuiltPlatforms.IsValidIndex(*FaceOwner))
+	{
+		return nullptr;
+	}
+
+	const FGridPlatform& Platform = BuiltPlatforms[*FaceOwner];
+	ENatureForm Form;
+
+	if (!GetNatureFace(Platform, OutSign, Form) || Form != ENatureForm::Water)
+	{
+		return nullptr;
+	}
+
+	// Water with a mesh of its own, or a cover, is drawn as that, and has no slab to carry on across a beam.
+	UPlatformStructureData* Water = GetFaceStructure(Platform, OutSign);
+	return Water->Mesh || Platform.NatureCover ? nullptr : Water;
+}
+
+bool ARoomManager::FindWaterSeam(const FIntVector& Node, const int32 Axis, FWaterSeam& OutSeam) const
+{
+	if (NatureIndices[static_cast<int32>(ENatureForm::Water)].IsEmpty())
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+
+	// The edge lies in two lattice planes, each facing along one of the other two axes.
+	for (int32 NormalAxis = 0; NormalAxis < 3; ++NormalAxis)
+	{
+		if (NormalAxis == Axis)
+		{
+			continue;
+		}
+
+		// The axis across the edge in that plane, with a module face either side of it.
+		const int32 Across = 3 - Axis - NormalAxis;
+
+		int32 Sign = 0;
+		int32 OtherSign = 0;
+		UPlatformStructureData* Water = GetFlatWater(Node, NormalAxis, Sign);
+
+		if (!Water || GetFlatWater(Node - AxisStep(Across, Module), NormalAxis, OtherSign) != Water || OtherSign != Sign)
+		{
+			continue;
+		}
+
+		// A face standing on the edge on the water's side parts the two, which then meet it rather than each other.
+		const FIntVector StandingMinNode = Sign > 0 ? Node : Node - AxisStep(NormalAxis, Module);
+
+		if (ModuleFaceOwners.Contains(MakeModuleFaceKey(StandingMinNode, Across)))
+		{
+			continue;
+		}
+
+		OutSeam.Water = Water;
+		OutSeam.NormalAxis = NormalAxis;
+		OutSeam.Sign = Sign;
+		return true;
+	}
+
+	return false;
+}
+
+bool ARoomManager::FindWaterSeamAtNode(const FIntVector& Node, FWaterSeam& OutSeam) const
+{
+	if (NatureIndices[static_cast<int32>(ENatureForm::Water)].IsEmpty())
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+
+	// The beams built at the node: the one starting at it along each axis, and the one ending at it.
+	TArray<FLatticeEdge, TInlineAllocator<6>> Built;
+
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		for (const FIntVector& Start : { Node, Node - AxisStep(Axis, Module) })
+		{
+			if (IsEdgeBuilt(MakeEdgeKey(FLatticeEdge{ Start, Axis })))
+			{
+				Built.Add(FLatticeEdge{ Start, Axis });
+			}
+		}
+	}
+
+	// The sheet is the one the first seam among them is in...
+	const FLatticeEdge* First = Built.FindByPredicate([&](const FLatticeEdge& Edge) { return FindWaterSeam(Edge.Node, Edge.Axis, OutSeam); });
+
+	if (!First)
+	{
+		return false;
+	}
+
+	// ...and every other beam there is a seam of the same sheet, or hangs behind it, as the wall under a pool does.
+	for (const FLatticeEdge& Edge : Built)
+	{
+		if (Edge.Axis == OutSeam.NormalAxis)
+		{
+			// The one starting at the node heads along the axis, the one ending at it against.
+			if ((Edge.Node == Node) == (OutSeam.Sign > 0))
+			{
+				return false;
+			}
+
+			continue;
+		}
+
+		FWaterSeam Seam;
+
+		if (&Edge != First && !(FindWaterSeam(Edge.Node, Edge.Axis, Seam) && Seam == OutSeam))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool ARoomManager::ArePiecesInStep() const
+{
+	if (!bPiecesComplete || !bShowPieces || !PieceMesh
+		|| !IsPieceLayerIntact(EdgeLayer, EdgePieces) || !IsPieceLayerIntact(NodeLayer, NodePieces))
+	{
+		return false;
+	}
+
+	for (const FStructureLayer& Layer : StructureLayers)
+	{
+		if (Layer.Pieces.Chunks.IsEmpty() || !IsPieceLayerIntact(Layer.Pieces, Layer.Pieces.Chunks[0]))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void ARoomManager::RefreshLatticePieces(const TSet<uint64>& EdgeKeys, const TSet<uint64>& NodeKeys)
+{
+	if (!ArePiecesInStep())
+	{
+		return;
+	}
+
+	FGatheredPieces Wanted;
+
+	// Every key either kind of piece could be drawn under, cut down or whole, to look for in the layers.
+	TArray<uint64> LatticeKeys;
+	TArray<uint64> NodeLatticeKeys;
+	TArray<uint64> SeamKeys;
+
+	for (const uint64 EdgeKey : EdgeKeys)
+	{
+		GatherEdgePieces(CellFromKey(EdgeKey), static_cast<int32>(EdgeKey >> KeyTagShift) - 1, Wanted);
+		LatticeKeys.Append({ EdgeKey, EdgeKey | WaterSeamPieceBit });
+		SeamKeys.Add(EdgeKey | WaterSeamPieceBit);
+	}
+
+	for (const uint64 NodeKey : NodeKeys)
+	{
+		GatherNodePieces(CellFromKey(NodeKey), Wanted);
+		NodeLatticeKeys.Append({ NodeKey, NodeKey | WaterSeamPieceBit });
+		SeamKeys.Add(NodeKey | WaterSeamPieceBit);
+	}
+
+	// A piece drawn under a key no longer wanted is taken away - the whole beam where it is now cut down, or the other
+	// way round - and one wanted but not drawn is added.
+	auto BringInLine = [this](FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, const TConstArrayView<uint64> Keys, const TConstArrayView<FPlacedPiece> WantedPieces)
+	{
+		TSet<uint64> WantedKeys;
+		TArray<FPlacedPiece> NewPieces;
+
+		for (const FPlacedPiece& Piece : WantedPieces)
+		{
+			bool bAlreadyWanted = false;
+			WantedKeys.Add(Piece.Key, &bAlreadyWanted);
+
+			if (!bAlreadyWanted && !Layer.PieceSlots.Contains(Piece.Key))
+			{
+				Layer.PieceStamps.Add(Piece.Key, Layer.SyncStamp);
+				NewPieces.Add(Piece);
+			}
+		}
+
+		for (const uint64 Key : Keys)
+		{
+			if (!WantedKeys.Contains(Key))
+			{
+				RemovePieceFromLayer(Layer, Key);
+			}
+		}
+
+		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
+	};
+
+	BringInLine(EdgeLayer, EdgePieces, LatticeKeys, Wanted.Edges);
+	BringInLine(NodeLayer, NodePieces, NodeLatticeKeys, Wanted.Nodes);
+
+	// The water over the seams, in the layer of the water it belongs to and taken out of any other.
+	for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& WaterPieces : Wanted.Structures)
+	{
+		FStructureLayer& Layer = FindOrAddStructureLayer(WaterPieces.Key);
+
+		UStaticMesh* Mesh = nullptr;
+		UMaterialInterface* Material = nullptr;
+		ResolveStructureLayerLook(Layer, Mesh, Material);
+		ApplyMeshAndMaterial(Layer.Pieces.Chunks, Mesh, Material);
+	}
+
+	for (FStructureLayer& Layer : StructureLayers)
+	{
+		if (Layer.Structure && Layer.Structure->IsNature() && Layer.Structure->NatureForm == ENatureForm::Water)
+		{
+			const TArray<FPlacedPiece>* WaterPieces = Wanted.Structures.Find(Layer.Structure.Get());
+			BringInLine(Layer.Pieces, Layer.Pieces.Chunks[0], SeamKeys, WaterPieces ? TConstArrayView<FPlacedPiece>(*WaterPieces) : TConstArrayView<FPlacedPiece>());
+		}
+	}
 }
 
 void ARoomManager::ResetPieces()
@@ -8180,7 +9057,8 @@ void ARoomManager::ResolveStructureLayerLook(FStructureLayer& Layer, UStaticMesh
 {
 	const UPlatformStructureData* Structure = Layer.Structure;
 
-	// Its own mesh with its own materials; or, for nature without one, the beams' box tinted to its flat colour.
+	// Its own mesh with its own materials; or, for nature without one, the beams' box in its flat material, or the
+	// beams' own, tinted to its flat colour.
 	if (!Structure || Structure->Mesh)
 	{
 		OutMesh = Structure ? Structure->Mesh.Get() : nullptr;
@@ -8189,7 +9067,8 @@ void ARoomManager::ResolveStructureLayerLook(FStructureLayer& Layer, UStaticMesh
 	}
 
 	OutMesh = PieceMesh;
-	OutMaterial = ResolveTintedMaterial(Layer.FlatMaterial, PieceMaterial, PieceColorParameterName, Structure->FlatColor);
+	OutMaterial = ResolveTintedMaterial(
+		Layer.FlatMaterial, Structure->FlatMaterial ? Structure->FlatMaterial.Get() : PieceMaterial.Get(), PieceColorParameterName, Structure->FlatColor);
 }
 
 void ARoomManager::ResetStructureLayers()
@@ -9115,6 +9994,7 @@ bool ARoomManager::PlaceSeed(const int32 Zone)
 		}
 
 		PlacePlatform(Seed, /*JoinedSide=*/0);
+		QueueGroundSpill(Seed);
 		return true;
 	}
 
@@ -9406,10 +10286,12 @@ void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
 		return RemovedKeys.Contains(MakePlatformKey(Platform));
 	};
 
-	// The list first, which is what is saved, then whatever waited on them: a fence end on a panel, a field's piece, a
-	// platform's health and its place in the queue to go.
+	// The list first, which is what is saved, then whatever waited on them: a fence's, a cliff's or a wall run's end on a panel, a piece of
+	// a field or of a patch of ground, a platform's health and its place in the queue to go.
 	Platforms.RemoveAll(IsRemoved);
 	FenceQueue.RemoveAll([&IsRemoved](const FFenceEnd& End) { return IsRemoved(End.Panel); });
+	CliffQueue.RemoveAll([&IsRemoved](const FFenceEnd& End) { return IsRemoved(End.Panel); });
+	WallRunQueue.RemoveAll([&IsRemoved](const FFenceEnd& End) { return IsRemoved(End.Panel); });
 
 	for (FNatureSpill& Spill : SpillQueue)
 	{
@@ -9417,6 +10299,13 @@ void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
 	}
 
 	SpillQueue.RemoveAll([](const FNatureSpill& Spill) { return Spill.Pieces.IsEmpty(); });
+
+	for (FGroundSpill& Spill : GroundSpillQueue)
+	{
+		Spill.Pieces.RemoveAll(IsRemoved);
+	}
+
+	GroundSpillQueue.RemoveAll([](const FGroundSpill& Spill) { return Spill.Pieces.IsEmpty(); });
 
 	for (const uint64 Key : RemovedKeys)
 	{
@@ -9533,7 +10422,8 @@ void ARoomManager::RemovePlacedPlatforms(
 			}
 		});
 
-		ForEachRimNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
+		// Inside it as well as round it: a post there, of a wall hanging under water, can have been cut down at a seam.
+		ForEachPlatformNode(Platform, SpanU, SpanV, Module, [&](const FIntVector& Node)
 		{
 			OutNodeKeys.Add(MakeCellKey(Node));
 		});
@@ -10009,15 +10899,8 @@ void ARoomManager::UpdateVisualsAfterRemoval(
 	const TSet<uint64>& NodeKeys,
 	const TConstArrayView<FGridSurfaceRef> ChangedSurfaces)
 {
-	bool bLayersIntact = IsPieceLayerIntact(EdgeLayer, EdgePieces) && IsPieceLayerIntact(NodeLayer, NodePieces);
-
-	for (const FStructureLayer& Layer : StructureLayers)
-	{
-		bLayersIntact = bLayersIntact && !Layer.Pieces.Chunks.IsEmpty() && IsPieceLayerIntact(Layer.Pieces, Layer.Pieces.Chunks[0]);
-	}
-
 	// Anything but the plain case is left to the full sync, which takes away whatever is no longer wanted.
-	if (!bPiecesComplete || !bShowPieces || !PieceMesh || !bLayersIntact)
+	if (!ArePiecesInStep())
 	{
 		SyncPieces();
 	}
@@ -10038,59 +10921,9 @@ void ARoomManager::UpdateVisualsAfterRemoval(
 			}
 		}
 
-		// The beams and posts round them, each as it now is: gone where nothing uses it any more, and back where the
-		// platform that blocked it was taken away.
-		const double RunExtent = static_cast<double>(GetModule() - 1) * CellSize;
-
-		auto MakeBox = [this](const FIntVector& MinCell, const FVector& Extent) -> FTransform
-		{
-			return FTransform(FRotator::ZeroRotator, GetCellMinCorner(MinCell) + 0.5 * Extent, Extent / UnitCubeSize);
-		};
-
-		TArray<FPlacedPiece> NewEdges;
-		TArray<FPlacedPiece> NewNodes;
-
-		for (const uint64 EdgeKey : EdgeKeys)
-		{
-			const bool bWanted = IsEdgeBuilt(EdgeKey);
-			const bool bDrawn = EdgeLayer.PieceSlots.Contains(EdgeKey);
-
-			if (bDrawn && !bWanted)
-			{
-				RemovePieceFromLayer(EdgeLayer, EdgeKey);
-			}
-			else if (bWanted && !bDrawn)
-			{
-				const FIntVector EdgeNode = CellFromKey(EdgeKey);
-				const int32 EdgeAxis = static_cast<int32>(EdgeKey >> KeyTagShift) - 1;
-
-				FVector EdgeExtent(CellSize);
-				EdgeExtent[EdgeAxis] = RunExtent;
-
-				EdgeLayer.PieceStamps.Add(EdgeKey, EdgeLayer.SyncStamp);
-				NewEdges.Add(FPlacedPiece{ EdgeKey, MakeBox(EdgeNode + AxisStep(EdgeAxis), EdgeExtent) });
-			}
-		}
-
-		for (const uint64 NodeKey : NodeKeys)
-		{
-			const FIntVector Node = CellFromKey(NodeKey);
-			const bool bWanted = IsNodeBuilt(Node);
-			const bool bDrawn = NodeLayer.PieceSlots.Contains(NodeKey);
-
-			if (bDrawn && !bWanted)
-			{
-				RemovePieceFromLayer(NodeLayer, NodeKey);
-			}
-			else if (bWanted && !bDrawn)
-			{
-				NodeLayer.PieceStamps.Add(NodeKey, NodeLayer.SyncStamp);
-				NewNodes.Add(FPlacedPiece{ NodeKey, MakeBox(Node, FVector(CellSize)) });
-			}
-		}
-
-		AddPiecesToLayer(EdgeLayer, EdgePieces, NewEdges);
-		AddPiecesToLayer(NodeLayer, NodePieces, NewNodes);
+		// The beams and posts they took in, each as it now is: gone where nothing uses it any more, back where the
+		// platform that blocked it was taken away, and whole again where water going ended a seam.
+		RefreshLatticePieces(EdgeKeys, NodeKeys);
 	}
 
 	UpdateSurfaceMarks(ChangedSurfaces);

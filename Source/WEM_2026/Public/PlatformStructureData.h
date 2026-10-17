@@ -6,6 +6,7 @@
 #include "Engine/DataAsset.h"
 #include "PlatformStructureData.generated.h"
 
+class UMaterialInterface;
 class UStaticMesh;
 class UStructureCategory;
 
@@ -123,6 +124,13 @@ public:
 	/** The colour it is drawn in, as a flat slab across its face, while it has no mesh. Lit, like the beams. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
 	FLinearColor FlatColor = FLinearColor(0.05f, 0.3f, 0.03f);
+
+	/**
+	 * The material its flat slab is drawn in, given FlatColor through the room manager's piece colour parameter. None draws
+	 * it in the beams' material. Water's is mapped by world position, so neighbouring pieces read as one surface.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
+	TObjectPtr<UMaterialInterface> FlatMaterial;
 
 	/**
 	 * Categories whose city structures cover its face: one of the room manager's structures in any of them, one-sided,

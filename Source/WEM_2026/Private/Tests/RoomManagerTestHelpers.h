@@ -123,6 +123,55 @@ struct FRoomManagerTestAccess
 		return Manager.FenceQueue.Num();
 	}
 
+	/** How many cliff ends wait to carry their run on. */
+	static int32 GetWaitingCliffEnds(const ARoomManager& Manager)
+	{
+		return Manager.CliffQueue.Num();
+	}
+
+	/** Draws whether a platform just placed starts a patch of ground spilling out, as a growth beat does. */
+	static void QueueGroundSpill(ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		Manager.QueueGroundSpill(Platform);
+	}
+
+	/** One ground spill beat. False when no patch had anywhere to go. */
+	static bool PlaceGroundSpillPiece(ARoomManager& Manager)
+	{
+		return Manager.PlaceGroundSpillPiece();
+	}
+
+	/** How many patches of the city's ground are still spilling out, and how many pieces the oldest may still lay. */
+	static int32 GetGroundSpills(const ARoomManager& Manager, int32& OutOldestRemaining)
+	{
+		OutOldestRemaining = Manager.GroundSpillQueue.IsEmpty() ? 0 : Manager.GroundSpillQueue[0].Remaining;
+		return Manager.GroundSpillQueue.Num();
+	}
+
+	/** Draws whether a wall just placed starts a run of walls round the outline of grounds, as a growth beat does. */
+	static void QueueWallRun(ARoomManager& Manager, const FGridPlatform& Wall)
+	{
+		Manager.QueueWallRun(Wall);
+	}
+
+	/** How many ends of runs of walls wait to carry on. */
+	static int32 GetWaitingWallRunEnds(const ARoomManager& Manager)
+	{
+		return Manager.WallRunQueue.Num();
+	}
+
+	/** Whether a wall stands wholly on the outline of the city's grounds of one side, its face FaceSign over them. */
+	static bool StandsOnGroundOutline(const ARoomManager& Manager, const FGridPlatform& Wall, const int32 FaceSign, const EStructureSide Side)
+	{
+		return Manager.StandsOnGroundOutline(Wall, FaceSign, Side);
+	}
+
+	/** Whether a cliff about to be placed stands wholly on the outline of ground or water. */
+	static bool StandsOnOutline(const ARoomManager& Manager, const FGridPlatform& Cliff, const int32 NatureSign)
+	{
+		return Manager.StandsOnOutline(Cliff, NatureSign);
+	}
+
 	/** The Up a placement would take if it were drawn now. Draws from the role stream, as a beat would. */
 	static EGridFace ChooseUp(ARoomManager& Manager, const FGridPlatform& Platform)
 	{
@@ -558,6 +607,89 @@ struct FRoomManagerTestAccess
 		return 0;
 	}
 
+	/** As WaterSeamPieceBit in RoomManager.cpp: a beam or post cut down at a seam in water, and the water over it. */
+	static constexpr uint64 WaterSeamBit = uint64(1) << 62;
+
+	static int32 GetModule(const ARoomManager& Manager)
+	{
+		return Manager.GetModule();
+	}
+
+	/** Brings every piece in line with the platforms, as a rebuild does. How many it had to add or take away. */
+	static int32 SyncPieces(ARoomManager& Manager)
+	{
+		return Manager.SyncPieces();
+	}
+
+	/** How many beams and posts are drawn, and how many of each are cut down at a seam in a sheet of water. */
+	static void GetLatticePieceCounts(const ARoomManager& Manager, int32& OutEdges, int32& OutCutEdges, int32& OutNodes, int32& OutCutNodes)
+	{
+		OutEdges = Manager.EdgeLayer.PieceSlots.Num();
+		OutNodes = Manager.NodeLayer.PieceSlots.Num();
+		OutCutEdges = 0;
+		OutCutNodes = 0;
+
+		for (const TPair<uint64, FIntPoint>& Piece : Manager.EdgeLayer.PieceSlots)
+		{
+			OutCutEdges += (Piece.Key & WaterSeamBit) != 0 ? 1 : 0;
+		}
+
+		for (const TPair<uint64, FIntPoint>& Piece : Manager.NodeLayer.PieceSlots)
+		{
+			OutCutNodes += (Piece.Key & WaterSeamBit) != 0 ? 1 : 0;
+		}
+	}
+
+	/** The box one piece of a layer fills, from its instance on the unit cube. False when the layer has no such piece. */
+	static bool GetPieceBox(const FRoomPieceLayer& Layer, const uint64 Key, FBox& OutBox)
+	{
+		const FIntPoint* Slot = Layer.PieceSlots.Find(Key);
+
+		if (!Slot || !Layer.Chunks.IsValidIndex(Slot->X) || !Layer.Chunks[Slot->X])
+		{
+			return false;
+		}
+
+		FTransform Transform;
+		Layer.Chunks[Slot->X]->GetInstanceTransform(Slot->Y, Transform, /*bWorldSpace=*/true);
+
+		const FVector Half = Transform.GetScale3D() * 50.0;
+		OutBox = FBox(Transform.GetLocation() - Half, Transform.GetLocation() + Half);
+		return true;
+	}
+
+	/** The beam from Node along Axis as drawn - whole or cut down - and the box it fills. False when none is drawn. */
+	static bool GetBeamBox(const ARoomManager& Manager, const FIntVector& Node, const int32 Axis, bool& bOutCut, FBox& OutBox)
+	{
+		const uint64 Key = WEMGrid::MakeTaggedKey(Node, Axis);
+		bOutCut = GetPieceBox(Manager.EdgeLayer, Key | WaterSeamBit, OutBox);
+		return bOutCut || GetPieceBox(Manager.EdgeLayer, Key, OutBox);
+	}
+
+	/** The post at Node as drawn - whole or cut down - and the box it fills. False when none is drawn. */
+	static bool GetPostBox(const ARoomManager& Manager, const FIntVector& Node, bool& bOutCut, FBox& OutBox)
+	{
+		const uint64 Key = WEMGrid::MakeCellKey(Node);
+		bOutCut = GetPieceBox(Manager.NodeLayer, Key | WaterSeamBit, OutBox);
+		return bOutCut || GetPieceBox(Manager.NodeLayer, Key, OutBox);
+	}
+
+	/** The box of the water over the seam at the beam from Node along Axis, or at the post at Node with Axis -1. */
+	static bool GetSeamWaterBox(const ARoomManager& Manager, const UPlatformStructureData* Water, const FIntVector& Node, const int32 Axis, FBox& OutBox)
+	{
+		const uint64 Key = (Axis < 0 ? WEMGrid::MakeCellKey(Node) : WEMGrid::MakeTaggedKey(Node, Axis)) | WaterSeamBit;
+
+		for (const FStructureLayer& Layer : Manager.StructureLayers)
+		{
+			if (Layer.Structure == Water)
+			{
+				return GetPieceBox(Layer.Pieces, Key, OutBox);
+			}
+		}
+
+		return false;
+	}
+
 	/** A face's streak in a category, or zero when its structure does not carry it. */
 	static int32 GetStreak(const ARoomManager& Manager, const int32 PlatformIndex, const int32 FaceSign, const UStructureCategory* Category)
 	{
@@ -669,8 +801,8 @@ namespace WEMRoomManagerTests
 
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
-	 * pieces off, no air pockets, molds or paths, one first tile in the middle, no strikes, reshuffles
-	 * or moving pockets, on a fixed seed. Structures replaces the slabs when given.
+	 * pieces off, no air pockets, molds or paths, one first tile in the middle, no strikes, reshuffles,
+	 * moving pockets, spilling grounds or runs of walls, on a fixed seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -691,6 +823,10 @@ namespace WEMRoomManagerTests
 		Manager->bEnableDamage = false;
 		Manager->bEnableReshuffle = false;
 		Manager->bMovePockets = false;
+		Manager->InteriorGroundSpillChance = 0.0f;
+		Manager->ExteriorGroundSpillChance = 0.0f;
+		Manager->InteriorWallRunChance = 0.0f;
+		Manager->ExteriorWallRunChance = 0.0f;
 
 		UPlatformTileData* Square = MakeTile(16, 16);
 		UPlatformTileData* Small = MakeTile(8, 8);

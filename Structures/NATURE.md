@@ -20,6 +20,8 @@ Each form only **meets** certain faces across a shared beam. "Meets" is the same
 | Water | ground or water | in its own plane |
 | | a cliff | along the cliff's top or foot |
 
+On top of the meetings, every cliff has to stand wholly on the outline of ground or water (since 2026-10-17, see Cliffs as runs). So a cliff still meets a cliff above it only where both stand on a field, never as a stack of cliffs alone.
+
 So all of a landscape's nature faces look into the same air, and their backs face into the city. A placement is held to this for every face it meets, from both sides. That gives the **city's rule** (the user's decision): the city grows against ground only with exteriors facing it, and never against water or a cliff. An urban placement that would meet water or a cliff is never listed. A face of one that meets ground is drawn from the exteriors, and if no exterior fits, the beat draws a different placement.
 
 **Air.** Every piece of ground and water keeps the air above it open. This is a box of cells out along its Up, as high as it drew between `MinAirStoreys` and `MaxAirStoreys`. It covers the piece's opening and every seam it shares with a field laid before it in its plane, but never its outline, so cliffs can still rise and drop there. The air holds growth back the way a placed object's obstacle does, without changing any surface, so objects still stand on the ground. A piece is only laid where its lowest storeys of air are already clear of every platform.
@@ -43,9 +45,10 @@ Molds are drawn before the pockets, from a stream of their own. Molds stay clear
 One piece per nature beat (`NaturePlacementInterval`), drawn from a stream of its own:
 
 1. **A field still spilling takes the beat.** Ground and water are laid as fields. Each spills out, one piece a beat, to the size it drew when it started (`GroundSpillMin`/`Max`, `WaterSpillMin`/`Max`). It spreads in its own plane, beside the pieces it has laid, and is likelier to go where it would meet more of them, so it spreads as a patch rather than a line. The oldest spilling field goes first, like the fence queue.
-2. **Otherwise something new starts**, drawn by `GroundWeight`, `CliffWeight` and `WaterWeight` among the forms that have somewhere to go:
+2. **Then a cliff still running.** Since 2026-10-17 a cliff carries on like a fence (see Cliffs as runs below), one piece a beat, the oldest waiting end first.
+3. **Otherwise something new starts**, drawn by `GroundWeight`, `CliffWeight` and `WaterWeight` among the forms that have somewhere to go:
    - a field of **ground**, against an exterior or at a cliff's top or foot (a terrace);
-   - a **cliff**, off a field's outline or carrying a cliff on;
+   - a **cliff**, off the outline of ground or water;
    - a pool of **water**, beside ground or at a cliff's top or foot.
 
    Only a spill grows off its own field. Starting next to ground alone is not enough for new ground, so fields stay distinct patches.
@@ -62,6 +65,11 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Nature: Ground / Cliff / Water Weight | `GroundWeight`, `CliffWeight`, `WaterWeight` | 1, 1, 0.5 | How often a beat with no field spilling starts each form. Zero never. |
 | Grid \| Nature: Ground Spill Min / Max | `GroundSpillMin`, `GroundSpillMax` | 4, 12 | Pieces a field of ground spills out to, its first included, drawn evenly. |
 | Grid \| Nature: Water Spill Min / Max | `WaterSpillMin`, `WaterSpillMax` | 2, 6 | The same for a pool of water. |
+| Grid \| Nature: Cliff Continue Chance | `CliffContinueChance` | 0.8 | The chance each end of a cliff, with room beyond it, carries the cliff on by another, as a fence's run does. Each end goes on for 4 cliffs on average at 0.8. Zero: every cliff stands alone. |
+| Grid \| Nature: Cliff Turn Chance | `CliffTurnChance` | 0.25 | Where a run could both go straight on and turn the corner, on an outline either way, how often it turns. Where only one is on an outline, it takes that one. |
+| Grid \| Ground Spill: Interior Ground Spill Chance | `InteriorGroundSpillChance` | 0.1 | The chance a floor growth lays with an interior ground on top spills out into a patch of interior grounds (see The city's grounds spill below). Zero never. |
+| Grid \| Ground Spill: Interior Ground Spill Min / Max | `InteriorGroundSpillMin`, `InteriorGroundSpillMax` | 2, 4 | Pieces such a patch spills out to, its first included, drawn evenly. |
+| Grid \| Ground Spill: Exterior Ground Spill Chance, Min / Max | `ExteriorGroundSpillChance`, `ExteriorGroundSpillMin`, `ExteriorGroundSpillMax` | 0.1, 2, 4 | The same for an exterior ground. |
 | Grid \| Nature: Ground / Cliff / Water Count | readouts | | Platforms of each form standing. |
 | Grid \| Air: Storey Cells | `StoreyCells` | 16 | Cells in a storey (3.2 m). |
 | Grid \| Air: Min / Max Air Storeys | `MinAirStoreys`, `MaxAirStoreys` | 3, 5 | Storeys of air above each piece of ground and water. Each piece draws its own height between the two. Zero keeps no air. |
@@ -94,7 +102,7 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Paths: Show Paths, Path Color | `bShowPaths`, `PathColor` | on, pale cyan | Each leg drawn as a thin box of lines. |
 | Grid \| Paths: Path Summary | readout | | Paths, legs, how many single moves there have been since the cube was cleared, the pieces held back, and the platforms standing in paths. Each path counts the platforms standing in it when it is drawn. |
 
-On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form**, **Flat Color** and **Cover Categories** (see Covers below). A nature structure that no cover covers and that has no mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
+On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form**, **Flat Color**, **Flat Material** and **Cover Categories** (see Covers below). A nature structure that no cover covers and that has no mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. The slab is drawn in its **Flat Material** where it names one (water does, see Water as one sheet below), or in the beams' material where it doesn't, given the flat colour either way through the material's `Color` parameter. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
 
 The assets: `/Game/Structures/Nature/DA_Nature_Ground`, `DA_Nature_Cliff`, `DA_Nature_Water`. Nature only grows where these are in a room manager's **Structures** list.
 
@@ -114,7 +122,7 @@ It is drawn from the nature stream with the category pull, like any face, and ke
 
 To growth the face is still nature. The meeting rules, the air, load-bearing and *Holds items* all read the nature asset as before. The cover is only how the face looks and which categories it offers.
 
-Set up: `DA_Nature_Ground` and `DA_Nature_Cliff` name NaturalFlora, NaturalSand and NaturalStone. `DA_Nature_Water` names none, so water stays flat blue. In NewMap's Structures list that gives 48 grounds for ground (18 flora, 21 sand, 9 stone) and 26 walls for cliffs (2 sand, 24 stone, no flora).
+Set up: `DA_Nature_Ground` and `DA_Nature_Cliff` name NaturalFlora, NaturalSand and NaturalStone. `DA_Nature_Water` names none, so water keeps its own look (since 2026-10-17 one sheet of water, see below). In NewMap's Structures list that gives 48 grounds for ground (18 flora, 21 sand, 9 stone) and 26 walls for cliffs (2 sand, 24 stone, no flora).
 
 Seen in Simulate (nature interval at 0.03 s for the run, then set back): 1688 platforms, 328 ground, 19 cliff and 150 water. Every ground piece and every cliff was covered, and no water was. A six-piece field sampled was all sand (sand, dirt and gravel).
 
@@ -138,6 +146,189 @@ My calls:
 - **The pull works both ways.** The city's own faces beside a field are pulled toward the field's category like any neighbour. So the city's exterior grounds next to a sand field tend to carry on as sand.
 - **The city still draws the natural structures** for its own exterior grounds and walls, as before. Nothing was taken from it.
 
+## Water as one sheet
+
+Asked for on 2026-10-17: one animated water texture that connects without seams across the water pieces, with only the beams of the outline showing. The user chose a texture I generate and a plain glossy surface over Single Layer Water.
+
+**Seams.** Where two pieces of the same flat water lie side by side in one plane, looking the same way, and nothing stands on the beam between them on the water's side, that beam is a **seam**. A seam beam keeps only the half of the platforms' layer behind the water, and the water fills the other half, level with the slabs on either side. A post is cut down the same way where every beam built at it is a seam of the same sheet, or hangs behind it. Beams and posts round the outline stay whole, the posts where a seam meets the outline included. A wall hanging under the water from a seam beam is still carried by the half that is left. A cliff standing on it on the water's side parts the pools, and the beam is whole again.
+
+How it is drawn (`RoomManager.h`, by `GatherEdgePieces`):
+- `FindWaterSeam` / `FindWaterSeamAtNode` decide, from `ModuleFaceOwners` alone, whether a beam or post is a seam.
+- A cut-down beam or post, and the water over it, are keyed with `WaterSeamPieceBit` (bit 62), apart from the whole piece. A full sync that wants the other kind removes one and draws the other, so nothing else in the sync had to change. The water pieces go in the water asset's own layer, beside its slabs.
+- `RefreshLatticePieces` brings named beams and posts in line in place. Removal now uses it in place of its own loop, and placement calls it too whenever there is water, for every beam and post the new platform takes in, inside it as well as round it. So a pool joins up as each piece is laid, and comes apart as one is struck. Removal now names every node of a removed platform, not just its rim.
+- `ArePiecesInStep` is the check `AppendPlatformPieces` and removal each made for themselves.
+
+**The look.** The user then gave a reference: murky, silty water in a flooded town at sunset, with the bright web of caustics over it. They asked for that look, animated. So the water is murky olive-grey, takes its sheen from the sky, and carries a moving caustic web.
+
+`DA_Nature_Water` names `/Game/Structures/Nature/Water/M_Nature_Water` as its Flat Material. The material is opaque and default lit, and has two custom nodes:
+- **WaterSurfaceNormal** gives a world-space normal. It maps the ripples by world position in the plane the face lies in, so every piece samples the same surface, whatever its size or where it starts. Two layers of the one ripple tile cross at different sizes, the second turned a quarter, and drift different ways over time, so neither the tile nor its single wind direction shows.
+- **WaterColor** gives the base colour: Color brightened along the caustic web. The web is two copies of the caustics tile in the same plane, drifting against each other and averaged, so lines cross, part and meet again rather than slide past as one pattern. The ripples' lean shifts where the web lands, so it wobbles with the surface. Because the web is in the base colour, it is lit like the rest of the colour: bright in sunlight, faint in shadow, as in the reference.
+
+Its parameters, as material defaults:
+
+| Parameter | Default | What |
+|---|---|---|
+| Color | set by the room manager | `DA_Nature_Water`'s Flat Color, now (0.05, 0.048, 0.033), murky olive-grey |
+| Roughness | 0.15 | Soft reflections of the sky |
+| Specular | 0.5 | |
+| RippleSize | 220 | cm across one repeat of the first ripple layer; the second is 0.61 of it |
+| RippleSpeed | 12 | cm/s the ripple layers drift |
+| RippleStrength | 0.25 | How far the ripples tilt the surface; 0 is a mirror |
+| CausticSize | 260 | cm across one repeat of the web; the second copy is 1/1.13 of it |
+| CausticSpeed | 10 | cm/s the two webs drift |
+| CausticStrength | 2.2 | How much brighter the colour is on a line; 0 is no web |
+| CausticDistort | 25 | cm the ripples' lean moves the web |
+
+Only Color is set per run, so the rest are tuned on `M_Nature_Water` itself.
+
+**The textures**, each a 1024² seamless tile with its generator script and source PNG in `Structures/Water/`:
+- `T_Water_Ripples_N` (normal map) comes from `make_water_ripples.py`. It shapes white noise in frequency space with a wind-sea spectrum spread about one direction.
+- `T_Water_Caustics` (greyscale, sRGB off) comes from `make_water_caustics.py`. It traces light straight down through a smooth periodic surface, bends each ray by the slope, and counts where it lands, wrapping round the tile, so the web is the real focusing of light rather than a drawn pattern. A surface with fine ripples in it broke the web into grain, so the surface the light passes through keeps only waves near 9 per tile. Bend 12 gave clean cells; 20 and 30 folded the light into tangles.
+
+Every wave fits the tile a whole number of times, so both tiles are seamless by construction. On each PNG, the difference across the wrap matches the difference between neighbouring pixels. Run either script with other settings and re-import over the asset for a different water.
+
+Test: `WEM.Nature.WaterSheet` lays two 16x16 pools side by side and checks:
+- 4 seam beams and 3 posts are cut down, with water over each;
+- the cut beam is the lower half and the water the upper, level with the outline;
+- outline beams and the posts where the seam meets the outline are whole;
+- the slab is drawn in the water's Flat Material;
+- a wall hanging under the seam keeps it a seam, and a cliff standing on it ends it;
+- taking the cliff away joins the pools again, and taking a pool away leaves the beam whole for the wall;
+- after every step, a full sync has nothing to add or take away.
+
+106/106 product tests pass.
+
+Seen in Simulate (NewMap as saved, nature interval 0.1 s): 1806 platforms, 109 water pieces, the largest pool 23 pieces. Only its outline shows. The ripples run straight across the joins, and two captures a few seconds apart differ, so it moves. These first two shots are the first pass, in clear blue:
+
+![A 23-piece pool as one sheet of water, only its outline beams showing](Screenshots/water_sheet.jpg)
+
+![Closer: the ripples carry on across the joins between pieces](Screenshots/water_sheet_near.jpg)
+
+The murky look, from just above a pool. In the second shot strikes have since taken pieces out of the pool, so the beams crossing it are the outlines of the holes and of the ground beside them.
+
+![Murky water with the caustic web in the sunlit part and the sky's sheen in the shade](Screenshots/water_murky_sun.jpg)
+
+![The same pool after strikes, the web stronger and the colour darker, as now set](Screenshots/water_murky.jpg)
+
+My calls:
+- **Seams only between the same water asset.** Two different water assets side by side keep a beam between them, as two pools.
+- **Only flat water joins.** Water drawn with a mesh or a cover is drawn as that, so it has no slab to carry across a beam.
+- **Water on walls works the same**, with *Nature Facing* set to Any Way: the material maps in the plane the face lies in.
+- **The custom node samples with `Texture2DSample`**, not `Tex.Sample`. The ray-tracing hit shaders reject a sample with implicit derivatives, and the material failed to compile until this changed.
+
+## Cliffs as runs
+
+Asked for on 2026-10-17: "Cliffs also need to behave like fences but make sure they are on a natural ground or water outline." The user then chose that every cliff touches a field, so cliffs no longer stack.
+
+**On an outline.** Every cliff, the first of a run or not, stands wholly on the outline of ground or water (`StandsOnOutline`). Its nature face meets ground or water round every module edge along its foot, or round every one along its top. Its back meets none there, since a field on both sides would make the edge a seam, not an outline. A cliff half off the end of an edge doesn't count, and nor does one looking away from the field. So a cliff rises off a field's edge or drops from it, and it is one tile high. A taller drop only comes from a terrace: a field laid on a cliff's top, with a new cliff off that field's outline.
+
+New cliffs now start off ground **or water** (before, only off ground, or carried on from another cliff). The cliff-off-cliff start is gone.
+
+**As a run.** When the nature beat lays a cliff, each of its ends with room beyond it carries the cliff on with `CliffContinueChance` and waits in a queue of its own, as a fence's ends do. While an end waits, the nature beat lays its next cliff before it starts anything new. The next cliff is the same cliff asset on the same tile, with the same Up and at the same height, either straight on or round the beam at the end onto a wall facing the other way. It is judged with its nature face either way round, and only spots that stand on an outline and meet the run legally are kept. So the run follows the outline, turns outward at a field's corners and inward at its inner corners, and stops where the outline ends. Where both straight on and a turn are on an outline, it turns with `CliffTurnChance`. A run that reaches a cliff of its own closes, as a fence round a roof does. Its back and its cover are drawn fresh for each cliff, the cover with the category pull, so a run tends to keep one look.
+
+One edge of an outline takes one cliff, rising or dropping, never both: the dropping one would look into the back of the rising one.
+
+Test: `WEM.Nature.CliffRun` checks:
+- On a single piece of ground, with every end carrying on, the first cliff runs round all four edges at one height, then nothing more is laid.
+- An L of three pieces takes a run of eight, turning in at its inner corner.
+- A cliff wholly on the outline stands on it. One half off the edge, one looking away from the field, and one on the seam between two pieces do not.
+- With no chance of carrying on, one cliff stands on each edge and no end ever waits.
+- Water's outline takes cliffs too.
+
+Seen in Simulate (NewMap as saved, nature beat 0.1 s), read off the platforms rather than by eye, since the city overhead hides most pools from the camera:
+- At 3264 platforms there were 76 cliffs and 269 pieces of ground and water.
+- Every cliff had a field at its foot or along its top.
+- The cliffs formed runs of 16, 15, 7, 7, 7, 7, 6, 4 and 2, with five cliffs alone. The 16-run rises round a pool of water, with stone and dirt walls as covers.
+- When stopped: 730 ground, 252 cliffs and 263 water, with the city still at 59 platforms a second.
+
+`WEM.Nature.Perf` afterwards: the nature beat took 3.7 ms on average and 10.8 ms at worst (4.5 and 10.2 before). It laid 75 cliffs in 3000 platforms (26 before).
+
+## The city's grounds spill
+
+Asked for on 2026-10-17: "I want ground:interior and ground:exterior to spill out sometimes as the natural tiles (albeit on much lower settings), obviously they will still need to be placed where they can be placed." The user chose:
+- each piece of a patch is a ground of the same side, drawn as usual (by weight, with the category pull);
+- the face behind it is drawn as any floor's is.
+
+**When.** A floor that growth lays, the first platform and the zones' first tiles included, may start a patch. Its face looking along its Up must be a Ground of side Interior or Exterior, and not a fence. It starts one with that side's chance, `InteriorGroundSpillChance` or `ExteriorGroundSpillChance` (0.1 each). The patch's size is drawn between that side's min and max (2 to 4, its first piece included). Nature's fields always spill, to 4 to 12.
+
+**How.** The patch waits in a queue of its own. A growth beat lays its next piece before it draws anything new, after any fence panel that waits. The piece is a floor beside the pieces the patch has laid, in their plane and with their Up, likelier where it would meet more of them. It is held to everything any floor there is held to: it must be free and flush, clear of held air, and meet nature only as the city may. Then its top is drawn from the grounds of the patch's side, those of both sides among them. What goes behind it follows the usual rules, so behind an interior ground, an exterior 80% of the time. A patch with no room left stops where it is.
+
+My calls:
+- **Both binds nothing**, so a ground of both sides starts no patch, though it can be a piece of one of either side.
+- **Only the face looking along Up.** A ground hanging face down under a floor (ground over ground) starts nothing.
+- **A reshuffle starts no patch**, since it keeps to its zone and a patch could wander out of it.
+- **Both chances are 0.1, and both sizes 2 to 4**, for "much lower settings".
+
+Tests: `WEM.Structures.GroundSpill.*`:
+- **Patch:** an interior patch of four lays a piece a beat, each in the plane, topped with an interior ground, an exterior behind it, beside a piece already laid. An exterior patch is all exterior grounds.
+- **Starts:** interior and exterior grounds start a patch. A ground of both sides, a roof, a wall, a ground looking down, and a chance of zero don't.
+- **Hemmed:** a floor ringed by floors has nowhere to go, so its patch stops at once. A patch whose piece is struck goes.
+- **Growth:** 400 beats at 0.3 each. Patches take beats, the placements agree with a rebuild, and the same seed grows the same city.
+
+The test fixture sets both chances to zero, so every older test grows as it did. 111/111 product tests pass.
+
+Not measured on its own: how much a spill beat costs. Each one walks the rims of at most four pieces, and NewMap's city held 59 platforms a second through the Simulate run above with spills on.
+
+## Walls run round the outline of grounds
+
+Asked for on 2026-10-17: "Interior and exterior walls also have fence-like qualities sometimes, meaning that they are built around the outline of ground tiles where they can be built." The user chose:
+- a run follows the outline of the city's grounds of its own side;
+- each next wall keeps that side on the face over the ground, drawn as usual.
+
+**When.** A wall that growth lays may start a run if it stands wholly on the outline of the city's grounds (`StandsOnGroundOutline`, the check cliffs use, with city grounds in place of nature). That means:
+- one face meets a Ground of a side round every module edge along its foot (or along its top);
+- the face over the ground stands for that same side (interiors over interior grounds, exteriors over exterior grounds), with grounds of both sides counting for either;
+- its other face meets no such ground there, since that would be a seam inside a patch, a partition rather than an outline.
+
+It starts a run with that side's chance, `InteriorWallRunChance` or `ExteriorWallRunChance` (0.25 each). Nature ground doesn't count, a wall of both sides over the ground starts nothing, and nor does a reshuffle.
+
+**How.** A run goes as a fence's does, with its own queue on the city beat, after fences and ground spills:
+- Each end with room beyond it carries on with `WallRunContinueChance` (0.8).
+- The next wall goes straight on or round the corner, on the same tile, with the same Up and at the same height, wherever it would stand wholly on the outline too. So the run follows the outline, turns at the patch's corners, inner ones included, and stops where the outline ends.
+- Where both straight on and a turn stand on it, the run turns with `WallRunTurnChance` (0.25).
+- Its face over the ground is drawn from the walls of the run's side, by weight with the category pull. Its back is drawn as any wall's is, so behind an interior there is an exterior 80% of the time.
+- A run closes when the next spot already holds a wall on the same outline.
+- A wall only goes where any wall could be placed. A floor that isn't load-bearing blocks its free rim, so no wall stands on it.
+
+Settings (Grid | Wall Runs on the room manager):
+
+| Property | Default | What |
+|---|---|---|
+| `InteriorWallRunChance` | 0.25 | The chance a wall laid on the outline of interior grounds, its interior over them, starts a run. |
+| `ExteriorWallRunChance` | 0.25 | The same for exteriors over exterior grounds. |
+| `WallRunContinueChance` | 0.8 | The chance each end carries on. |
+| `WallRunTurnChance` | 0.25 | Where it could go straight or turn, how often it turns. |
+
+How it is built:
+- `DrawFill` takes an `FFaceWish` (face, type, side): the face is drawn first from the matching structures. The ground spill uses the same thing for its Ground tops.
+- `FFenceEnd` carries the run's side.
+- `IsRunEndClosed` closes a fence or cliff run on more of itself, and a run of walls on a wall on the same outline.
+
+Tests: `WEM.Structures.WallRun.*`:
+- **Ring:** a wall on an interior floor's edge runs round all four edges, each wall interior over the floor. Round an L of three floors it takes eight, turning in at the inner corner.
+- **Starts:**
+  - Start a run: an interior over interior ground, and an exterior over exterior ground.
+  - Start none: an interior over exterior ground, a wall of both sides, a wall on the seam between two floors, a wall hanging below the floor's edge, a wall half off the edge, and a chance of zero.
+- **Growth:** at 0.5 with spills on, runs take beats, the placements agree with a rebuild, and the same seed grows the same city.
+
+The fixture sets both chances to zero. 114/114 product tests pass.
+
+Seen in Simulate (NewMap, 20 s each, values set on the instance and not saved). The measure is walls standing on a city ground's edge with ground on one side only, and how many of them sit in chains of 4 or more joined at their ends:
+
+| Wall run chances | Platforms | Walls on a ground's edge | In chains of 4+ | Longest chain |
+|---|---|---|---|---|
+| 0 (off) | 1862 | 322 (17%) | 69 (21%) | 10 |
+| 0.25 (default) | 2653 | 458 (17%) | 93 (20%) | 7 |
+| 1, continue 1 | 3167 | 654 (21%) | 222 (34%) | 11 |
+
+So at the default of 0.25 the runs don't show in one 20 s run; at 1 they clearly do. Why so weak:
+- Most walls on an edge get there before their floor does, and only a wall laid where the ground already is starts a run.
+- Many outlines are blocked or already built against.
+
+Raise the two chances for more, or ask for runs to start when a floor is laid beside walls already standing.
+
+In NewMap the walls standing on a ground's edge were mostly exteriors over exterior grounds (341 of 654). Interiors over interior grounds were 65, and walls of both sides over the ground 76.
+
 ## Built
 
 | Phase | Commit | What |
@@ -158,7 +349,7 @@ Tests: `WEM.Nature.*`, 13 product tests and 1 stress test (`Perf`). 91/91 produc
 - **"Spills out" is a queue**, one piece a beat, like fences ("one piece per tick").
 - **A field spills in its own plane**, and turning a corner is the cliffs' job. A field never meets ground or water across a fold.
 - **Water spills too**, as smaller pools.
-- **What new nature starts against.** New ground starts against an exterior or at a cliff's top or foot, never against ground alone, so fields stay patches. New water starts beside ground or at a cliff's top or foot, and a cliff off ground or another cliff. The first terrace test caught the opposite behaviour, where fields kept growing through the city's own placements next to them.
+- **What new nature starts against.** New ground starts against an exterior or at a cliff's top or foot, never against ground alone, so fields stay patches. New water starts beside ground or at a cliff's top or foot, and a cliff off ground or another cliff (since 2026-10-17: off the outline of ground or water only, see Cliffs as runs). The first terrace test caught the opposite behaviour, where fields kept growing through the city's own placements next to them.
 - **Both counts as exterior** for the city's rule and for ground, in line with "Both satisfies either side's filter". A face with no structure (laid before structures existed) counts as anything.
 - **The city never meets water or a cliff.** That is the user's rule as written: those forms meet no urban face. The city still builds against their backs, so rooms can sit behind a cliff and under a pool.
 - **Nature is always load-bearing**, whatever stands behind it. Otherwise a non-load-bearing ceiling behind ground would block the field's free beams and stop it spilling.
@@ -204,7 +395,7 @@ To see more nature, lower *Nature Placement Interval* (each beat costs about 4.5
   Deeper floors mostly collect sideways growth. A mold fills as the city reaches it, so it fills over time rather than at once.
 
 - ~~Nature never goes away.~~ Since 2026-10-15 platforms are struck down and reshuffled, nature among them, and pockets, molds and the air over the fields hold back only new placements. See `DELETION.md`.
-- **Water is still a flat colour.** Ground and cliffs are covered by the natural structures (see Covers). Water names no cover categories, since no water structures exist yet. A nature structure with a mesh is drawn with the mesh, fitted like any structure, where no cover covers it.
+- **Water has no covers.** Ground and cliffs are covered by the natural structures (see Covers). Water is one animated sheet instead (see Water as one sheet), and names no cover categories. A nature structure with a mesh is drawn with the mesh, fitted like any structure, where no cover covers it.
 - **The object placer treats nature like any surface.** Ground holds items, so the city's objects will stand on meadows. Water and cliffs hold nothing.
 - **The nature beat samples**, so with very few places left it can miss them for a few beats.
 - **Debug lines are redrawn whole** whenever a piece of a field is laid. That is fine at one beat a second. With thousands of fields and a fast nature beat, turn `bShowAir` off.
