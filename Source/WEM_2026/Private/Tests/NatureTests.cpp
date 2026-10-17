@@ -610,6 +610,153 @@ bool FNatureSpillTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureCoverTest, "WEM.Nature.Cover", WEMRoomManagerTests::TestFlags)
+
+bool FNatureCoverTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+	FNatureKit Kit(Rooted);
+
+	auto MakeCategory = [&Rooted](const TCHAR* Name)
+	{
+		UStructureCategory* Category = NewObject<UStructureCategory>(
+			GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UStructureCategory::StaticClass(), Name));
+		Category->AddToRoot();
+		Rooted.Add(Category);
+		return Category;
+	};
+
+	auto MakeNatural = [&Rooted](const TCHAR* Name, const EStructureType Type, UStructureCategory* Category, const bool bTwoSided)
+	{
+		UPlatformStructureData* Structure = MakeStructure(Name, 16, 16, Type, bTwoSided);
+		Structure->Categories = { Category };
+		Rooted.Add(Structure);
+		return Structure;
+	};
+
+	// Two categories ground and cliffs are covered from, and a third they are not. Of the city's structures in them:
+	// a ground of each, a wall of one, and a two-sided ground, which never covers a single face.
+	UStructureCategory* Flora = MakeCategory(TEXT("TestCoverFlora"));
+	UStructureCategory* Sand = MakeCategory(TEXT("TestCoverSand"));
+	UStructureCategory* Stone = MakeCategory(TEXT("TestCoverStone"));
+	UPlatformStructureData* FloraGround = MakeNatural(TEXT("TestCoverFloraGround"), EStructureType::Ground, Flora, false);
+	UPlatformStructureData* SandGround = MakeNatural(TEXT("TestCoverSandGround"), EStructureType::Ground, Sand, false);
+	UPlatformStructureData* SandWall = MakeNatural(TEXT("TestCoverSandWall"), EStructureType::Wall, Sand, false);
+	UPlatformStructureData* StoneGround = MakeNatural(TEXT("TestCoverStoneGround"), EStructureType::Ground, Stone, false);
+	UPlatformStructureData* FloraSlab = MakeNatural(TEXT("TestCoverFloraSlab"), EStructureType::Ground, Flora, true);
+
+	Kit.Ground->CoverCategories = { Flora, Sand };
+	Kit.Cliff->CoverCategories = { Flora, Sand };
+
+	TArray<TObjectPtr<UPlatformStructureData>> Structures = Kit.GetAll();
+	Structures.Append({ FloraGround, SandGround, SandWall, StoneGround, FloraSlab });
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Structures);
+	UPlatformTileData* Square = Manager->Tiles[0];
+
+	// Ground is covered by a ground of its categories, one-sided; its face is still the ground to growth.
+	int32 FloraCovers = 0;
+	int32 SandCovers = 0;
+
+	for (int32 Draw = 0; Draw < 64; ++Draw)
+	{
+		FGridPlatform Floor = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, nullptr, nullptr);
+
+		if (!FRoomManagerTestAccess::DrawNatureFill(*Manager, Floor, ENatureForm::Ground, 1))
+		{
+			AddError(TEXT("Ground is not laid on a floor looking up"));
+			break;
+		}
+
+		TestTrue(TEXT("Its face is still the ground"), Floor.PositiveStructure == Kit.Ground);
+		FloraCovers += Floor.NatureCover == FloraGround ? 1 : 0;
+		SandCovers += Floor.NatureCover == SandGround ? 1 : 0;
+	}
+
+	AddInfo(FString::Printf(TEXT("Ground covers, of 64: %d flora, %d sand."), FloraCovers, SandCovers));
+	TestEqual(TEXT("Ground is always covered by a one-sided ground of its categories"), FloraCovers + SandCovers, 64);
+	TestTrue(TEXT("Of either category"), FloraCovers > 0 && SandCovers > 0);
+
+	// A cliff by a wall of its categories: here only the sand one.
+	int32 WallCovers = 0;
+
+	for (int32 Draw = 0; Draw < 16; ++Draw)
+	{
+		FGridPlatform Wall = MakeSegment(FIntVector(32, 16, 16), EGridAxis::X, Square, EGridFace::PosZ, nullptr, nullptr);
+
+		if (FRoomManagerTestAccess::DrawNatureFill(*Manager, Wall, ENatureForm::Cliff, -1))
+		{
+			WallCovers += Wall.NegativeStructure == Kit.Cliff && Wall.NatureCover == SandWall ? 1 : 0;
+		}
+	}
+
+	TestEqual(TEXT("A cliff is covered by the wall of its categories"), WallCovers, 16);
+
+	// Water names none, so it keeps its flat colour.
+	FGridPlatform Pool = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Square, EGridFace::PosZ, nullptr, nullptr);
+	TestTrue(TEXT("Water lies on a floor"), FRoomManagerTestAccess::DrawNatureFill(*Manager, Pool, ENatureForm::Water, 1));
+	TestTrue(TEXT("Uncovered"), Pool.NatureCover == nullptr);
+
+	// A covered ground is drawn as its cover, and offers the cover's category to the faces beside it.
+	ARoomManager* Shown = SpawnRoomManager(TestWorld.World, Rooted, Structures);
+	Shown->bShowPieces = true;
+
+	FGridPlatform Covered = MakeSegment(FIntVector(16, 16, 32), EGridAxis::Z, Shown->Tiles[0], EGridFace::PosZ, Kit.Ground, Kit.CeilingInterior);
+	Covered.NatureCover = FloraGround;
+	FRoomManagerTestAccess::Place(*Shown, Covered);
+
+	UStaticMesh* Mesh = nullptr;
+	UMaterialInterface* Material = nullptr;
+	TestEqual(TEXT("The cover is drawn once"), FRoomManagerTestAccess::GetStructureLayerPieces(*Shown, FloraGround, Mesh, Material), 1);
+	TestTrue(TEXT("From its own mesh"), Mesh == FloraGround->Mesh);
+	TestEqual(TEXT("The ground's flat slab is not drawn"), FRoomManagerTestAccess::GetStructureLayerPieces(*Shown, Kit.Ground, Mesh, Material), 0);
+	TestEqual(TEXT("The ground face offers flora"), FRoomManagerTestAccess::GetStreak(*Shown, 0, 1, Flora), 1);
+	TestEqual(TEXT("And not sand"), FRoomManagerTestAccess::GetStreak(*Shown, 0, 1, Sand), 0);
+
+	FRoomManagerTestAccess::Remove(*Shown, { Covered });
+	TestEqual(TEXT("Taken away, its cover goes with it"), FRoomManagerTestAccess::GetStructureLayerPieces(*Shown, FloraGround, Mesh, Material), 0);
+
+	// With the pull certain, a field keeps the category it started with.
+	KeepToForm(*Manager, ENatureForm::Ground, 6);
+	Manager->ContinueChance = 1.0f;
+	Manager->MaxContinueChance = 1.0f;
+
+	TArray<FGridPlatform> Roofs;
+	for (const FIntVector& MinNode : { FIntVector(16, 16, 32), FIntVector(32, 16, 32), FIntVector(16, 32, 32), FIntVector(32, 32, 32) })
+	{
+		Roofs.Add(MakeSegment(MinNode, EGridAxis::Z, Square, EGridFace::PosZ, Kit.RoofExterior, Kit.CeilingInterior));
+	}
+
+	FRoomManagerTestAccess::Rebuild(*Manager, Roofs);
+
+	for (int32 Beat = 0; Beat < 6; ++Beat)
+	{
+		Manager->PlaceNextNature();
+	}
+
+	TArray<const UStructureCategory*> FieldCategories;
+	int32 Pieces = 0;
+
+	for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(*Manager))
+	{
+		if (Platform.NatureCover)
+		{
+			FieldCategories.AddUnique(Platform.NatureCover->Categories[0]);
+			++Pieces;
+		}
+	}
+
+	TestEqual(TEXT("The field spilled out to six covered pieces"), Pieces, 6);
+	TestEqual(TEXT("All of one category"), FieldCategories.Num(), 1);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNatureCliffBeatTest, "WEM.Nature.CliffBeat", WEMRoomManagerTests::TestFlags)
 
 bool FNatureCliffBeatTest::RunTest(const FString& Parameters)

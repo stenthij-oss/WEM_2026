@@ -3004,6 +3004,7 @@ bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm For
 {
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
+	Platform.NatureCover = nullptr;
 
 	int32 SpanU, SpanV;
 	if (!GetPlatformSpans(Platform, SpanU, SpanV))
@@ -3080,6 +3081,38 @@ bool ARoomManager::DrawNatureFill(FGridPlatform& Platform, const ENatureForm For
 
 	Platform.PositiveStructure = NatureSign > 0 ? Front : Back;
 	Platform.NegativeStructure = NatureSign > 0 ? Back : Front;
+
+	// Its face covered by one of the city's structures from the categories the nature names, of the type the face
+	// takes: a ground on ground and water, a wall on a cliff. With none that fits, it keeps its own look.
+	if (Front->CoverCategories.IsEmpty())
+	{
+		return true;
+	}
+
+	const EStructureType CoverType = bWall ? EStructureType::Wall : EStructureType::Ground;
+	Options.Reset();
+
+	for (UPlatformStructureData* Structure : UsableStructures)
+	{
+		const bool bInCoverCategory = Structure->Categories.ContainsByPredicate([Front](const TObjectPtr<UStructureCategory>& Category)
+		{
+			return Category && Front->CoverCategories.Contains(Category);
+		});
+
+		if (bInCoverCategory
+			&& !Structure->bTwoSided
+			&& EnumHasAnyFlags(WEMStructures::GetTypesOnFace(*Structure, NormalAxis, NatureSign, Platform.Up), CoverType)
+			&& Fits(Structure))
+		{
+			Options.Add(Structure);
+		}
+	}
+
+	if (!Options.IsEmpty())
+	{
+		Platform.NatureCover = DrawStructureFrom(Stream, Options, Platform, NatureSign);
+	}
+
 	return true;
 }
 
@@ -5962,6 +5995,18 @@ void ARoomManager::RecordFill(const int32 PlatformIndex)
 
 		GetCategoryIndices(Fill.Structure, Fill.Categories);
 
+		// Nature covered by a city structure offers the cover's categories too, so a field tends to stay one of them.
+		if (Platform.NatureCover && Fill.Structure && Fill.Structure->IsNature())
+		{
+			TArray<int32, TInlineAllocator<4>> CoverCategories;
+			GetCategoryIndices(Platform.NatureCover, CoverCategories);
+
+			for (const int32 Category : CoverCategories)
+			{
+				Fill.Categories.AddUnique(Category);
+			}
+		}
+
 		if (Fill.Categories.IsEmpty())
 		{
 			continue;
@@ -6171,6 +6216,7 @@ bool ARoomManager::DrawFill(FGridPlatform& Platform, const bool bLoadBearingOnly
 {
 	Platform.PositiveStructure = nullptr;
 	Platform.NegativeStructure = nullptr;
+	Platform.NatureCover = nullptr;
 
 	// The city meets nature only with exteriors, and only ground: a face meeting ground is drawn from the
 	// exteriors - those of both sides among them - and a placement meeting water or a cliff is not filled.
@@ -7751,11 +7797,12 @@ void ARoomManager::UpdateDebugReadouts()
 	const EStructureSide ProbeSide = DebugProbeStructure ? DebugProbeStructure->Side : EStructureSide::Exterior;
 	const FString UpName = StaticEnum<EGridFace>()->GetDisplayNameTextByValue(static_cast<int64>(OwnerPlatform.Up)).ToString();
 
-	// Nature is what its form is, on whichever face it was laid.
+	// Nature is what its form is, on whichever face it was laid, and says what covers it.
 	if (DebugProbeStructure && DebugProbeStructure->IsNature())
 	{
-		DebugProbeRole = FString::Printf(TEXT("%s, nature, up %s"),
-			*StaticEnum<ENatureForm>()->GetDisplayNameTextByValue(static_cast<int64>(DebugProbeStructure->NatureForm)).ToString().ToLower(), *UpName);
+		DebugProbeRole = FString::Printf(TEXT("%s, nature, up %s%s"),
+			*StaticEnum<ENatureForm>()->GetDisplayNameTextByValue(static_cast<int64>(DebugProbeStructure->NatureForm)).ToString().ToLower(), *UpName,
+			OwnerPlatform.NatureCover ? *FString::Printf(TEXT(", covered with %s"), *OwnerPlatform.NatureCover->GetName()) : TEXT(""));
 	}
 	else
 	{
@@ -8020,23 +8067,34 @@ void ARoomManager::GatherPlatformPieces(const FGridPlatform& Platform, FGathered
 
 	auto AddStructure = [&](UPlatformStructureData* Structure, const int32 Sign, const uint64 Key)
 	{
+		bool bTurned = false;
+
+		auto Fits = [&](const UPlatformStructureData* Candidate)
+		{
+			return Candidate && Candidate->Mesh
+				&& WEMStructures::FitsShape(Candidate->Width, Candidate->Length, Candidate->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned);
+		};
+
+		// Nature is drawn as the city structure covering it while that still fits, and one-sided like the nature.
+		const bool bNature = Structure && Structure->IsNature();
+
+		if (bNature && Fits(Platform.NatureCover))
+		{
+			Structure = Platform.NatureCover;
+		}
 		// Nature with no mesh of its own is a slab of its flat colour, which fits any opening.
-		if (Structure && !Structure->Mesh && Structure->IsNature())
+		else if (bNature && !Structure->Mesh)
 		{
 			OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{ Key, MakeFlatSlabTransform(Platform, Sign) });
 			return;
 		}
-
-		bool bTurned = false;
-
-		if (!Structure || !Structure->Mesh
-			|| !WEMStructures::FitsShape(Structure->Width, Structure->Length, Structure->bMayLieSideways, NormalAxis, Platform.Up, SpanU, SpanV, bTurned))
+		else if (!Fits(Structure))
 		{
 			return;
 		}
 
 		OutPieces.Structures.FindOrAdd(Structure).Add(FPlacedPiece{
-			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, Platform.Up, SpanU, SpanV, Sign, bTurned, Structure->bTwoSided && !Structure->IsNature()) });
+			Key, WEMStructures::MakeStructureTransform(MinCorner, CellSize, NormalAxis, Platform.Up, SpanU, SpanV, Sign, bTurned, Structure->bTwoSided && !bNature) });
 	};
 
 	// Nature is one-sided, whatever it is set to.
@@ -9972,7 +10030,7 @@ void ARoomManager::UpdateVisualsAfterRemoval(
 
 			for (FStructureLayer& Layer : StructureLayers)
 			{
-				if (Layer.Structure == Platform.PositiveStructure || Layer.Structure == Platform.NegativeStructure)
+				if (Layer.Structure == Platform.PositiveStructure || Layer.Structure == Platform.NegativeStructure || Layer.Structure == Platform.NatureCover)
 				{
 					RemovePieceFromLayer(Layer.Pieces, PlatformKey);
 					RemovePieceFromLayer(Layer.Pieces, PlatformKey | NegativeFacePieceBit);

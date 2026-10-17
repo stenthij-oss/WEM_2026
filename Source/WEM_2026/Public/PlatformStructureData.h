@@ -98,8 +98,9 @@ enum class ENatureForm : uint8
  * closed, since they show wherever a beam is not built.
  *
  * A structure of the nature section is one-sided whatever it is set to, and is only ever laid on the face
- * its form gives it - Types, Two-sided, Fence and Load-bearing are not asked of it. It needs no mesh: one
- * without is drawn as a slab of its flat colour.
+ * its form gives it - Types, Two-sided, Fence and Load-bearing are not asked of it. It needs no mesh: its
+ * face is drawn as a city structure from its cover categories where one fits, or else as its own mesh, or
+ * a slab of its flat colour.
  */
 UCLASS(BlueprintType)
 class WEM_2026_API UPlatformStructureData : public UDataAsset
@@ -122,6 +123,15 @@ public:
 	/** The colour it is drawn in, as a flat slab across its face, while it has no mesh. Lit, like the beams. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
 	FLinearColor FlatColor = FLinearColor(0.05f, 0.3f, 0.03f);
+
+	/**
+	 * Categories whose city structures cover its face: one of the room manager's structures in any of them, one-sided,
+	 * of the type its face takes - Ground on ground and water, Wall on a cliff - that fits the opening. It is drawn
+	 * like any face's structure, the category pull included, so a field tends to stay one category. With none set,
+	 * or none that fits, it is drawn as its mesh or its flat colour.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (EditCondition = "Section == EStructureSection::Nature", EditConditionHides))
+	TArray<TObjectPtr<UStructureCategory>> CoverCategories;
 
 	/** Cells from beam to beam along the structure's width (its X), as authored. The importer measures it from the mesh. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Structure", meta = (ClampMin = "2"))

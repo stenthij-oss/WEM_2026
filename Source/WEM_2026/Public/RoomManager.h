@@ -133,6 +133,14 @@ struct FGridPlatform
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
 	TObjectPtr<UPlatformStructureData> NegativeStructure;
 
+	/**
+	 * On a nature platform, the city structure drawn across its nature face from the nature's cover categories (see
+	 * UPlatformStructureData::CoverCategories), in place of its mesh or flat colour. The nature is still what the
+	 * face is to growth; the cover is how it looks and the categories it offers to the faces beside it.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Platform")
+	TObjectPtr<UPlatformStructureData> NatureCover;
+
 	EPlatformKind GetKind() const
 	{
 		return Normal == EGridAxis::Z ? EPlatformKind::SurfaceHorizontal : EPlatformKind::SurfaceVertical;
@@ -1887,7 +1895,10 @@ private:
 	 * structure of the face's type, a ceiling under ground and water and a wall behind a cliff. Ground and
 	 * water lie along their Up, their nature face looking along it; a cliff is a wall. Which ways they may
 	 * face in the world NatureFacing says - by default only flat, looking up at the sky, so cliffs stand
-	 * upright off their edges. A nature platform is always load-bearing, whatever stands behind it.
+	 * upright off their edges. A nature platform is always load-bearing, whatever stands behind it. Its
+	 * nature face is covered by a city structure from the categories the nature names (CoverCategories) -
+	 * a ground on ground and water, a wall on a cliff - kept as the platform's NatureCover, drawn with the
+	 * category pull and offering its categories to the faces beside it. To growth the face is still nature.
 	 *
 	 * Which faces meet across a shared beam is the walk the category pull takes (see Structures in the class
 	 * comment), and a nature face meets only what its form allows: ground meets more ground or water in its
@@ -1999,9 +2010,10 @@ private:
 	/**
 	 * Fills a platform about to be placed with nature of one form on the face NatureSign looks out from,
 	 * and one-sided urban structure behind it - any of the face's type there, an exterior where the back
-	 * meets ground - both from Stream. Its Up has to suit the form already: along its normal and looking
+	 * meets ground - both from Stream, and then the city structure covering the nature face, where the
+	 * nature names cover categories and one fits. Its Up has to suit the form already: along its normal and looking
 	 * out of the nature face for ground and water, in its plane for a cliff. False when that is not so,
-	 * when the back would meet water or a cliff, or when nothing fits either face.
+	 * when the back would meet water or a cliff, or when nothing fits either face. A missing cover is no failure.
 	 */
 	bool DrawNatureFill(FGridPlatform& Platform, ENatureForm Form, int32 NatureSign, FRandomStream& Stream);
 

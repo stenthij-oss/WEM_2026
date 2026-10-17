@@ -94,11 +94,49 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Paths: Show Paths, Path Color | `bShowPaths`, `PathColor` | on, pale cyan | Each leg drawn as a thin box of lines. |
 | Grid \| Paths: Path Summary | readout | | Paths, legs, how many single moves there have been since the cube was cleared, the pieces held back, and the platforms standing in paths. Each path counts the platforms standing in it when it is drawn. |
 
-On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form** and **Flat Color**. A nature structure without a mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
+On a structure (data asset): **Section** (Urban/Nature) and, for nature, **Nature Form**, **Flat Color** and **Cover Categories** (see Covers below). A nature structure that no cover covers and that has no mesh is drawn as a slab of its flat colour across the opening, from the mid-plane out to its face, lit like the beams. Types, Two-sided, Fence and Load-bearing are not used for nature. *Holds items* is: ground holds items, while the water and cliff assets hold none. *Weight* chooses among several structures of one form, and categories take part in the pull as usual.
 
 The assets: `/Game/Structures/Nature/DA_Nature_Ground`, `DA_Nature_Cliff`, `DA_Nature_Water`. Nature only grows where these are in a room manager's **Structures** list.
 
-Readout: **Debug Probe Role** reads `ground, nature, up +Z` on a nature face.
+Readout: **Debug Probe Role** reads `ground, nature, up +Z` on a nature face, followed by `, covered with <structure>` when a cover covers it.
+
+## Covers
+
+Asked for on 2026-10-17: "The nature ground tiles are currently green. The top part needs to have a structure", from the natural flora, sand and stone categories, the ones set as ground; cliffs the same, the ones set as walls.
+
+A nature structure now names **Cover Categories** (`UPlatformStructureData::CoverCategories`). When the nature beat lays a piece, it draws the nature, then the city structure behind it as before, and then a **cover** for the nature face. The cover is one of the room manager's structures that:
+- belongs to any of those categories,
+- is one-sided,
+- has the type the face takes: **Ground** on ground and water, **Wall** on a cliff,
+- fits the opening.
+
+It is drawn from the nature stream with the category pull, like any face, and kept on the platform as `FGridPlatform::NatureCover`. The pieces draw the cover across the nature face in place of the flat slab. The face offers the cover's categories to the faces beside it, so a field tends to stay one category, and fields form patches of sand, flora or stone.
+
+To growth the face is still nature. The meeting rules, the air, load-bearing and *Holds items* all read the nature asset as before. The cover is only how the face looks and which categories it offers.
+
+Set up: `DA_Nature_Ground` and `DA_Nature_Cliff` name NaturalFlora, NaturalSand and NaturalStone. `DA_Nature_Water` names none, so water stays flat blue. In NewMap's Structures list that gives 48 grounds for ground (18 flora, 21 sand, 9 stone) and 26 walls for cliffs (2 sand, 24 stone, no flora).
+
+Seen in Simulate (nature interval at 0.03 s for the run, then set back): 1688 platforms, 328 ground, 19 cliff and 150 water. Every ground piece and every cliff was covered, and no water was. A six-piece field sampled was all sand (sand, dirt and gravel).
+
+![Covered fields: sand, dirt and stone ground, natural walls on the cliffs, water still flat](Screenshots/nature_covers.jpg)
+
+Test: `WEM.Nature.Cover` checks:
+- ground takes only one-sided grounds of its categories, and both categories turn up;
+- a cliff takes the one wall of its categories;
+- water stays bare;
+- a covered piece is drawn as its cover and not as the slab, and the cover goes when the piece is taken away;
+- its face offers the cover's category;
+- with the pull certain, a spilled field is all one category, and agrees with a full rebuild.
+
+105/105 product tests pass.
+
+My calls:
+- **The face's type decides, not the name.** Ground needs a structure set as Ground (not Roof), and a cliff one set as Wall. `NatFlora_Wall_Moss_01` is set as Ground, so it covers ground, not cliffs. That is why flora has no walls for cliffs. Set it to Wall in Blender if it is meant for cliffs.
+- **Side is not asked.** All 74 natural structures are exteriors anyway.
+- **Two-sided structures never cover**, since a cover is one face with the city's structure behind it.
+- **No cover that fits leaves the old look.** That means the nature's own mesh, or else its flat colour, so nature still grows on tiles the natural structures don't come in (they are all 16x16). The same holds if a cover's size later changes so that it no longer fits.
+- **The pull works both ways.** The city's own faces beside a field are pulled toward the field's category like any neighbour. So the city's exterior grounds next to a sand field tend to carry on as sand.
+- **The city still draws the natural structures** for its own exterior grounds and walls, as before. Nothing was taken from it.
 
 ## Built
 
@@ -166,7 +204,7 @@ To see more nature, lower *Nature Placement Interval* (each beat costs about 4.5
   Deeper floors mostly collect sideways growth. A mold fills as the city reaches it, so it fills over time rather than at once.
 
 - ~~Nature never goes away.~~ Since 2026-10-15 platforms are struck down and reshuffled, nature among them, and pockets, molds and the air over the fields hold back only new placements. See `DELETION.md`.
-- **Flat colours only.** A nature structure with a mesh is drawn with the mesh, fitted like any structure, but no meshes exist yet.
+- **Water is still a flat colour.** Ground and cliffs are covered by the natural structures (see Covers). Water names no cover categories, since no water structures exist yet. A nature structure with a mesh is drawn with the mesh, fitted like any structure, where no cover covers it.
 - **The object placer treats nature like any surface.** Ground holds items, so the city's objects will stand on meadows. Water and cliffs hold nothing.
 - **The nature beat samples**, so with very few places left it can miss them for a few beats.
 - **Debug lines are redrawn whole** whenever a piece of a field is laid. That is fine at one beat a second. With thousands of fields and a fast nature beat, turn `bShowAir` off.
