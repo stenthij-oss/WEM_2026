@@ -1,0 +1,281 @@
+// The AI overlay: the platform pieces on screen go to a local AI and come back painted over.
+//
+// STAGE 1 (pack) makes the picture the AI is given, at its own size: the pieces as they are on screen, everything
+// else black, and the pieces' outline in alpha.
+// STAGE 3 (pack depth) makes the depth map that goes with it, for the AI's depth ControlNet: the pieces' depth, near
+// white and far black, everything else black. Its alpha holds the depth again, on a fixed range, for the game to fit
+// the map's range to the view with.
+// STAGE 5 (pack sent depth) keeps, for the game itself, the nearest and furthest depth of the pieces under each pixel
+// of the picture sent, so the AI's answer can later be laid where those pieces are by then.
+// STAGE 2 (unpack) turns the AI's picture, as it came back from the bridge in RGBA8 words, into a texture.
+// STAGE 0 (composite) lays the AI's picture over the pieces on screen, by Weight, and only where the pieces are. With
+// reprojection, each pixel of the pieces takes the AI's colour from where the camera saw that spot when the picture was
+// sent; the newest picture fades in over the one before.
+// STAGE 4 (show) draws part of AITexture over the whole view instead, to see what the AI is sent.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D SceneColorTexture;
+Texture2D SceneDepthTexture;
+Texture2D<uint2> CustomStencilTexture;
+Texture2D AITexture;
+// The AI's picture before the newest, and the depths kept with each when they were sent (STAGE 5).
+Texture2D AIPrevTexture;
+Texture2D SentDepthTexture;
+Texture2D PrevSentDepthTexture;
+StructuredBuffer<uint> AIPixels;
+SamplerState BilinearSampler;
+SamplerState PointSampler;
+
+// Where the pass draws in its render target, and how big that is.
+int2 OutputMin;
+float2 OutputSize;
+// Where the view sits in the scene colour, and one over the scene colour texture's size.
+int2 SceneColorMin;
+float2 SceneColorSize;
+float2 SceneColorInvExtent;
+// Where the view sits in custom stencil, which is at render resolution, like depth.
+int2 StencilMin;
+int2 StencilMax;
+float2 StencilSize;
+// The stencil value ARoomManager gives the pieces.
+uint StencilValue;
+// The width of the AI's picture, in pixels.
+uint AIWidth;
+// How much of the AI's picture covers the pieces: wem.AIOverlay.Opacity times where the cycle is.
+float Weight;
+// 1 also cuts the AI's picture to where the pieces were when it was sent (its alpha), and where reprojected, to the
+// spots its view saw.
+float ClipToMask;
+// Turns scene depth into distance along the view, as View.InvDeviceZToWorldZTransform does (see ConvertFromDeviceZ).
+float4 InvDeviceZToWorldZTransform;
+// The distances, in world units, the depth map runs between: white at DepthRangeNear and nearer, black at DepthRangeFar
+// and further. Fitted to the view, or DepthNear and DepthFar.
+float DepthRangeNear;
+float DepthRangeFar;
+// The fixed range the depth in alpha runs between: wem.AIOverlay.DepthNear and .DepthFar, in world units.
+float DepthNear;
+float DepthFar;
+// Where in AITexture the show stage takes its picture from: UV * xy + zw.
+float4 AIUVScaleBias;
+// This view's clip space (without the anti-aliasing jitter) to its translated world.
+float4x4 ClipToTranslatedWorld;
+// This view's translated world to the clip space of the view the newest picture, and the one before, was sent from.
+float4x4 TranslatedWorldToSentClip;
+float4x4 TranslatedWorldToPrevSentClip;
+// x: the newest picture is reprojected, y: the one before is, z: there is one before.
+float4 ReprojectFlags;
+// How far the newest picture has faded in over the one before, 0 to 1.
+float Blend;
+// How far, as a share of the depth, a spot may lie from the depths a picture saw there and still count as seen.
+float DepthTolerance;
+
+// Depths are kept in half floats, which go to 65504.
+static const float MaxKeptDepth = 65000.0f;
+
+float IsPiece(int2 StencilPixel)
+{
+	const uint Stencil = CustomStencilTexture.Load(int3(clamp(StencilPixel, StencilMin, StencilMax - 1), 0)) STENCIL_COMPONENT_SWIZZLE;
+	return Stencil == StencilValue ? 1.0f : 0.0f;
+}
+
+float DeviceZToDistance(float DeviceZ)
+{
+	return DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+}
+
+// How bright a distance is on a range from Near (white) to Far (black). Even steps of brightness are even ratios of
+// distance, so the near pieces keep their detail and the far ones still differ. AIOverlayPrivate::BrightnessToDistance
+// turns it back.
+float DistanceToBrightness(float Distance, float Near, float Far)
+{
+	return 1.0f - saturate(log(max(Distance, Near) / Near) / log(Far / Near));
+}
+
+float3 SampleSceneColor(float2 ViewUV)
+{
+	return SceneColorTexture.SampleLevel(BilinearSampler, (SceneColorMin + ViewUV * SceneColorSize) * SceneColorInvExtent, 0).rgb;
+}
+
+// Where the pieces at this pixel are, in this view's translated world. The pixel itself may be just beside them (the
+// cover is softened over a pixel's neighbours), so it takes the depth of the first of it and its neighbours on a piece.
+float3 PieceTranslatedWorld(float2 UV, int2 StencilPixel)
+{
+	const int2 Taps[5] = { int2(0, 0), int2(1, 0), int2(-1, 0), int2(0, 1), int2(0, -1) };
+	float DeviceZ = 0.0f;
+	bool bFound = false;
+	UNROLL
+	for (int Tap = 0; Tap < 5; ++Tap)
+	{
+		const int2 Pixel = clamp(StencilPixel + Taps[Tap], StencilMin, StencilMax - 1);
+		if (!bFound && IsPiece(Pixel) > 0.0f)
+		{
+			DeviceZ = SceneDepthTexture.Load(int3(Pixel, 0)).r;
+			bFound = true;
+		}
+	}
+	const float4 Position = mul(float4((UV * 2.0f - 1.0f) * float2(1.0f, -1.0f), DeviceZ, 1.0f), ClipToTranslatedWorld);
+	return Position.xyz / Position.w;
+}
+
+// The colour a picture sent earlier has for a spot of the pieces now, and whether that picture saw the spot: whether it
+// lies within the depths of the pieces the picture saw around where it lands (not hidden then behind something nearer,
+// nor off its edge).
+float4 SampleSent(Texture2D Picture, Texture2D SentDepth, float4x4 ToSentClip, float3 TranslatedWorld, out float Seen)
+{
+	Seen = 0.0f;
+	const float4 Clip = mul(float4(TranslatedWorld, 1.0f), ToSentClip);
+	if (Clip.w <= 0.0f)
+	{
+		return 0.0f;
+	}
+	const float2 SentUV = Clip.xy / Clip.w * float2(0.5f, -0.5f) + 0.5f;
+	if (any(SentUV < 0.0f) || any(SentUV > 1.0f))
+	{
+		return 0.0f;
+	}
+
+	// The four pixels the colour is blended from: their nearest (red) and furthest (green) depths, 0 where no piece was.
+	const float4 Nearest = SentDepth.GatherRed(PointSampler, SentUV);
+	const float4 Furthest = SentDepth.GatherGreen(PointSampler, SentUV);
+	float Low = MaxKeptDepth;
+	float High = 0.0f;
+	UNROLL
+	for (int Corner = 0; Corner < 4; ++Corner)
+	{
+		if (Furthest[Corner] > 0.0f)
+		{
+			Low = min(Low, Nearest[Corner]);
+			High = max(High, Furthest[Corner]);
+		}
+	}
+	const float Depth = min(Clip.w, MaxKeptDepth);
+	Seen = High > 0.0f && Depth >= Low * (1.0f - DepthTolerance) && Depth <= High * (1.0f + DepthTolerance) ? 1.0f : 0.0f;
+	return Picture.SampleLevel(BilinearSampler, SentUV, 0);
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const int2 Pixel = int2(SvPosition.xy) - OutputMin;
+	const float2 UV = (float2(Pixel) + 0.5f) / OutputSize;
+
+#if STAGE == 1
+	// The AI's picture is far smaller than the screen, so four samples go into each of its pixels.
+	float3 Color = 0.0f;
+	float Mask = 0.0f;
+	UNROLL
+	for (int Tap = 0; Tap < 4; ++Tap)
+	{
+		const float2 Offset = (float2(Tap & 1, Tap >> 1) - 0.5f) * 0.5f / OutputSize;
+		const float2 TapUV = saturate(UV + Offset);
+		Color += SampleSceneColor(TapUV);
+		Mask += IsPiece(StencilMin + int2(TapUV * StencilSize));
+	}
+	Color *= 0.25f;
+	Mask *= 0.25f;
+	OutColor = float4(Color * Mask, Mask);
+
+#elif STAGE == 3
+	// Like the colour picture: four samples a pixel, and only the pieces count, so their edges fade to black (far).
+	float Brightness = 0.0f;
+	float Fixed = 0.0f;
+	float Mask = 0.0f;
+	UNROLL
+	for (int Tap = 0; Tap < 4; ++Tap)
+	{
+		const float2 Offset = (float2(Tap & 1, Tap >> 1) - 0.5f) * 0.5f / OutputSize;
+		const int2 StencilPixel = StencilMin + int2(saturate(UV + Offset) * StencilSize);
+		const float Piece = IsPiece(StencilPixel);
+		const float Distance = DeviceZToDistance(SceneDepthTexture.Load(int3(clamp(StencilPixel, StencilMin, StencilMax - 1), 0)).r);
+		Brightness += Piece * DistanceToBrightness(Distance, DepthRangeNear, DepthRangeFar);
+		Fixed += Piece * DistanceToBrightness(Distance, DepthNear, DepthFar);
+		Mask += Piece;
+	}
+	// Alpha: the fixed-range depth of pixels wholly on the pieces, at least 1 of 255; 0 elsewhere, so edges do not count.
+	OutColor = float4((Brightness * 0.25f).xxx, Mask == 4.0f ? max(Fixed * 0.25f, 1.0f / 255.0f) : 0.0f);
+
+#elif STAGE == 5
+	// The same four samples as the picture's pixel: the nearest and furthest of those on the pieces, none elsewhere.
+	float Nearest = MaxKeptDepth;
+	float Furthest = 0.0f;
+	UNROLL
+	for (int Tap = 0; Tap < 4; ++Tap)
+	{
+		const float2 Offset = (float2(Tap & 1, Tap >> 1) - 0.5f) * 0.5f / OutputSize;
+		const int2 StencilPixel = clamp(StencilMin + int2(saturate(UV + Offset) * StencilSize), StencilMin, StencilMax - 1);
+		if (IsPiece(StencilPixel) > 0.0f)
+		{
+			const float Distance = min(DeviceZToDistance(SceneDepthTexture.Load(int3(StencilPixel, 0)).r), MaxKeptDepth);
+			Nearest = min(Nearest, Distance);
+			Furthest = max(Furthest, Distance);
+		}
+	}
+	OutColor = Furthest > 0.0f ? float4(Nearest, Furthest, 0.0f, 0.0f) : 0.0f;
+
+#elif STAGE == 4
+	const float4 Live = SceneColorTexture.Load(int3(SceneColorMin + int2(UV * SceneColorSize), 0));
+	OutColor = float4(AITexture.SampleLevel(BilinearSampler, UV * AIUVScaleBias.xy + AIUVScaleBias.zw, 0).rgb, Live.a);
+
+#elif STAGE == 2
+	const uint Word = AIPixels[Pixel.y * AIWidth + Pixel.x];
+	OutColor = float4(Word & 0xFF, (Word >> 8) & 0xFF, (Word >> 16) & 0xFF, Word >> 24) / 255.0f;
+
+#else
+	const float4 Live = SceneColorTexture.Load(int3(SceneColorMin + int2(UV * SceneColorSize), 0));
+
+	// The pieces now, softened over a pixel's neighbours so their edges blend instead of stepping.
+	const int2 StencilPixel = StencilMin + int2(UV * StencilSize);
+	const float MaskNow = (2.0f * IsPiece(StencilPixel)
+		+ IsPiece(StencilPixel + int2(1, 0)) + IsPiece(StencilPixel - int2(1, 0))
+		+ IsPiece(StencilPixel + int2(0, 1)) + IsPiece(StencilPixel - int2(0, 1))) / 6.0f;
+
+	// The newest picture and the one before, each from where it saw the pieces at this pixel, or else as it lies on
+	// screen. Without reprojection, a picture counts as seeing everywhere, and only its alpha cuts it.
+	float3 Position = 0.0f;
+	if (MaskNow > 0.0f && (ReprojectFlags.x > 0.0f || ReprojectFlags.y > 0.0f))
+	{
+		Position = PieceTranslatedWorld(UV, StencilPixel);
+	}
+
+	// (Ifs rather than ?:, which older HLSL evaluates on both sides, out parameters and all.)
+	float SeenNow = 1.0f;
+	float4 AINow;
+	if (ReprojectFlags.x > 0.0f)
+	{
+		AINow = SampleSent(AITexture, SentDepthTexture, TranslatedWorldToSentClip, Position, SeenNow);
+	}
+	else
+	{
+		AINow = AITexture.SampleLevel(BilinearSampler, UV, 0);
+	}
+
+	float SeenBefore = 0.0f;
+	float4 AIBefore = 0.0f;
+	if (ReprojectFlags.z > 0.0f)
+	{
+		if (ReprojectFlags.y > 0.0f)
+		{
+			AIBefore = SampleSent(AIPrevTexture, PrevSentDepthTexture, TranslatedWorldToPrevSentClip, Position, SeenBefore);
+		}
+		else
+		{
+			AIBefore = AIPrevTexture.SampleLevel(BilinearSampler, UV, 0);
+			SeenBefore = 1.0f;
+		}
+	}
+
+	// The newest fades in over the one before; where only one of them saw the spot, that one; where neither, the pieces
+	// stay as they are (with ClipToMask).
+	float4 AI = AINow;
+	float Seen = SeenNow;
+	if (SeenBefore > 0.0f)
+	{
+		AI = SeenNow > 0.0f ? lerp(AIBefore, AINow, Blend) : AIBefore;
+		Seen = 1.0f;
+	}
+
+	const float Cover = saturate(Weight * MaskNow * lerp(1.0f, Seen * AI.a, ClipToMask));
+	OutColor = float4(lerp(Live.rgb, AI.rgb, Cover), Live.a);
+#endif
+}

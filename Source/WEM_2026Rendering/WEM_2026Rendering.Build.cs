@@ -13,5 +13,8 @@ public class WEM_2026Rendering : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[] { "Core" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] { "CoreUObject", "Engine", "RenderCore", "Renderer", "RHI" });
+
+		// The AI overlay's page in Project Settings (AIOverlaySettings.h).
+		PrivateDependencyModuleNames.Add("DeveloperSettings");
 	}
 }

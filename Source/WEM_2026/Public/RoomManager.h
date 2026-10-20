@@ -255,7 +255,8 @@ struct FRoomPieceLayer
 	GENERATED_BODY()
 
 	/**
-	 * Oldest first, and only the last is ever still being filled. The first is the actor's own
+	 * Oldest first. A chunk holds only pieces the AI overlay takes in, or only ones it leaves alone (its stencil value
+	 * tells which), and only the newest chunk of either kind is ever still being filled. The first is the actor's own
 	 * component for this kind of piece, or for a structure one made alongside the layer; the rest
 	 * are made as the structure grows. None but the actor's own are saved, and none are
 	 * copied with the actor: each layer property on ARoomManager is DuplicateTransient.
@@ -1799,8 +1800,9 @@ private:
 
 	/**
 	 * Brings the built geometry in line with the platforms - one piece per structure filling an
-	 * opening, per module edge and per node of rim - adding only what is new. Walks the whole
-	 * structure. Returns how many pieces it had to add.
+	 * opening, per module edge and per node of rim - adding only what is new, and moves any piece
+	 * on the wrong side of the AI overlay. Walks the whole structure. Returns how many pieces it had
+	 * to add, take away or move.
 	 */
 	int32 SyncPieces();
 
@@ -1898,8 +1900,36 @@ private:
 	/** Whether a layer's chunks still hold exactly the pieces its record says they do. */
 	bool IsPieceLayerIntact(const FRoomPieceLayer& Layer, const UInstancedStaticMeshComponent* FirstChunk) const;
 
-	/** Adds pieces to a layer, filling its open chunk and starting a new one whenever that is full. */
+	/**
+	 * Adds pieces to a layer, each to the open chunk of its side of the AI overlay, starting a new one whenever that is
+	 * full or there is none.
+	 */
 	void AddPiecesToLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, TConstArrayView<FPlacedPiece> NewPieces);
+
+	/**
+	 * Whether the AI overlay takes in a piece of Layer at a share of segments of Percent (wem.AIOverlay.SegmentPercent):
+	 * a fill when its segment is picked, a beam or post when it frames a picked segment - runs round its rim, not across
+	 * its inside - and the water over a seam with its beam or post.
+	 */
+	bool IsPieceInOverlay(const FRoomPieceLayer& Layer, uint64 Key, float Percent) const;
+
+	/** Whether the module edge from Node along Axis is rim to a segment the AI overlay picks at Percent. */
+	bool DoesBeamFramePickedSegment(const FIntVector& Node, int32 Axis, float Percent) const;
+
+	/** Whether a beam of a segment the AI overlay picks at Percent ends at Node. */
+	bool DoesPostFramePickedSegment(const FIntVector& Node, float Percent) const;
+
+	/** Moves the pieces of Layer named by Keys that are drawn on the wrong side of the AI overlay into chunks of the other. Returns how many moved. */
+	int32 SortLayerForOverlay(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, TConstArrayView<uint64> Keys);
+
+	/**
+	 * Moves every piece drawn on the wrong side of the AI overlay for its share of segments now
+	 * (wem.AIOverlay.SegmentPercent) into a chunk of the other side. Returns how many it moved.
+	 */
+	int32 SortPiecesForOverlay();
+
+	/** Sorts the pieces again whenever the overlay's share of segments changes during play. */
+	FDelegateHandle OverlayShareChangedHandle;
 
 	/** Empties a layer back to its first chunk, cleared. */
 	void ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk);

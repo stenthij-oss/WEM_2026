@@ -1,5 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+#include "AIBridgeLauncher.h"
+#include "AIOverlay.h"
 #include "Misc/CoreDelegates.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
@@ -21,20 +23,27 @@ public:
 		{
 			SkyGlitch = FSceneViewExtensions::NewExtension<FSkyGlitchViewExtension>();
 			Portrait = FSceneViewExtensions::NewExtension<FPortraitFrameViewExtension>();
+			AIOverlayExtension = FSceneViewExtensions::NewExtension<FAIOverlayViewExtension>();
+
+			// A packaged game's bridge, loading while the map does.
+			AIBridgeLauncher::Start();
 		});
 	}
 
 	virtual void ShutdownModule() override
 	{
+		AIBridgeLauncher::Stop();
 		FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitHandle);
 		SkyGlitch.Reset();
 		Portrait.Reset();
+		AIOverlayExtension.Reset();
 	}
 
 private:
 	FDelegateHandle PostEngineInitHandle;
 	TSharedPtr<FSkyGlitchViewExtension, ESPMode::ThreadSafe> SkyGlitch;
 	TSharedPtr<FPortraitFrameViewExtension, ESPMode::ThreadSafe> Portrait;
+	TSharedPtr<FAIOverlayViewExtension, ESPMode::ThreadSafe> AIOverlayExtension;
 };
 
 IMPLEMENT_MODULE(FWEM_2026RenderingModule, WEM_2026Rendering);

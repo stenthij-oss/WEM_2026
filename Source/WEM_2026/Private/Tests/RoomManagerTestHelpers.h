@@ -17,6 +17,7 @@
 #include "PlatformTileData.h"
 #include "RoomManager.h"
 #include "StructureCategory.h"
+#include "Templates/Function.h"
 #include "UObject/Package.h"
 
 /** What the tests read of the room manager's private state. Befriended by ARoomManager. */
@@ -674,6 +675,44 @@ struct FRoomManagerTestAccess
 		}
 
 		return 0;
+	}
+
+	/** Moves every piece to the chunks of its side of the AI overlay, as a change to wem.AIOverlay.SegmentPercent in play does. How many moved. */
+	static int32 SortPiecesForOverlay(ARoomManager& Manager)
+	{
+		return Manager.SortPiecesForOverlay();
+	}
+
+	/** How many cells a built platform spans along its first and second in-plane axes. */
+	static void GetSpans(const ARoomManager& Manager, const FGridPlatform& Platform, int32& OutSpanU, int32& OutSpanV)
+	{
+		Manager.GetPlatformSpans(Platform, OutSpanU, OutSpanV);
+	}
+
+	/** Every piece drawn, with the chunk it is drawn in and whether it fills an opening rather than being a beam or post. */
+	static void ForEachDrawnPiece(const ARoomManager& Manager, TFunctionRef<void(uint64 Key, const UInstancedStaticMeshComponent& Chunk, bool bFill)> Visit)
+	{
+		const auto VisitLayer = [&Visit](const FRoomPieceLayer& Layer, const bool bFill)
+		{
+			for (int32 ChunkIndex = 0; ChunkIndex < Layer.Chunks.Num(); ++ChunkIndex)
+			{
+				if (Layer.Chunks[ChunkIndex] && Layer.ChunkKeys.IsValidIndex(ChunkIndex))
+				{
+					for (const uint64 Key : Layer.ChunkKeys[ChunkIndex])
+					{
+						Visit(Key, *Layer.Chunks[ChunkIndex], bFill);
+					}
+				}
+			}
+		};
+
+		VisitLayer(Manager.EdgeLayer, false);
+		VisitLayer(Manager.NodeLayer, false);
+
+		for (const FStructureLayer& Layer : Manager.StructureLayers)
+		{
+			VisitLayer(Layer.Pieces, true);
+		}
 	}
 
 	/** As WaterSeamPieceBit in RoomManager.cpp: a beam or post cut down at a seam in water, and the water over it. */

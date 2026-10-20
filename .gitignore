@@ -28,3 +28,6 @@ Thumbs.db
 
 # Python bytecode, left by Blender running the structure scripts
 __pycache__/
+
+# The AI overlay's Python side: a clone of StreamDiffusion with its own venv (see Structures/AI_OVERLAY.md)
+StreamDiffusion/

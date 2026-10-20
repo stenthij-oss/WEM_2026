@@ -22,9 +22,11 @@ public class WEM_2026Editor : ModuleRules
 			"MeshDescription",
 			"MessageLog",
 			"PropertyEditor",
+			"Settings",
 			"Slate",
 			"SlateCore",
 			"StaticMeshDescription",
+			"ToolMenus",
 			"UnrealEd"
 		});
 	}

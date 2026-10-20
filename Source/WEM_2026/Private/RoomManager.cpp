@@ -64,6 +64,20 @@ namespace
 	constexpr int32 PieceChunkCapacity = 128;
 
 	/**
+	 * The custom stencil value every piece is drawn into, beams, nodes and structures alike - or, with
+	 * the overlay's share of segments below 100, every piece it picks. The AI overlay
+	 * (WEM_2026Rendering's AIOverlay, console wem.AIOverlay.Stencil) finds the pieces on screen by it;
+	 * the surface marks are notation, not pieces, and stay out.
+	 */
+	constexpr int32 AIOverlayStencil = 1;
+
+	/**
+	 * The custom stencil value of a piece the AI overlay leaves alone, with its share of segments below 100
+	 * (wem.AIOverlay.SegmentPercent). Still drawn into custom depth, so it hides the pieces the overlay takes in behind it.
+	 */
+	constexpr int32 OutOfOverlayStencil = 0;
+
+	/**
 	 * Most squares one chunk of an overlay colour holds before a fresh chunk is started.
 	 *
 	 * The overlay is kept out of Lumen, so what a changed chunk costs is rebuilding its bounds and
@@ -173,6 +187,46 @@ namespace
 	 * tag reaches this bit, so in a structure's layer it cannot meet a platform's key either.
 	 */
 	constexpr uint64 WaterSeamPieceBit = uint64(1) << 62;
+
+	/**
+	 * The share of segments, in percent, the AI overlay takes over: wem.AIOverlay.SegmentPercent, made by
+	 * WEM_2026Rendering, which loads before this module. All of them when it is not there.
+	 */
+	float GetOverlaySegmentPercent()
+	{
+		static IConsoleVariable* Variable = nullptr;
+		if (!Variable)
+		{
+			Variable = IConsoleManager::Get().FindConsoleVariable(TEXT("wem.AIOverlay.SegmentPercent"));
+		}
+
+		return Variable ? FMath::Clamp(Variable->GetFloat(), 0.0f, 100.0f) : 100.0f;
+	}
+
+	/**
+	 * Whether the AI overlay takes in the segment with this platform key at a share of Percent. Picked by the key alone,
+	 * so a segment stays picked however the structure around it changes, and a higher share keeps every segment a lower
+	 * one picked.
+	 */
+	bool IsSegmentPicked(const uint64 PlatformKey, const float Percent)
+	{
+		if (Percent >= 100.0f)
+		{
+			return true;
+		}
+		if (Percent <= 0.0f)
+		{
+			return false;
+		}
+
+		// splitmix64's finish, so segments side by side on the lattice scatter.
+		uint64 Hash = PlatformKey;
+		Hash = (Hash ^ (Hash >> 30)) * 0xbf58476d1ce4e5b9ull;
+		Hash = (Hash ^ (Hash >> 27)) * 0x94d049bb133111ebull;
+		Hash ^= Hash >> 31;
+
+		return static_cast<double>(Hash >> 40) < Percent * 0.01 * static_cast<double>(uint64(1) << 24);
+	}
 
 	/** Where one face of a platform is kept in ARoomManager::FaceFills: its positive face, then its negative one. */
 	FORCEINLINE int32 GetFaceFillIndex(const int32 PlatformIndex, const int32 FaceSign)
@@ -736,6 +790,8 @@ ARoomManager::ARoomManager()
 		Pieces->SetCanEverAffectNavigation(false);
 		Pieces->SetCastShadow(true);
 		Pieces->SetMobility(EComponentMobility::Movable);
+		Pieces->SetRenderCustomDepth(true);
+		Pieces->SetCustomDepthStencilValue(AIOverlayStencil);
 	}
 
 	for (UInstancedStaticMeshComponent* Marks :
@@ -849,6 +905,16 @@ void ARoomManager::BeginPlay()
 		RebuildVisuals();
 	}
 
+	// The AI overlay's share of segments can be changed during play, from its settings page or the console; the pieces
+	// already drawn are sorted again for it.
+	if (IConsoleVariable* OverlayShare = IConsoleManager::Get().FindConsoleVariable(TEXT("wem.AIOverlay.SegmentPercent")))
+	{
+		OverlayShareChangedHandle = OverlayShare->OnChangedDelegate().AddWeakLambda(this, [this](IConsoleVariable*)
+		{
+			SortPiecesForOverlay();
+		});
+	}
+
 	// Paths, pockets, strikes and reshuffles all fall due by one clock, starting from now.
 	const double Now = GetClock();
 	NextStrikeAt = Now + DamageStream.FRandRange(MinStrikeInterval, FMath::Max(MaxStrikeInterval, MinStrikeInterval));
@@ -899,6 +965,12 @@ void ARoomManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		World->GetTimerManager().ClearTimer(NatureTimerHandle);
 		World->GetTimerManager().ClearTimer(ClockTimerHandle);
 	}
+
+	if (IConsoleVariable* OverlayShare = IConsoleManager::Get().FindConsoleVariable(TEXT("wem.AIOverlay.SegmentPercent")))
+	{
+		OverlayShare->OnChangedDelegate().Remove(OverlayShareChangedHandle);
+	}
+	OverlayShareChangedHandle.Reset();
 
 	Super::EndPlay(EndPlayReason);
 }
@@ -9085,6 +9157,10 @@ int32 ARoomManager::SyncPieces()
 		AddedPieces += SyncPieceLayer(Layer.Pieces, Layer.Pieces.Chunks[0], StructurePieces.Value, Mesh, Material);
 	}
 
+	// A beam or post kept from before may frame a segment the AI overlay takes in that it did not frame then, or the
+	// other way round: it goes to the chunks of the side it is on now.
+	AddedPieces += SortPiecesForOverlay();
+
 	// Only a sync that built every platform can be added to one placement at a time.
 	bPiecesComplete = bDrawPieces;
 
@@ -9155,6 +9231,34 @@ void ARoomManager::AppendPlatformPieces(const FGridPlatform& Platform)
 		TArray<FPlacedPiece> NewPieces;
 		AppendToLayer(Layer.Pieces, StructurePieces.Value, NewPieces);
 		AddPiecesToLayer(Layer.Pieces, Layer.Pieces.Chunks[0], NewPieces);
+	}
+
+	// A segment the AI overlay takes in brings the beams and posts round it in with it, the ones a neighbour already drew
+	// too. Taking a segment in never lets another piece go, so nothing else changes side.
+	const float OverlayPercent = GetOverlaySegmentPercent();
+
+	if (OverlayPercent > 0.0f && OverlayPercent < 100.0f && IsSegmentPicked(MakePlatformKey(Platform), OverlayPercent))
+	{
+		const auto KeysOf = [](const TConstArrayView<FPlacedPiece> LayerPieces)
+		{
+			TArray<uint64> Keys;
+			Keys.Reserve(LayerPieces.Num());
+			for (const FPlacedPiece& Piece : LayerPieces)
+			{
+				Keys.Add(Piece.Key);
+			}
+			return Keys;
+		};
+
+		SortLayerForOverlay(EdgeLayer, EdgePieces, KeysOf(Pieces.Edges));
+		SortLayerForOverlay(NodeLayer, NodePieces, KeysOf(Pieces.Nodes));
+
+		// The water over a seam among them goes with its beam or post.
+		for (const TPair<UPlatformStructureData*, TArray<FPlacedPiece>>& StructurePieces : Pieces.Structures)
+		{
+			FStructureLayer& Layer = FindOrAddStructureLayer(StructurePieces.Key);
+			SortLayerForOverlay(Layer.Pieces, Layer.Pieces.Chunks[0], KeysOf(StructurePieces.Value));
+		}
 	}
 }
 
@@ -9506,6 +9610,9 @@ void ARoomManager::RefreshLatticePieces(const TSet<uint64>& EdgeKeys, const TSet
 		}
 
 		AddPiecesToLayer(Layer, FirstChunk, NewPieces);
+
+		// One kept may have framed a segment the AI overlay takes in that has just gone, or met one just come.
+		SortLayerForOverlay(Layer, FirstChunk, Keys);
 	};
 
 	BringInLine(EdgeLayer, EdgePieces, LatticeKeys, Wanted.Edges);
@@ -9701,44 +9808,222 @@ void ARoomManager::AddPiecesToLayer(
 	// A chunk made with the layer has no record of its own yet.
 	Layer.ChunkKeys.SetNum(Layer.Chunks.Num());
 
-	// New pieces go into the chunk still being filled, and a fresh chunk is started once that
-	// one is full. Those are the only components whose instance count changes, so they are the
-	// only ones whose surface cache Lumen has to capture again.
-	for (int32 NextPiece = 0; NextPiece < NewPieces.Num();)
+	// A chunk draws everything it holds with one stencil value, so the pieces the AI overlay takes in and the ones it
+	// leaves alone go to chunks of their own. With every piece taken in - the default - only the first kind is made.
+	const float OverlayPercent = GetOverlaySegmentPercent();
+	TArray<FPlacedPiece> PiecesBySide[2];
+
+	for (const FPlacedPiece& Piece : NewPieces)
 	{
-		int32 ChunkIndex = Layer.Chunks.Num() - 1;
-		UInstancedStaticMeshComponent* OpenChunk = Layer.Chunks[ChunkIndex];
-		int32 Room = PieceChunkCapacity - OpenChunk->GetInstanceCount();
-
-		if (Room <= 0)
-		{
-			OpenChunk = AddInstancedChunk(Layer.Chunks, FirstChunk ? FirstChunk : Layer.Chunks[0].Get());
-			Layer.ChunkKeys.AddDefaulted();
-			++ChunkIndex;
-			Room = PieceChunkCapacity;
-		}
-
-		const int32 Count = FMath::Min(Room, NewPieces.Num() - NextPiece);
-		TArray<uint64>& Keys = Layer.ChunkKeys[ChunkIndex];
-		const int32 FirstInstance = Keys.Num();
-
-		TArray<FTransform> Transforms;
-		Transforms.Reserve(Count);
-
-		for (int32 Offset = 0; Offset < Count; ++Offset)
-		{
-			const FPlacedPiece& Piece = NewPieces[NextPiece + Offset];
-			Transforms.Add(Piece.Transform);
-			Keys.Add(Piece.Key);
-			Layer.PieceSlots.Add(Piece.Key, FIntPoint(ChunkIndex, FirstInstance + Offset));
-		}
-
-		// One batch per chunk: one instance at a time would redo the component's bookkeeping
-		// for every instance.
-		OpenChunk->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
-
-		NextPiece += Count;
+		PiecesBySide[IsPieceInOverlay(Layer, Piece.Key, OverlayPercent) ? 1 : 0].Add(Piece);
 	}
+
+	for (int32 Side = 0; Side < 2; ++Side)
+	{
+		const TArray<FPlacedPiece>& SidePieces = PiecesBySide[Side];
+		const int32 Stencil = Side == 1 ? AIOverlayStencil : OutOfOverlayStencil;
+		const auto IsOfSide = [Side](const UInstancedStaticMeshComponent* Chunk)
+		{
+			return IsValid(Chunk) && (Chunk->CustomDepthStencilValue == AIOverlayStencil) == (Side == 1);
+		};
+
+		// New pieces go into the side's chunk still being filled, and a fresh chunk is started once that
+		// one is full. Those are the only components whose instance count changes, so they are the
+		// only ones whose surface cache Lumen has to capture again.
+		int32 ChunkIndex = Layer.Chunks.FindLastByPredicate(IsOfSide);
+
+		for (int32 NextPiece = 0; NextPiece < SidePieces.Num();)
+		{
+			int32 Room = ChunkIndex != INDEX_NONE ? PieceChunkCapacity - Layer.Chunks[ChunkIndex]->GetInstanceCount() : 0;
+
+			if (Room <= 0)
+			{
+				UInstancedStaticMeshComponent* NewChunk = AddInstancedChunk(Layer.Chunks, FirstChunk ? FirstChunk : Layer.Chunks[0].Get());
+				NewChunk->SetCustomDepthStencilValue(Stencil);
+				Layer.ChunkKeys.AddDefaulted();
+				ChunkIndex = Layer.Chunks.Num() - 1;
+				Room = PieceChunkCapacity;
+			}
+
+			UInstancedStaticMeshComponent* OpenChunk = Layer.Chunks[ChunkIndex];
+			const int32 Count = FMath::Min(Room, SidePieces.Num() - NextPiece);
+			TArray<uint64>& Keys = Layer.ChunkKeys[ChunkIndex];
+			const int32 FirstInstance = Keys.Num();
+
+			TArray<FTransform> Transforms;
+			Transforms.Reserve(Count);
+
+			for (int32 Offset = 0; Offset < Count; ++Offset)
+			{
+				const FPlacedPiece& Piece = SidePieces[NextPiece + Offset];
+				Transforms.Add(Piece.Transform);
+				Keys.Add(Piece.Key);
+				Layer.PieceSlots.Add(Piece.Key, FIntPoint(ChunkIndex, FirstInstance + Offset));
+			}
+
+			// One batch per chunk: one instance at a time would redo the component's bookkeeping
+			// for every instance.
+			OpenChunk->AddInstances(Transforms, /*bShouldReturnIndices=*/false, /*bWorldSpace=*/true);
+
+			NextPiece += Count;
+		}
+	}
+}
+
+bool ARoomManager::IsPieceInOverlay(const FRoomPieceLayer& Layer, const uint64 Key, const float Percent) const
+{
+	if (Percent >= 100.0f)
+	{
+		return true;
+	}
+	if (Percent <= 0.0f)
+	{
+		return false;
+	}
+
+	// A structure's layer holds the fills, keyed by their platform, and the water over the seams, keyed by its beam or post.
+	const bool bLattice = &Layer == &EdgeLayer || &Layer == &NodeLayer || (Key & WaterSeamPieceBit) != 0;
+	const uint64 BareKey = Key & ~(NegativeFacePieceBit | WaterSeamPieceBit);
+
+	if (!bLattice)
+	{
+		return IsSegmentPicked(BareKey, Percent);
+	}
+
+	// A post is keyed by its cell alone, a beam with its axis as the tag.
+	const FIntVector Node = CellFromKey(BareKey);
+	const int32 Tag = static_cast<int32>(BareKey >> KeyTagShift);
+
+	return Tag == 0 ? DoesPostFramePickedSegment(Node, Percent) : DoesBeamFramePickedSegment(Node, Tag - 1, Percent);
+}
+
+bool ARoomManager::DoesBeamFramePickedSegment(const FIntVector& Node, const int32 Axis, const float Percent) const
+{
+	FModuleFace Faces[4];
+	GetEdgeFaces(FLatticeEdge{ Node, Axis }, GetModule(), Faces);
+
+	// In each plane through the beam, the faces either side of it. Where one platform holds both the beam runs across
+	// its inside rather than round it.
+	for (int32 Plane = 0; Plane < 2; ++Plane)
+	{
+		const int32* Owners[2] = {
+			ModuleFaceOwners.Find(MakeModuleFaceKey(Faces[Plane * 2].MinNode, Faces[Plane * 2].Normal)),
+			ModuleFaceOwners.Find(MakeModuleFaceKey(Faces[Plane * 2 + 1].MinNode, Faces[Plane * 2 + 1].Normal)) };
+
+		if (Owners[0] && Owners[1] && *Owners[0] == *Owners[1])
+		{
+			continue;
+		}
+
+		for (const int32* FaceOwner : Owners)
+		{
+			if (FaceOwner && BuiltPlatforms.IsValidIndex(*FaceOwner) && IsSegmentPicked(MakePlatformKey(BuiltPlatforms[*FaceOwner]), Percent))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+bool ARoomManager::DoesPostFramePickedSegment(const FIntVector& Node, const float Percent) const
+{
+	const int32 Module = GetModule();
+
+	// A post on a segment's rim is where two beams of that rim meet, or one ends that carries on beyond it.
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if (DoesBeamFramePickedSegment(Node, Axis, Percent) || DoesBeamFramePickedSegment(Node - AxisStep(Axis, Module), Axis, Percent))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+int32 ARoomManager::SortLayerForOverlay(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk, const TConstArrayView<uint64> Keys)
+{
+	// A layer out of step with its record is drawn again whole by the next sync, sorted as it is drawn.
+	if (!IsPieceLayerIntact(Layer, FirstChunk))
+	{
+		return 0;
+	}
+
+	const float OverlayPercent = GetOverlaySegmentPercent();
+	TArray<FPlacedPiece> Moving;
+	TArray<uint32> Stamps;
+
+	for (const uint64 Key : Keys)
+	{
+		const FIntPoint* Slot = Layer.PieceSlots.Find(Key);
+		if (!Slot || !Layer.Chunks.IsValidIndex(Slot->X))
+		{
+			continue;
+		}
+
+		const UInstancedStaticMeshComponent* Chunk = Layer.Chunks[Slot->X];
+		if (IsPieceInOverlay(Layer, Key, OverlayPercent) != (Chunk->CustomDepthStencilValue == AIOverlayStencil))
+		{
+			FPlacedPiece& Piece = Moving.AddDefaulted_GetRef();
+			Piece.Key = Key;
+			Chunk->GetInstanceTransform(Slot->Y, Piece.Transform, /*bWorldSpace=*/true);
+			Stamps.Add(Layer.PieceStamps.FindRef(Key));
+		}
+	}
+
+	// Taken out and drawn again on the other side, still named by the sync that last found it.
+	for (const FPlacedPiece& Piece : Moving)
+	{
+		RemovePieceFromLayer(Layer, Piece.Key);
+	}
+
+	AddPiecesToLayer(Layer, FirstChunk, Moving);
+
+	for (int32 Index = 0; Index < Moving.Num(); ++Index)
+	{
+		Layer.PieceStamps.Add(Moving[Index].Key, Stamps[Index]);
+	}
+
+	return Moving.Num();
+}
+
+int32 ARoomManager::SortPiecesForOverlay()
+{
+	const bool bEveryPieceIn = GetOverlaySegmentPercent() >= 100.0f;
+	int32 Moved = 0;
+
+	auto SortLayer = [this, bEveryPieceIn, &Moved](FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk)
+	{
+		// At the default, with every piece taken in, a layer with nothing drawn out of the overlay has nothing to move.
+		const bool bAnyOut = Layer.Chunks.ContainsByPredicate([](const UInstancedStaticMeshComponent* Chunk)
+		{
+			return IsValid(Chunk) && Chunk->CustomDepthStencilValue != AIOverlayStencil && Chunk->GetInstanceCount() > 0;
+		});
+
+		if (bEveryPieceIn && !bAnyOut)
+		{
+			return;
+		}
+
+		TArray<uint64> Keys;
+		Layer.PieceSlots.GenerateKeyArray(Keys);
+		Moved += SortLayerForOverlay(Layer, FirstChunk, Keys);
+	};
+
+	SortLayer(EdgeLayer, EdgePieces);
+	SortLayer(NodeLayer, NodePieces);
+
+	for (FStructureLayer& Layer : StructureLayers)
+	{
+		if (!Layer.Pieces.Chunks.IsEmpty())
+		{
+			SortLayer(Layer.Pieces, Layer.Pieces.Chunks[0]);
+		}
+	}
+
+	return Moved;
 }
 
 void ARoomManager::ResetPieceLayer(FRoomPieceLayer& Layer, UInstancedStaticMeshComponent* FirstChunk)
@@ -9840,6 +10125,8 @@ UInstancedStaticMeshComponent* ARoomManager::AddInstancedChunk(
 	Chunk->bAffectDistanceFieldLighting = FirstChunk->bAffectDistanceFieldLighting;
 	Chunk->bAffectDynamicIndirectLighting = FirstChunk->bAffectDynamicIndirectLighting;
 	Chunk->SetVisibleInRayTracing(FirstChunk->bVisibleInRayTracing);
+	Chunk->SetRenderCustomDepth(FirstChunk->bRenderCustomDepth);
+	Chunk->SetCustomDepthStencilValue(FirstChunk->CustomDepthStencilValue);
 	Chunk->SetStaticMesh(FirstChunk->GetStaticMesh());
 	Chunk->SetMaterial(0, FirstChunk->OverrideMaterials.IsValidIndex(0) ? FirstChunk->OverrideMaterials[0].Get() : nullptr);
 	Chunk->SetupAttachment(SceneRoot);
