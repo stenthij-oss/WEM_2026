@@ -13,8 +13,9 @@ public class WEM_2026 : ModuleRules
 		// The drone trail draws its own mesh (DroneTrailMeshComponent.cpp).
 		PrivateDependencyModuleNames.AddRange(new string[] { "RenderCore", "RHI" });
 
-		// Uncomment if you are using Slate UI
-		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
+
+		// The Players page in Project Settings (WEMPlayers.h).
+		PublicDependencyModuleNames.Add("DeveloperSettings");
 		
 		// Uncomment if you are using online features
 		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
