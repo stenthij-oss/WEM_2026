@@ -484,6 +484,51 @@ struct FRoomManagerTestAccess
 		return Manager.SeedQueue.Num();
 	}
 
+	/** Whether a platform standing is a ground tile, and the ground tiles standing, in list order. */
+	static bool IsGroundTile(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return Manager.GroundTiles.Contains(WEMGrid::MakeTaggedKey(Platform.MinNode, static_cast<int32>(Platform.Normal)));
+	}
+
+	static TArray<FGridPlatform> GetGroundTiles(const ARoomManager& Manager)
+	{
+		return Manager.BuiltPlatforms.FilterByPredicate([&Manager](const FGridPlatform& Platform) { return IsGroundTile(Manager, Platform); });
+	}
+
+	/** How many ground tiles a zone has. */
+	static int32 GetGroundTileCount(const ARoomManager& Manager, const int32 Zone)
+	{
+		return Manager.GroundTileCounts[Zone];
+	}
+
+	/** How many platforms standing link to no ground tile, by a search of the whole structure. */
+	static int32 CountLoose(const ARoomManager& Manager)
+	{
+		TArray<int32> Loose;
+		Manager.GatherAllLoose(Loose);
+		return Loose.Num();
+	}
+
+	/** The platforms sharing a beam with the one at Index in the built list, as indices into it. */
+	static TArray<int32> GetLinked(const ARoomManager& Manager, const int32 Index)
+	{
+		TArray<int32, TInlineAllocator<8>> Touching;
+		Manager.GatherTouchingPlatforms(Manager.BuiltPlatforms[Index], Touching);
+		Touching.Remove(Index);
+		return TArray<int32>(Touching);
+	}
+
+	/** Platforms taken away for losing their link, and ground tiles passed on, since the cube was cleared. */
+	static int32 GetCutLoose(const ARoomManager& Manager)
+	{
+		return Manager.CutLooseRemovals;
+	}
+
+	static int32 GetGroundTilesPassedOn(const ARoomManager& Manager)
+	{
+		return Manager.GroundTilesPassedOn;
+	}
+
 	/** One path of air as drawn: its corners and the box of cells each leg fills. */
 	struct FPath
 	{
@@ -826,7 +871,8 @@ namespace WEMRoomManagerTests
 	/**
 	 * A room manager with the designer's tile sizes, a two-sided slab filling each, overlay and
 	 * pieces off, no air pockets, molds or paths, one first tile in the middle, no strikes, reshuffles,
-	 * moving pockets, spilling grounds or runs of walls, on a fixed seed. Structures replaces the slabs when given.
+	 * moving pockets, spilling grounds or runs of walls, nothing cut loose from the ground tiles, on a fixed
+	 * seed. Structures replaces the slabs when given.
 	 */
 	inline ARoomManager* SpawnRoomManager(
 		UWorld* World,
@@ -847,6 +893,7 @@ namespace WEMRoomManagerTests
 		Manager->bEnableDamage = false;
 		Manager->bEnableReshuffle = false;
 		Manager->bMovePockets = false;
+		Manager->bLinkToGroundTiles = false;
 		Manager->InteriorGroundSpillChance = 0.0f;
 		Manager->ExteriorGroundSpillChance = 0.0f;
 		Manager->InteriorWallRunChance = 0.0f;

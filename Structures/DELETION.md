@@ -72,6 +72,7 @@ The field air is worked out afresh on every field change (`GatherFieldAir`), but
 | Grid \| Deletion: Reshuffle Interval | `ReshuffleInterval` | 10 s |
 | Grid \| Deletion: Min / Max Reshuffle Count | `MinReshuffleCount`, `MaxReshuffleCount` | 4, 12 |
 | Grid \| Deletion: Reshuffle Step Interval | `ReshuffleStepInterval` | 0.25 s |
+| Grid \| Deletion: Link To Ground Tiles | `bLinkToGroundTiles` | on (2026-10-17): whatever loses its link to a ground tile goes at once (see Ground tiles) |
 | Grid \| Air Pockets: Move Pockets | `bMovePockets` | on |
 | Grid \| Air Pockets: Pocket Half Life, Min Pocket Life | `PocketHalfLife`, `MinPocketLife` | 120 s, 30 s |
 | Grid \| Molds: Mold Growth Weight | `MoldGrowthWeight` | 4 |
@@ -109,6 +110,65 @@ Asked the same day: "Can growth be more multiplied and fast?" The placement time
 A beat costs about what `WEM.Deletion.Perf` shows: 0.5 ms early on, about 2 ms at 5,000 platforms. With the default budget that is up to about 16 beats a frame early on, and 4 at 5,000 platforms (240 a second). Raise the budget for more, at the frame rate's cost. Faster growth also fills the cube sooner, so strikes find more to kill: see the steady-state note under Measurements.
 
 More fronts also make growth look more multiplied: *Seeds Per Zone* starts every zone from several first tiles.
+
+## Ground tiles
+
+Asked on 2026-10-17:
+- every segment has to be connected to a ground tile, a zone's first tile;
+- when a ground tile goes, a random tile of its zone becomes the ground tile, and whatever is not connected again goes;
+- a segment with nothing holding it up goes at once.
+
+Asked what counts as connected, the user said "each segment at least be connected to another segment on whatever side, except edge to edge", where edge to edge meant "no corner to corner". In this lattice platforms only meet along beams, so growth already grows that way.
+
+| Ask | Built as |
+|---|---|
+| Ground tiles are the first tiles that spawn within a zone | **Ground tiles** (`GroundTiles`, each with its zone): every seed, and the first platform laid in a zone with no ground tile. That covers the middle zone's very first platform, every other zone's first tile, a zone's second and third with *Seeds Per Zone*, and the first platform to reach a zone whose ground tiles have all gone. |
+| Each segment connected to a ground tile, on whatever side, not corner to corner | **Link To Ground Tiles** (`bLinkToGroundTiles`, Grid \| Deletion, on). A platform links to a ground tile through a run of platforms, each sharing a beam (a module edge of rim) with the next, in one plane or at an angle. Meeting at a post alone does not link. Any zone's ground tile will do. |
+| When a ground tile is deleted, a random tile becomes the ground tile; tiles not connected again are deleted | **Passed on** (`PassOnGroundTiles`): before the platforms go, each ground tile among them goes to a platform drawn at random among the rest of its zone, from a stream of its own. Then whatever links to no ground tile goes with them. |
+| A segment without any supporting structure is always immediately deleted | The same rule: a platform with nothing left around it is a piece of one with no ground tile in it. It goes in the same removal, not on the clock's 4 a tick. |
+
+**How it works.** Growth keeps to the rule by itself. A placement is only ever open where it shares a beam with what stands, and everything standing links. Only taking platforms away can cut some loose: a strike's dead, a reshuffle's step, or a ground tile going. So after every removal, the platforms the removed ones touched search out through the beams they share (`GatherCutLoose`). Each goes nearest a ground tile first, until it meets one or a platform already found to link. A search that runs out has been through the whole piece it started in and found no ground tile there. That piece is taken away at once, in one batch. Nothing else touched it, so taking it away cuts nothing more loose.
+
+**Show Zones** also draws each ground tile as a crossed box in its zone's colour, a cell out all round. **Deletion Summary** adds the ground tiles, how many were passed on, and how many platforms were cut loose. The incremental check (`wem.RoomManager.VerifyEvery`) also reports any platform left unlinked, and any ground tile a rebuild would not keep.
+
+**Cheaper removals.** A removal judges again every placement round the platforms taken away. Round a piece cut loose almost none of them meet anything any more, and a placement meeting nothing is never open. So `RefreshCandidatesAfterRemoval` now lets those go, or leaves them out, without judging them in full (`MeetsStructure`, which asks only the rim and stops at the first beam it finds). The path refresh already did this. It applies to every removal, and the lists still agree with a full gather.
+
+### My calls (flagged for the user)
+
+- **Linking is geometric**: a shared beam links whatever stands on it. A wall that is not load-bearing still links what shares its top beam.
+- **A ground tile links its own zone and every other.** Growth crossing a zone border links back to the ground tile it grew from.
+- **The pass-on draws from every platform left in the zone, linked or not**, so a piece cut off from everything is saved when the draw lands in it.
+- **A zone emptied of platforms has no ground tile** until growth lays one there again, and the first laid is its ground tile. With *Seed Every Zone* off, that is how the other 26 zones get theirs.
+- **Ground tiles are not protected.** Strikes and reshuffles take them like any platform.
+- **Off, the ground tiles are still kept**, so the rule can be turned on mid-run. But turning it on does not sweep the cube: a piece left unlinked while it was off goes only when something touching it is taken away.
+- **A saved platform list played without clearing** gives each zone the first of its platforms in the list.
+- **At once, in the same frame**, as asked. See the cost below.
+
+### Measurements
+
+`WEM.Deletion.GroundTiles` (129 cube, 27 seeds, 400 beats):
+- The platform that most hangs on cut 15 loose, exactly the ones a plain search of the beams predicts.
+- A ground tile passed on in the middle zone cut 2 loose, again as predicted.
+- Eight rounds of 12 random removals with growth between cut 198 loose.
+- A strike killing a fifth cut 124 more loose.
+- Growth reached an emptied zone again after 22 beats, and its first platform was its ground tile.
+
+`WEM.Deletion.Perf` now runs with the rule on. Over its 40 simulated seconds the cube grew to 5,225 platforms. The strikes and reshuffles cut 152 loose, and 1 ground tile was passed on. A reshuffle step now costs 8.4 ms mean and 43.8 ms longest, against 7.1 / 13.6 ms before, since a step can cut a piece loose. Growth beats and strikes are as before.
+
+The test then strikes once more, killing one platform in twenty, and takes them away 4 a tick with growth between. The last row was measured after the pocket noise (`NATURE.md`) changed what grows, so its cube differs:
+
+| Build | Killed / cut loose | Most cut in one tick | Ticks cutting some loose: mean / longest | Longest, per platform |
+|---|---|---|---|---|
+| First version | 282 / 640 | 113 | 42.0 / 302.6 ms | 2.6 ms |
+| Skipping placements that meet nothing | 282 / 640 | 113 | 25.8 / 142.5 ms | 1.2 ms |
+| And asking only the rim (now) | 278 / 852 | 244 | 31.4 / 250.1 ms | 1.0 ms |
+
+Ticks that cut nothing loose cost 7.9 ms mean and 15.1 ms longest. A collapse's cost is almost all in judging the placements round it again: 97 of the 113 ms for 113 platforms, in the second build. The search itself takes 0.2-2.3 ms.
+
+### Known limits
+
+- **A big collapse costs a long frame**: about 1 ms per platform cut loose at 5,000 platforms, so 244 at once took 250 ms. Spreading a collapse over a few ticks would end the hitch, but it would no longer be immediate.
+- **Deaths take two to three times as many again with them** (278 killed cut 852 loose), so the cube wears faster and the removal work rises with it.
 
 ## Measurements
 
@@ -161,10 +221,12 @@ What the new tests show:
 - A mold weight of 8 puts 39 platforms in the molds against 23 at weight 1.
 - A nine-piece landscape keeps one-storey trunks and grows a two-storey crown from the second storey up, 16 cells past its edges. The first storey past the edge stays free. The crown shrinks when a piece goes, and is gone when the landscape splits in two.
 
+Since 2026-10-17, `WEM.Deletion.GroundTiles` checks the ground tiles (see Ground tiles), and **117/117 product tests pass**. The fixture keeps *Link To Ground Tiles* off, so the older tests take away only what they ask to.
+
 ## Known limits
 
 - **Objects on a platform that dies stay standing** (see above).
-- **Removal costs about what a placement does**, so a cube with a high death rate spends that much more of each frame on the room manager.
+- **Removal costs about what a placement does**, so a cube with a high death rate spends that much more of each frame on the room manager. With *Link To Ground Tiles* on, a big collapse goes in one frame (see Ground tiles).
 - **A strike walks every platform**, but only asks the ones it hits whether they are vulnerable.
 - **The field air is worked out afresh on every field change**: about 1 ms per thousand pieces of ground and water, before the swap.
 - **The category streaks and patches are history**: a removal leaves them as they were, so *Category Patch Size* counts faces that have gone.

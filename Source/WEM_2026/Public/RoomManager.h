@@ -1195,7 +1195,7 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Paths")
 	FString PathSummary;
 
-	/** Draws the 27 zones as boxes of lines, each in its own colour. */
+	/** Draws the 27 zones as boxes of lines, each in its own colour, and each zone's ground tiles as crossed boxes in it. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Zones")
 	bool bShowZones = false;
 
@@ -1263,6 +1263,15 @@ public:
 	float VulnerableDamageMultiplier = 1.6f;
 
 	/**
+	 * Every platform has to link to a ground tile - a zone's first tile - through the platforms between: each sharing a
+	 * beam with the next, in one plane or at an angle. Meeting at a post alone does not link. Whatever loses its link as
+	 * a platform goes is taken away at once with it. A ground tile that goes is passed on to a platform drawn at random
+	 * in its zone, and whatever does not link to it, or to another, goes.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion")
+	bool bLinkToGroundTiles = true;
+
+	/**
 	 * Now and then, in a zone drawn at random, a number of platforms holding no objects are taken away one by one, and
 	 * as each goes another is laid somewhere else in the same zone: the zone reshuffled a little.
 	 */
@@ -1284,7 +1293,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Deletion", meta = (ClampMin = "0.05", EditCondition = "bEnableReshuffle"))
 	float ReshuffleStepInterval = 0.25f;
 
-	/** Strikes, hits and what they took away, reshuffles, and pockets moved, since the cube was cleared. Readout only. */
+	/**
+	 * Strikes, hits and what they took away, reshuffles, pockets moved, the ground tiles and how many were passed on, and
+	 * the platforms cut loose from them, since the cube was cleared. Readout only.
+	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Deletion")
 	FString DeletionSummary;
 
@@ -2778,6 +2790,17 @@ private:
 	 * Two rules follow from it: a placement demotes promoted surfaces it builds against, and a floor's block on a
 	 * beam holds only while it is the one platform there.
 	 *
+	 * Ground tiles
+	 * ------------
+	 * A zone's ground tiles are its first tiles: the seeds, and the first platform laid in a zone with no ground tile -
+	 * the middle zone's very first, or the first to reach a zone whose ground tiles have all gone. With
+	 * bLinkToGroundTiles every platform has to link to one, of any zone, through a run of platforms each sharing a beam
+	 * (a module edge of rim) with the next; meeting at a post alone does not link. Growth keeps to that by itself, since
+	 * a placement is only open where it shares a beam with what stands. Only taking platforms away can cut some loose,
+	 * so after every removal the platforms the removed ones touched search out for a ground tile, heading for the
+	 * nearest; a search that runs out has found a whole piece cut loose, which goes at once. A ground tile taken away
+	 * is passed on first, to a platform drawn at random among the rest of its zone, so what links to that one stays.
+	 *
 	 * Every ReshuffleInterval a zone is drawn at random and between MinReshuffleCount and MaxReshuffleCount of its
 	 * platforms holding no objects - none standing on either face - are drawn to move. Every ReshuffleStepInterval one
 	 * of them is taken away and a platform laid elsewhere in the same zone, as a beat lays one, away from every spot
@@ -2845,6 +2868,30 @@ private:
 
 	/** Starts a strike or a reshuffle when due, and carries a reshuffle on. */
 	void AdvanceDeletion(double Now);
+
+	/** Makes a platform standing a ground tile of its zone. False when it already is one. */
+	bool MakeGroundTile(const FGridPlatform& Platform);
+
+	/**
+	 * Lets go of every ground tile among the platforms about to be taken away, by key, and passes each on to a platform
+	 * drawn at random among those staying in its zone that are not ground tiles yet. False when none was among them.
+	 */
+	bool PassOnGroundTiles(const TSet<uint64>& RemovedKeys);
+
+	/**
+	 * The platforms standing that have lost their link to every ground tile now Removed have been taken away, each once,
+	 * as they stand. Searched for out from the platforms the removed ones touched.
+	 */
+	void GatherCutLoose(TConstArrayView<FGridPlatform> Removed, TArray<FGridPlatform>& OutLoose) const;
+
+	/** Every platform standing with no link to a ground tile, by indices into BuiltPlatforms, ascending: a search of the whole structure. */
+	void GatherAllLoose(TArray<int32>& OutLoose) const;
+
+	/**
+	 * Brings the ground tiles in line with a rebuild: those still standing stay, any gone are let go, and every zone with
+	 * platforms but no ground tile takes the first of them in the list, the first laid there.
+	 */
+	void ReconcileGroundTiles();
 
 	/** Writes DeletionSummary. */
 	void UpdateDeletionSummary();
@@ -3001,6 +3048,15 @@ private:
 	 * placement may just have given it something to grow off. Returns whether it was judged.
 	 */
 	bool RefreshPlatformCandidate(int32 TileIndex, const FGridPlatform& Candidate, bool bMayHaveComeFree);
+
+	/** Drops one placement of the usable tile at TileIndex from its list, if it is listed, without judging it. */
+	void UnlistPlatformCandidate(int32 TileIndex, const FGridPlatform& Candidate);
+
+	/**
+	 * Whether a placement shares a module edge of rim with what stands. Once anything stands, only such a placement is
+	 * ever open, and this is far cheaper to ask than whether it is.
+	 */
+	bool MeetsStructure(const FGridPlatform& Placement) const;
 
 	/**
 	 * Draws one platform of a kind from the placement stream - a tile by weight, then one of its
@@ -3330,6 +3386,14 @@ private:
 	int32 ReshuffleRemovals = 0;
 	int32 ReshufflePlacements = 0;
 
+	/** The ground tiles, by platform key, each with its zone, and how many each zone has. Beat state, like health. */
+	TMap<uint64, int32> GroundTiles;
+	int32 GroundTileCounts[ZoneCount] = {};
+
+	/** Ground tiles passed on to another platform of their zone, and platforms taken away for losing their link, since the cube was cleared. */
+	int32 GroundTilesPassedOn = 0;
+	int32 CutLooseRemovals = 0;
+
 	/** The zones waiting for a first tile of their own, in order. */
 	TArray<int32> SeedQueue;
 
@@ -3467,6 +3531,9 @@ private:
 
 	/** Which zone is reshuffled, and which of its platforms move. */
 	FRandomStream ReshuffleStream;
+
+	/** Which platform a ground tile taken away is passed on to. */
+	FRandomStream GroundTileStream;
 
 	FTimerHandle NatureTimerHandle;
 

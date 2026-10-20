@@ -55,6 +55,113 @@ namespace DeletionTestsPrivate
 			return FRoomManagerTestAccess::IsVulnerable(Manager, Platform);
 		});
 	}
+
+	/** Whether a platform still stands. */
+	bool IsStanding(const ARoomManager& Manager, const FGridPlatform& Platform)
+	{
+		return FRoomManagerTestAccess::GetBuilt(Manager).ContainsByPredicate([&Platform](const FGridPlatform& Built)
+		{
+			return Built.MinNode == Platform.MinNode && Built.Normal == Platform.Normal;
+		});
+	}
+
+	/** The structure as a plain graph: every platform standing, the ones sharing a beam with each, and the ground tiles. */
+	struct FLinks
+	{
+		TArray<FGridPlatform> Built;
+		TArray<TArray<int32>> Linked;
+		TArray<int32> Ground;
+	};
+
+	FLinks GetLinks(const ARoomManager& Manager)
+	{
+		FLinks Links;
+		Links.Built = FRoomManagerTestAccess::GetBuilt(Manager);
+
+		for (int32 Index = 0; Index < Links.Built.Num(); ++Index)
+		{
+			Links.Linked.Add(FRoomManagerTestAccess::GetLinked(Manager, Index));
+
+			if (FRoomManagerTestAccess::IsGroundTile(Manager, Links.Built[Index]))
+			{
+				Links.Ground.Add(Index);
+			}
+		}
+
+		return Links;
+	}
+
+	/** What would be left with no link to Ground once Gone were taken away, worked out the plain way: all not reached from them. */
+	TSet<int32> GetUnreached(const FLinks& Links, const TArray<int32>& Ground, const TSet<int32>& Gone)
+	{
+		TArray<bool> bReached;
+		bReached.Init(false, Links.Built.Num());
+		TArray<int32> Frontier;
+
+		for (const int32 Index : Ground)
+		{
+			if (!Gone.Contains(Index) && !bReached[Index])
+			{
+				bReached[Index] = true;
+				Frontier.Add(Index);
+			}
+		}
+
+		for (int32 Next = 0; Next < Frontier.Num(); ++Next)
+		{
+			for (const int32 Index : Links.Linked[Frontier[Next]])
+			{
+				if (!Gone.Contains(Index) && !bReached[Index])
+				{
+					bReached[Index] = true;
+					Frontier.Add(Index);
+				}
+			}
+		}
+
+		TSet<int32> Unreached;
+
+		for (int32 Index = 0; Index < Links.Built.Num(); ++Index)
+		{
+			if (!bReached[Index] && !Gone.Contains(Index))
+			{
+				Unreached.Add(Index);
+			}
+		}
+
+		return Unreached;
+	}
+
+	/** The platform, not a ground tile, whose going would cut the most loose, and what it would cut. */
+	int32 FindWeakest(const FLinks& Links, TSet<int32>& OutCut)
+	{
+		int32 Weakest = INDEX_NONE;
+		OutCut.Reset();
+
+		for (int32 Index = 0; Index < Links.Built.Num(); ++Index)
+		{
+			if (Links.Ground.Contains(Index))
+			{
+				continue;
+			}
+
+			TSet<int32> Cut = GetUnreached(Links, Links.Ground, { Index });
+
+			if (Weakest == INDEX_NONE || Cut.Num() > OutCut.Num())
+			{
+				Weakest = Index;
+				OutCut = MoveTemp(Cut);
+			}
+		}
+
+		return Weakest;
+	}
+
+	/** How many of these still stand. */
+	int32 CountStanding(const ARoomManager& Manager, const FLinks& Links, const TSet<int32>& Indices)
+	{
+		return Algo::CountIf(Indices, [&](const int32 Index) { return IsStanding(Manager, Links.Built[Index]); });
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDeletionRemoveTest, "WEM.Deletion.Remove", WEMRoomManagerTests::TestFlags)
@@ -440,6 +547,254 @@ bool FDeletionReshuffleTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDeletionGroundTilesTest, "WEM.Deletion.GroundTiles", WEMRoomManagerTests::TestFlags)
+
+bool FDeletionGroundTilesTest::RunTest(const FString& Parameters)
+{
+	using namespace DeletionTestsPrivate;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+	Manager->GridSize = 129;
+	Manager->bSeedEveryZone = true;
+	Manager->bLinkToGroundTiles = true;
+	Manager->ClearPlatforms();
+
+	// The first tiles are the ground tiles, one a zone. Growth lays no more, since every zone has its own, and everything
+	// it lays links to one.
+	Grow(*Manager, 27);
+	TestEqual(TEXT("27 first tiles, all ground tiles"), FRoomManagerTestAccess::GetGroundTiles(*Manager).Num(), 27);
+
+	Grow(*Manager, 400);
+	TestEqual(TEXT("Growth lays no more"), FRoomManagerTestAccess::GetGroundTiles(*Manager).Num(), 27);
+	TestEqual(TEXT("Everything growth lays links to one"), FRoomManagerTestAccess::CountLoose(*Manager), 0);
+	TestEqual(TEXT("Agreeing with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	FRoomManagerTestAccess::EnsureCandidates(*Manager);
+
+	// Taking away the platform that most hangs on cuts loose exactly what linked through it alone, as worked out the plain
+	// way from the beams shared, all in the one removal.
+	{
+		const FLinks Links = GetLinks(*Manager);
+		TSet<int32> Cut;
+		const int32 Weakest = FindWeakest(Links, Cut);
+		const int32 Before = Manager->GetPlatformCount();
+		AddInfo(FString::Printf(TEXT("%d platforms; taking away the weakest cuts %d loose."), Before, Cut.Num()));
+
+		if (!TestTrue(TEXT("Something hangs on one platform alone"), Weakest != INDEX_NONE && Cut.Num() > 0))
+		{
+			ReleaseRooted(Rooted);
+			return false;
+		}
+
+		FRoomManagerTestAccess::Remove(*Manager, { Links.Built[Weakest] });
+
+		TestEqual(TEXT("It and all that hung on it go at once"), Manager->GetPlatformCount(), Before - 1 - Cut.Num());
+		TestEqual(TEXT("Exactly what hung on it"), CountStanding(*Manager, Links, Cut), 0);
+		TestEqual(TEXT("Counted as cut loose"), FRoomManagerTestAccess::GetCutLoose(*Manager), Cut.Num());
+		TestEqual(TEXT("Everything left links"), FRoomManagerTestAccess::CountLoose(*Manager), 0);
+		TestFalse(TEXT("The lists are kept"), FRoomManagerTestAccess::IsStale(*Manager));
+		TestEqual(TEXT("And agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+	}
+
+	// A platform left with nothing around it - every one it shared a beam with taken away - goes at once.
+	{
+		const FLinks Links = GetLinks(*Manager);
+		int32 Lonely = INDEX_NONE;
+
+		for (int32 Index = 0; Index < Links.Built.Num() && Lonely == INDEX_NONE; ++Index)
+		{
+			const bool bNextToGround = Links.Linked[Index].ContainsByPredicate([&Links](const int32 Linked) { return Links.Ground.Contains(Linked); });
+			Lonely = !Links.Ground.Contains(Index) && Links.Linked[Index].Num() >= 2 && !bNextToGround ? Index : INDEX_NONE;
+		}
+
+		if (TestTrue(TEXT("A platform with two or more around it, none a ground tile"), Lonely != INDEX_NONE))
+		{
+			TArray<FGridPlatform> Around;
+
+			for (const int32 Linked : Links.Linked[Lonely])
+			{
+				Around.Add(Links.Built[Linked]);
+			}
+
+			FRoomManagerTestAccess::Remove(*Manager, Around);
+			TestFalse(TEXT("A platform with nothing left to link through goes at once"), IsStanding(*Manager, Links.Built[Lonely]));
+			TestEqual(TEXT("Everything left links"), FRoomManagerTestAccess::CountLoose(*Manager), 0);
+		}
+	}
+
+	// A ground tile taken away is passed on to another platform of its zone, and what links neither to that one nor to any
+	// other ground tile goes.
+	{
+		const FLinks Links = GetLinks(*Manager);
+		int32 Ground = INDEX_NONE;
+		int32 Zone = INDEX_NONE;
+
+		for (const int32 Index : Links.Ground)
+		{
+			const int32 ItsZone = FRoomManagerTestAccess::GetZoneOf(*Manager, Links.Built[Index]);
+			const int32 InZone = Algo::CountIf(Links.Built, [&](const FGridPlatform& Platform) { return FRoomManagerTestAccess::GetZoneOf(*Manager, Platform) == ItsZone; });
+
+			if (InZone >= 8)
+			{
+				Ground = Index;
+				Zone = ItsZone;
+				break;
+			}
+		}
+
+		if (!TestTrue(TEXT("A ground tile with company in its zone"), Ground != INDEX_NONE))
+		{
+			ReleaseRooted(Rooted);
+			return false;
+		}
+
+		const int32 Before = Manager->GetPlatformCount();
+		const int32 PassedBefore = FRoomManagerTestAccess::GetGroundTilesPassedOn(*Manager);
+		FRoomManagerTestAccess::Remove(*Manager, { Links.Built[Ground] });
+
+		const TArray<FGridPlatform> ZoneGround = FRoomManagerTestAccess::GetGroundTiles(*Manager).FilterByPredicate([&](const FGridPlatform& Platform)
+		{
+			return FRoomManagerTestAccess::GetZoneOf(*Manager, Platform) == Zone;
+		});
+
+		TestEqual(TEXT("Passed on"), FRoomManagerTestAccess::GetGroundTilesPassedOn(*Manager) - PassedBefore, 1);
+		TestEqual(TEXT("Its zone has one again"), ZoneGround.Num(), 1);
+
+		if (ZoneGround.Num() == 1)
+		{
+			const int32 Heir = Links.Built.IndexOfByPredicate([&](const FGridPlatform& Platform)
+			{
+				return Platform.MinNode == ZoneGround[0].MinNode && Platform.Normal == ZoneGround[0].Normal;
+			});
+
+			TArray<int32> Grounds = Links.Ground;
+			Grounds.Remove(Ground);
+			Grounds.Add(Heir);
+
+			const TSet<int32> Cut = GetUnreached(Links, Grounds, { Ground });
+			AddInfo(FString::Printf(TEXT("Zone %d's ground tile passed on to the %d-th platform; %d cut loose."), Zone, Heir, Cut.Num()));
+			TestTrue(TEXT("To another platform that stood in its zone"), Heir != INDEX_NONE && Heir != Ground);
+			TestEqual(TEXT("What links to no ground tile goes, and only that"), Manager->GetPlatformCount(), Before - 1 - Cut.Num());
+			TestEqual(TEXT("All of it"), CountStanding(*Manager, Links, Cut), 0);
+		}
+
+		TestEqual(TEXT("Everything left links"), FRoomManagerTestAccess::CountLoose(*Manager), 0);
+		TestEqual(TEXT("And agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+	}
+
+	// Worn down at random, ground tiles among the rest, with growth going on: nothing is ever left standing unlinked, and
+	// no zone with platforms is ever without a ground tile.
+	FRandomStream Stream(31);
+	int32 Unlinked = 0;
+	int32 ZonesWithout = 0;
+
+	for (int32 Round = 0; Round < 8; ++Round)
+	{
+		RemoveAtRandom(*Manager, Stream, 12, Round % 2 == 0 ? 1 : 4);
+		Grow(*Manager, 40);
+		Unlinked += FRoomManagerTestAccess::CountLoose(*Manager);
+
+		for (int32 Zone = 0; Zone < 27; ++Zone)
+		{
+			const bool bHasPlatforms = FRoomManagerTestAccess::GetBuilt(*Manager).ContainsByPredicate([&](const FGridPlatform& Platform)
+			{
+				return FRoomManagerTestAccess::GetZoneOf(*Manager, Platform) == Zone;
+			});
+
+			ZonesWithout += bHasPlatforms && FRoomManagerTestAccess::GetGroundTileCount(*Manager, Zone) == 0 ? 1 : 0;
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("Worn at random: %d platforms. %s"), Manager->GetPlatformCount(), *Manager->DeletionSummary));
+	TestEqual(TEXT("Nothing ever stands unlinked"), Unlinked, 0);
+	TestEqual(TEXT("No zone with platforms goes without a ground tile"), ZonesWithout, 0);
+	TestEqual(TEXT("And it all agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// A zone emptied has no ground tile until growth reaches it again, and the first platform laid there is its ground tile.
+	{
+		constexpr int32 Zone = 13;
+		const TArray<FGridPlatform> InZone = FRoomManagerTestAccess::GetBuilt(*Manager).FilterByPredicate([&](const FGridPlatform& Platform)
+		{
+			return FRoomManagerTestAccess::GetZoneOf(*Manager, Platform) == Zone;
+		});
+
+		FRoomManagerTestAccess::Remove(*Manager, InZone);
+		TestEqual(TEXT("An emptied zone has no ground tile"), FRoomManagerTestAccess::GetGroundTileCount(*Manager, Zone), 0);
+
+		auto FindFirstInZone = [&]() -> const FGridPlatform*
+		{
+			return Manager->Platforms.FindByPredicate([&](const FGridPlatform& Platform) { return FRoomManagerTestAccess::GetZoneOf(*Manager, Platform) == Zone; });
+		};
+
+		int32 Beats = 0;
+
+		while (!FindFirstInZone() && Beats < 2000 && Manager->PlaceNextPlatform())
+		{
+			++Beats;
+		}
+
+		const FGridPlatform* First = FindFirstInZone();
+		AddInfo(FString::Printf(TEXT("Growth reached the emptied zone after %d beats."), Beats));
+		TestTrue(TEXT("Growth reaches it again"), First != nullptr);
+		TestTrue(TEXT("And the first laid there is its ground tile"), First && FRoomManagerTestAccess::IsGroundTile(*Manager, *First));
+		TestEqual(TEXT("Its only one"), FRoomManagerTestAccess::GetGroundTileCount(*Manager, Zone), 1);
+	}
+
+	// Strikes cut loose too: every platform hit dies, and what hung on it goes with it, on the clock's few at a time.
+	{
+		Manager->StrikeFraction = 0.2f;
+		Manager->MinDamage = 1000.0f;
+		Manager->MaxDamage = 1000.0f;
+
+		const int32 CutBefore = FRoomManagerTestAccess::GetCutLoose(*Manager);
+		FRoomManagerTestAccess::Strike(*Manager);
+
+		int32 Ticks = 0;
+
+		while (FRoomManagerTestAccess::GetDyingCount(*Manager) > 0)
+		{
+			FRoomManagerTestAccess::RemoveDying(*Manager, 4);
+			Unlinked += FRoomManagerTestAccess::CountLoose(*Manager);
+			++Ticks;
+		}
+
+		AddInfo(FString::Printf(TEXT("A strike killing a fifth: %d ticks, %d cut loose with them; %d platforms left."),
+			Ticks, FRoomManagerTestAccess::GetCutLoose(*Manager) - CutBefore, Manager->GetPlatformCount()));
+		TestEqual(TEXT("Nothing stands unlinked after any tick"), Unlinked, 0);
+		TestEqual(TEXT("And it agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+	}
+
+	// Off, a platform taken away takes nothing with it, and what hung on it stands unlinked.
+	{
+		Manager->bLinkToGroundTiles = false;
+		Grow(*Manager, 200);
+
+		const FLinks Links = GetLinks(*Manager);
+		TSet<int32> Cut;
+		const int32 Weakest = FindWeakest(Links, Cut);
+		const int32 Before = Manager->GetPlatformCount();
+		AddInfo(FString::Printf(TEXT("Off: taking away the weakest of %d would cut %d loose."), Before, Cut.Num()));
+		TestTrue(TEXT("Something hangs on one platform alone"), Weakest != INDEX_NONE && Cut.Num() > 0);
+		FRoomManagerTestAccess::Remove(*Manager, { Links.Built[FMath::Max(Weakest, 0)] });
+
+		TestEqual(TEXT("Off, only the platform taken away goes"), Manager->GetPlatformCount(), Before - 1);
+		TestEqual(TEXT("And what hung on it stands unlinked"), FRoomManagerTestAccess::CountLoose(*Manager), Cut.Num());
+	}
+
+	// Every seed is a ground tile: three a zone, three ground tiles a zone.
+	Manager->bLinkToGroundTiles = true;
+	Manager->SeedsPerZone = 3;
+	Manager->ClearPlatforms();
+	Grow(*Manager, 81);
+	TestEqual(TEXT("Three seeds a zone, 81 ground tiles"), FRoomManagerTestAccess::GetGroundTiles(*Manager).Num(), 81);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDeletionPocketsTest, "WEM.Deletion.Pockets", WEMRoomManagerTests::TestFlags)
 
 bool FDeletionPocketsTest::RunTest(const FString& Parameters)
@@ -636,6 +991,7 @@ bool FDeletionPerfTest::RunTest(const FString& Parameters)
 	Manager->bSeedEveryZone = true;
 	Manager->AirPocketCount = 6;
 	Manager->MoldCount = 2;
+	Manager->bLinkToGroundTiles = true;
 	Manager->ClearPlatforms();
 
 	while (Manager->GetPlatformCount() < 3000 && Manager->PlaceNextPlatform())
@@ -663,13 +1019,27 @@ bool FDeletionPerfTest::RunTest(const FString& Parameters)
 		}
 	};
 
-	FTimes Beats, Strikes, Removals, Reshuffles, Moves;
+	FTimes Beats, Strikes, Removals, CuttingRemovals, Reshuffles, Moves;
+	int32 MostCut = 0;
 
 	auto Time = [](FTimes& Times, TFunctionRef<void()> Work)
 	{
 		const double Start = FPlatformTime::Seconds();
 		Work();
 		Times.Add(FPlatformTime::Seconds() - Start);
+	};
+
+	// A removal tick, kept apart by whether it cut anything loose from the ground tiles.
+	auto TimeRemoval = [&]()
+	{
+		const int32 CutBefore = FRoomManagerTestAccess::GetCutLoose(*Manager);
+		const double Start = FPlatformTime::Seconds();
+		FRoomManagerTestAccess::RemoveDying(*Manager, 4);
+		const double Seconds = FPlatformTime::Seconds() - Start;
+		const int32 Cut = FRoomManagerTestAccess::GetCutLoose(*Manager) - CutBefore;
+
+		(Cut > 0 ? CuttingRemovals : Removals).Add(Seconds);
+		MostCut = FMath::Max(MostCut, Cut);
 	};
 
 	// About 60 beats a second, as NewMap's 0.0107 s beat comes out at 60 frames a second, a clock tick every three
@@ -680,7 +1050,7 @@ bool FDeletionPerfTest::RunTest(const FString& Parameters)
 
 		if (Beat % 3 == 0 && FRoomManagerTestAccess::GetDyingCount(*Manager) > 0)
 		{
-			Time(Removals, [&] { FRoomManagerTestAccess::RemoveDying(*Manager, 4); });
+			TimeRemoval();
 		}
 
 		if (Beat % 120 == 60)
@@ -720,6 +1090,32 @@ bool FDeletionPerfTest::RunTest(const FString& Parameters)
 	AddInfo(FString::Printf(TEXT("%d platforms standing. %s"), Manager->GetPlatformCount(), *Manager->DeletionSummary));
 	AddInfo(FString::Printf(TEXT("Beats: %s. Strikes: %s. Removal ticks (4 at most): %s. Reshuffle steps: %s. Pocket move steps (a slab each): %s."),
 		*Beats.Describe(), *Strikes.Describe(), *Removals.Describe(), *Reshuffles.Describe(), *Moves.Describe()));
+
+	// 40 seconds kill too few to cut much loose. A strike that kills one in twenty, taken away as the clock takes them -
+	// 4 a tick, three beats of growth between ticks - shows what cutting loose costs at a high rate of deaths.
+	Manager->StrikeFraction = 0.05f;
+	Manager->MinDamage = 1000.0f;
+	Manager->MaxDamage = 1000.0f;
+
+	const int32 BeforeHeavy = Manager->GetPlatformCount();
+	const int32 CutBeforeHeavy = FRoomManagerTestAccess::GetCutLoose(*Manager);
+	FRoomManagerTestAccess::Strike(*Manager);
+	const int32 Killed = FRoomManagerTestAccess::GetDyingCount(*Manager);
+
+	while (FRoomManagerTestAccess::GetDyingCount(*Manager) > 0)
+	{
+		TimeRemoval();
+
+		for (int32 Beat = 0; Beat < 3; ++Beat)
+		{
+			Time(Beats, [&] { Manager->PlaceNextPlatform(); });
+		}
+	}
+
+	AddInfo(FString::Printf(TEXT("A strike killing %d of %d: %d more cut loose with them, %d at most in one tick. Removal ticks cutting nothing: %s. Ticks cutting some loose: %s."),
+		Killed, BeforeHeavy, FRoomManagerTestAccess::GetCutLoose(*Manager) - CutBeforeHeavy, MostCut, *Removals.Describe(), *CuttingRemovals.Describe()));
+	TestEqual(TEXT("Nothing is left standing unlinked"), FRoomManagerTestAccess::CountLoose(*Manager), 0);
+	TestFalse(TEXT("Nor are the lists left to be gathered afresh"), FRoomManagerTestAccess::IsStale(*Manager));
 
 	ReleaseRooted(Rooted);
 	return true;

@@ -1589,6 +1589,62 @@ bool ARoomManager::RefreshPlatformCandidate(
 	return true;
 }
 
+void ARoomManager::UnlistPlatformCandidate(const int32 TileIndex, const FGridPlatform& Candidate)
+{
+	TArray<FGridPlatform>& Candidates = TileCandidates[TileIndex].ByKind[KindIndex(Candidate.GetKind())];
+
+	const uint64 Key = MakeCandidateKey(Candidate);
+	const int32 Index = Algo::LowerBoundBy(Candidates, Key, [](const FGridPlatform& Listed)
+	{
+		return MakeCandidateKey(Listed);
+	});
+
+	if (Candidates.IsValidIndex(Index) && MakeCandidateKey(Candidates[Index]) == Key)
+	{
+		Candidates.RemoveAt(Index);
+	}
+}
+
+bool ARoomManager::MeetsStructure(const FGridPlatform& Placement) const
+{
+	int32 SpanU, SpanV;
+
+	if (!GetPlatformSpans(Placement, SpanU, SpanV))
+	{
+		return false;
+	}
+
+	const int32 Module = GetModule();
+
+	int32 U, V;
+	GetInPlaneAxes(AxisIndex(Placement.Normal), U, V);
+
+	// Round its rim alone, and only until something is met there: its two sides running along U, then its two along V.
+	for (const int32 StepV : { 0, SpanV })
+	{
+		for (int32 StepU = 0; StepU < SpanU; StepU += Module)
+		{
+			if (ModuleEdgeUses.Contains(MakeEdgeKey(FLatticeEdge{ Placement.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), U })))
+			{
+				return true;
+			}
+		}
+	}
+
+	for (const int32 StepU : { 0, SpanU })
+	{
+		for (int32 StepV = 0; StepV < SpanV; StepV += Module)
+		{
+			if (ModuleEdgeUses.Contains(MakeEdgeKey(FLatticeEdge{ Placement.MinNode + AxisStep(U, StepU) + AxisStep(V, StepV), V })))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
 bool ARoomManager::PlacePlatformOfKind(const EPlatformKind Kind, const TFunction<bool(const FGridPlatform&)>* Filter)
 {
 	FGridPlatform Platform;
@@ -1830,6 +1886,14 @@ void ARoomManager::PlacePlatform(const FGridPlatform& Platform, const int32 Join
 
 	TArray<FGridSurfaceRef> ChangedSurfaces;
 	AddPlacedPlatform(Platform, ChangedSurfaces);
+
+	// The first laid in a zone with no ground tile is its ground tile: the middle zone's very first, a seed, or the first
+	// to reach a zone whose ground tiles have all gone.
+	if (GroundTileCounts[GetZoneOf(Platform)] == 0 && MakeGroundTile(Platform) && bShowZones)
+	{
+		RebuildDebugGrid();
+	}
+
 	UpdateDebugReadouts();
 	UpdateVisualsAfterPlacement(Platform, ChangedSurfaces);
 
@@ -2614,6 +2678,12 @@ void ARoomManager::ClearPlatforms()
 	SeedPhase.Reset();
 	QueueSeeds();
 
+	// Nor has any zone a ground tile.
+	GroundTiles.Reset();
+	FMemory::Memzero(GroundTileCounts);
+	GroundTilesPassedOn = 0;
+	CutLooseRemovals = 0;
+
 	ResetPlacementStream();
 	BeginNewGeneration();
 
@@ -2648,6 +2718,7 @@ void ARoomManager::ResetPlacementStream()
 	DamageStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Damage"))))));
 	SeedStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Seeds"))))));
 	ReshuffleStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("Reshuffle"))))));
+	GroundTileStream.Initialize(static_cast<int32>(HashCombineFast(GetTypeHash(Seed), GetTypeHash(FStringView(TEXT("GroundTiles"))))));
 }
 
 void ARoomManager::AdvancePlacement()
@@ -6438,25 +6509,6 @@ void ARoomManager::RefreshCandidatesOnPathPieces(
 	// full, which is most of them, since paths run mostly through open air. The empty cube has its own rule.
 	const bool bPassOverLoose = bMayHaveComeFree && !BuiltPlatforms.IsEmpty();
 
-	auto MeetsStructure = [&](const FGridPlatform& Candidate)
-	{
-		int32 SpanU, SpanV;
-
-		if (!GetPlatformSpans(Candidate, SpanU, SpanV))
-		{
-			return false;
-		}
-
-		bool bMeets = false;
-
-		ForEachModuleEdge(Candidate, SpanU, SpanV, Module, [&](const FLatticeEdge& Edge, const bool bRim)
-		{
-			bMeets = bMeets || (bRim && ModuleEdgeUses.Contains(MakeEdgeKey(Edge)));
-		});
-
-		return bMeets;
-	};
-
 	auto Refresh = [&](const int32 TileIndex, const FGridPlatform& Candidate)
 	{
 		bool bAlreadyJudged = false;
@@ -7545,6 +7597,8 @@ void ARoomManager::RebuildPlatformState()
 		}
 	}
 
+	// The ground tiles are kept by key, like health, and a zone left without one takes its first.
+	ReconcileGroundTiles();
 	UpdateZoneSummary();
 
 	// This runs on every edit and every check, so the warning is only given when what it would
@@ -8118,6 +8172,15 @@ void ARoomManager::VerifyIncrementalState()
 	const int32 IncrementalStructureRevision = StructureRevision;
 	const TArray<FAirBox> IncrementalAirBoxes = AirBoxes;
 	const bool bHadRemovals = bHasRemovals;
+	const TMap<uint64, int32> IncrementalGroundTiles = GroundTiles;
+
+	// Every platform links to a ground tile, when it has to.
+	TArray<int32> Loose;
+
+	if (bLinkToGroundTiles)
+	{
+		GatherAllLoose(Loose);
+	}
 
 	// The record of changed surfaces belongs with the revision, and goes back with it below.
 	TArray<FGridSurfaceRef> IncrementalJournal = MoveTemp(SurfaceJournal);
@@ -8275,6 +8338,17 @@ void ARoomManager::VerifyIncrementalState()
 	if (RedrawnMarks > 0)
 	{
 		Mismatches.Add(FString::Printf(TEXT("overlay: %d squares missing or the wrong colour"), RedrawnMarks));
+	}
+
+	// The rebuild keeps every ground tile and adds none: no zone with platforms is ever left without one.
+	if (!GroundTiles.OrderIndependentCompareEqual(IncrementalGroundTiles))
+	{
+		Mismatches.Add(FString::Printf(TEXT("ground tiles: %d kept, %d rebuilt"), IncrementalGroundTiles.Num(), GroundTiles.Num()));
+	}
+
+	if (!Loose.IsEmpty())
+	{
+		Mismatches.Add(FString::Printf(TEXT("%d platform(s) with no link to a ground tile"), Loose.Num()));
 	}
 
 	++VerifiedPlacements;
@@ -10291,6 +10365,23 @@ void ARoomManager::AppendZoneLines(TArray<FBatchedLine>& Lines) const
 			Lines.Emplace(FVector(Max.X, Min.Y, Z), FVector(Min.X, Max.Y, Z), Color, /*LifeTime=*/0.0f, BoundaryLineThickness, SDPG_World);
 		}
 	}
+
+	// Each ground tile as a crossed box in its zone's colour, a cell out all round, so it reads over its own beams.
+	for (const TPair<uint64, int32>& Ground : GroundTiles)
+	{
+		const int32* Index = ModuleFaceOwners.Find(Ground.Key);
+
+		if (!Index)
+		{
+			continue;
+		}
+
+		const FAirBox Box = GetPlatformBox(BuiltPlatforms[*Index]);
+		const FLinearColor Color(ZoneColors.IsValidIndex(Ground.Value) ? ZoneColors[Ground.Value] : GetDefaultZoneColor(Ground.Value, ZonesPerSide * ZonesPerSide));
+
+		AppendBoxLines(Lines, GetCellMinCorner(Box.Min) - FVector(CellSize), GetCellMinCorner(Box.Max) + FVector(2.0 * CellSize),
+			Color, 2.0f * BoundaryLineThickness, SDPG_World, /*bWithDiagonals=*/true);
+	}
 }
 
 void ARoomManager::UpdateZoneSummary()
@@ -10433,6 +10524,13 @@ bool ARoomManager::PlaceSeed(const int32 Zone)
 		}
 
 		PlacePlatform(Seed, /*JoinedSide=*/0);
+
+		// Every seed is a ground tile, a zone's second and third as much as its first.
+		if (MakeGroundTile(Seed) && bShowZones)
+		{
+			RebuildDebugGrid();
+		}
+
 		QueueGroundSpill(Seed);
 		return true;
 	}
@@ -10687,8 +10785,279 @@ void ARoomManager::AdvanceDeletion(const double Now)
 
 void ARoomManager::UpdateDeletionSummary()
 {
-	DeletionSummary = FString::Printf(TEXT("%d strikes, %d hits (%d vulnerable), %d taken away, %d waiting; %d reshuffles, %d taken away and %d laid; %d pocket moves"),
-		StrikeCount, HitCount, VulnerableHitCount, DamageRemovals, DyingQueue.Num(), ReshuffleCount, ReshuffleRemovals, ReshufflePlacements, PocketMoves);
+	DeletionSummary = FString::Printf(TEXT("%d strikes, %d hits (%d vulnerable), %d taken away, %d waiting; %d reshuffles, %d taken away and %d laid; %d pocket moves; %d ground tiles, %d passed on, %d cut loose"),
+		StrikeCount, HitCount, VulnerableHitCount, DamageRemovals, DyingQueue.Num(), ReshuffleCount, ReshuffleRemovals, ReshufflePlacements, PocketMoves,
+		GroundTiles.Num(), GroundTilesPassedOn, CutLooseRemovals);
+}
+
+bool ARoomManager::MakeGroundTile(const FGridPlatform& Platform)
+{
+	const uint64 Key = MakePlatformKey(Platform);
+
+	if (GroundTiles.Contains(Key))
+	{
+		return false;
+	}
+
+	const int32 Zone = GetZoneOf(Platform);
+	GroundTiles.Add(Key, Zone);
+	++GroundTileCounts[Zone];
+	return true;
+}
+
+bool ARoomManager::PassOnGroundTiles(const TSet<uint64>& RemovedKeys)
+{
+	// The zone of each ground tile going, in zone order, so the draws come out the same whatever order they were named in.
+	TArray<int32> Zones;
+
+	for (const uint64 Key : RemovedKeys)
+	{
+		if (const int32* Zone = GroundTiles.Find(Key))
+		{
+			Zones.Add(*Zone);
+			--GroundTileCounts[*Zone];
+			GroundTiles.Remove(Key);
+		}
+	}
+
+	if (Zones.IsEmpty())
+	{
+		return false;
+	}
+
+	Zones.Sort();
+
+	for (const int32 Zone : Zones)
+	{
+		// Among the platforms staying in its zone, in list order, any but the ground tiles it has already. A zone with none
+		// left goes without, until the next platform laid in it.
+		TArray<int32> Pool;
+
+		for (int32 Index = 0; Index < BuiltPlatforms.Num(); ++Index)
+		{
+			const uint64 Key = MakePlatformKey(BuiltPlatforms[Index]);
+
+			if (!RemovedKeys.Contains(Key) && !GroundTiles.Contains(Key) && GetZoneOf(BuiltPlatforms[Index]) == Zone)
+			{
+				Pool.Add(Index);
+			}
+		}
+
+		if (!Pool.IsEmpty())
+		{
+			MakeGroundTile(BuiltPlatforms[Pool[GroundTileStream.RandRange(0, Pool.Num() - 1)]]);
+			++GroundTilesPassedOn;
+		}
+	}
+
+	return true;
+}
+
+void ARoomManager::GatherCutLoose(const TConstArrayView<FGridPlatform> Removed, TArray<FGridPlatform>& OutLoose) const
+{
+	OutLoose.Reset();
+
+	// With no ground tile at all there is nothing to link to, and nothing is cut from it: a cube emptied of them is
+	// empty, since a zone with platforms always has one.
+	if (GroundTiles.IsEmpty() || BuiltPlatforms.IsEmpty())
+	{
+		return;
+	}
+
+	// Where each ground tile's middle lies, doubled so it stays whole, for the search to head for.
+	auto GetTwiceMiddle = [this](const FGridPlatform& Platform)
+	{
+		const FAirBox Box = GetPlatformBox(Platform);
+		return Box.Min + Box.Max;
+	};
+
+	TArray<FIntVector> GroundMiddles;
+	GroundMiddles.Reserve(GroundTiles.Num());
+
+	for (const TPair<uint64, int32>& Ground : GroundTiles)
+	{
+		if (const int32* Index = ModuleFaceOwners.Find(Ground.Key))
+		{
+			GroundMiddles.Add(GetTwiceMiddle(BuiltPlatforms[*Index]));
+		}
+	}
+
+	auto GetDistance = [&](const int32 Index)
+	{
+		const FIntVector Middle = GetTwiceMiddle(BuiltPlatforms[Index]);
+		int32 Nearest = MAX_int32;
+
+		for (const FIntVector& Ground : GroundMiddles)
+		{
+			const FIntVector Step = Ground - Middle;
+			Nearest = FMath::Min(Nearest, FMath::Abs(Step.X) + FMath::Abs(Step.Y) + FMath::Abs(Step.Z));
+		}
+
+		return Nearest;
+	};
+
+	auto IsGroundTile = [this](const int32 Index)
+	{
+		return GroundTiles.Contains(MakePlatformKey(BuiltPlatforms[Index]));
+	};
+
+	// Only what touched a platform taken away can have lost its link: everything else still links the way it did.
+	TArray<int32> Starts;
+	TArray<int32, TInlineAllocator<8>> Touching;
+
+	for (const FGridPlatform& Platform : Removed)
+	{
+		GatherTouchingPlatforms(Platform, Touching);
+
+		for (const int32 Index : Touching)
+		{
+			Starts.AddUnique(Index);
+		}
+	}
+
+	Starts.Sort();
+
+	// Each searches out through the beams it shares, nearest a ground tile first, until it meets one, or one already found
+	// to link: then everything it came across links too, being joined to it. A search that runs out has been through the
+	// whole piece it is in, and found no ground tile in it.
+	TSet<int32> Linked;
+	TSet<int32> Loose;
+
+	using FStep = TPair<int32, int32>;
+	auto Nearer = [](const FStep& First, const FStep& Second)
+	{
+		return First.Key != Second.Key ? First.Key < Second.Key : First.Value < Second.Value;
+	};
+
+	for (const int32 Start : Starts)
+	{
+		if (Linked.Contains(Start) || Loose.Contains(Start))
+		{
+			continue;
+		}
+
+		TSet<int32> Seen;
+		TArray<int32> Reached;
+		TArray<FStep> Frontier;
+		bool bLinks = IsGroundTile(Start);
+
+		Seen.Add(Start);
+		Reached.Add(Start);
+		Frontier.HeapPush(FStep(GetDistance(Start), Start), Nearer);
+
+		while (!bLinks && !Frontier.IsEmpty())
+		{
+			FStep Next;
+			Frontier.HeapPop(Next, Nearer, EAllowShrinking::No);
+
+			GatherTouchingPlatforms(BuiltPlatforms[Next.Value], Touching);
+
+			for (const int32 Index : Touching)
+			{
+				bool bAlreadySeen = false;
+				Seen.Add(Index, &bAlreadySeen);
+
+				if (bAlreadySeen)
+				{
+					continue;
+				}
+
+				Reached.Add(Index);
+
+				if (Linked.Contains(Index) || IsGroundTile(Index))
+				{
+					bLinks = true;
+					break;
+				}
+
+				Frontier.HeapPush(FStep(GetDistance(Index), Index), Nearer);
+			}
+		}
+
+		(bLinks ? Linked : Loose).Append(Reached);
+	}
+
+	// In list order, as they stand.
+	TArray<int32> LooseIndices = Loose.Array();
+	LooseIndices.Sort();
+	OutLoose.Reserve(LooseIndices.Num());
+
+	for (const int32 Index : LooseIndices)
+	{
+		OutLoose.Add(BuiltPlatforms[Index]);
+	}
+}
+
+void ARoomManager::GatherAllLoose(TArray<int32>& OutLoose) const
+{
+	OutLoose.Reset();
+
+	// Out from every ground tile at once, through the beams shared; whatever is never reached has no link.
+	TArray<bool> bReached;
+	bReached.Init(false, BuiltPlatforms.Num());
+
+	TArray<int32> Frontier;
+
+	for (const TPair<uint64, int32>& Ground : GroundTiles)
+	{
+		if (const int32* Index = ModuleFaceOwners.Find(Ground.Key); Index && !bReached[*Index])
+		{
+			bReached[*Index] = true;
+			Frontier.Add(*Index);
+		}
+	}
+
+	TArray<int32, TInlineAllocator<8>> Touching;
+
+	for (int32 Next = 0; Next < Frontier.Num(); ++Next)
+	{
+		GatherTouchingPlatforms(BuiltPlatforms[Frontier[Next]], Touching);
+
+		for (const int32 Index : Touching)
+		{
+			if (!bReached[Index])
+			{
+				bReached[Index] = true;
+				Frontier.Add(Index);
+			}
+		}
+	}
+
+	for (int32 Index = 0; Index < BuiltPlatforms.Num(); ++Index)
+	{
+		if (!bReached[Index])
+		{
+			OutLoose.Add(Index);
+		}
+	}
+}
+
+void ARoomManager::ReconcileGroundTiles()
+{
+	FMemory::Memzero(GroundTileCounts);
+
+	// The zones are worked out again, since the cube they lie in may have changed.
+	for (auto Ground = GroundTiles.CreateIterator(); Ground; ++Ground)
+	{
+		const int32* Index = ModuleFaceOwners.Find(Ground.Key());
+
+		if (!Index || MakePlatformKey(BuiltPlatforms[*Index]) != Ground.Key())
+		{
+			Ground.RemoveCurrent();
+			continue;
+		}
+
+		Ground.Value() = GetZoneOf(BuiltPlatforms[*Index]);
+		++GroundTileCounts[Ground.Value()];
+	}
+
+	for (const FGridPlatform& Platform : BuiltPlatforms)
+	{
+		if (GroundTileCounts[GetZoneOf(Platform)] == 0)
+		{
+			MakeGroundTile(Platform);
+		}
+	}
 }
 
 void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
@@ -10724,6 +11093,10 @@ void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
 	{
 		return RemovedKeys.Contains(MakePlatformKey(Platform));
 	};
+
+	// A ground tile going is passed on to another platform of its zone while they all still stand, so the draw sees the zone
+	// as it is.
+	const bool bGroundTilesChanged = PassOnGroundTiles(RemovedKeys);
 
 	// The list first, which is what is saved, then whatever waited on them: a fence's, a cliff's or a wall run's end on a panel, a piece of
 	// a field or of a patch of ground, a platform's health and its place in the queue to go.
@@ -10788,6 +11161,25 @@ void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
 		RebuildAirLines();
 	}
 
+	if (bGroundTilesChanged && bShowZones)
+	{
+		RebuildDebugGrid();
+	}
+
+	// Whatever hung on them alone goes with them, at once: every platform left with no link to a ground tile. It was all
+	// one piece with nothing else touching it, so taking it away cuts nothing more loose.
+	if (bLinkToGroundTiles)
+	{
+		TArray<FGridPlatform> Loose;
+		GatherCutLoose(Standing, Loose);
+
+		if (!Loose.IsEmpty())
+		{
+			CutLooseRemovals += Loose.Num();
+			RemovePlatforms(Loose);
+		}
+	}
+
 	// With every platform gone, growth starts over: the middle zone's first tile, then every other zone's.
 	if (BuiltPlatforms.IsEmpty())
 	{
@@ -10795,6 +11187,7 @@ void ARoomManager::RemovePlatforms(const TConstArrayView<FGridPlatform> Removed)
 	}
 
 	UpdateDebugReadouts();
+	UpdateDeletionSummary();
 
 	const int32 VerifyEvery = CVarRoomManagerVerifyEvery.GetValueOnGameThread();
 
@@ -11278,18 +11671,35 @@ void ARoomManager::RefreshCandidatesAfterRemoval(const TConstArrayView<FGridPlat
 
 	const int32 Module = GetModule();
 
+	// A few hundred placements are judged round each platform taken away, so the sets are sized for them up front.
 	TArray<TSet<uint64>> Judged;
 	Judged.SetNum(TileCandidates.Num());
+
+	for (TSet<uint64>& TileJudged : Judged)
+	{
+		TileJudged.Reserve(Removed.Num() * 256);
+	}
 
 	auto Judge = [&](const int32 TileIndex, const FGridPlatform& Candidate, bool)
 	{
 		bool bAlreadyJudged = false;
 		Judged[TileIndex].Add(MakeCandidateKey(Candidate), &bAlreadyJudged);
 
-		// Room has come free, so a placement not listed is judged as well as every listed one.
-		if (!bAlreadyJudged)
+		if (bAlreadyJudged)
+		{
+			return;
+		}
+
+		// Room has come free, so a placement not listed is judged as well as every listed one. But only one meeting what
+		// stands along its rim is ever open, and round platforms taken away many meet nothing any more - all of them round
+		// a piece cut loose. Those are let go from the lists, or left out, without being judged in full.
+		if (MeetsStructure(Candidate))
 		{
 			RefreshPlatformCandidate(TileIndex, Candidate, /*bMayHaveComeFree=*/true);
+		}
+		else
+		{
+			UnlistPlatformCandidate(TileIndex, Candidate);
 		}
 	};
 
