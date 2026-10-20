@@ -621,26 +621,46 @@ void UHoverDroneMovementComponent::TickComponent(float DeltaTime, enum ELevelTic
 
 			FRotator RotDelta = RotVelocity * DeltaTime;
 
-			// enforce pitch limits
-			float const CurrentPitch = UpdatedComponent->GetComponentRotation().Pitch;
-			float const MinDeltaPitch = MinPitch - CurrentPitch;
-			float const MaxDeltaPitch = MaxPitch - CurrentPitch;
-			float const OldPitch = RotDelta.Pitch;
-			RotDelta.Pitch = FMath::Clamp(RotDelta.Pitch, MinDeltaPitch, MaxDeltaPitch);
-			if (!FMath::IsNearlyEqual(OldPitch, RotDelta.Pitch, KINDA_SMALL_NUMBER))
+			if (bAllowLooping)
 			{
-				// if we got clamped, zero the pitch velocity
-				RotVelocity.Pitch = 0.f;
+				if (!RotDelta.IsNearlyZero())
+				{
+					// Pitch turns about the view's own right axis, so holding look-up carries the view over the top and round.
+					// Yaw turns about world up, which keeps the horizon level; it flips sign while upside down so the view
+					// still pans the way the stick points. Upright, this is the same as adding pitch and yaw to the rotator.
+					FQuat const OldQuat = UpdatedComponent->GetComponentQuat();
+					float const YawSign = (OldQuat.GetUpVector().Z < 0.f) ? -1.f : 1.f;
+					FQuat const NewQuat = FRotator(0.f, RotDelta.Yaw * YawSign, 0.f).Quaternion() * OldQuat * FRotator(RotDelta.Pitch, 0.f, 0.f).Quaternion();
+
+					FHitResult Hit(1.f);
+					SafeMoveUpdatedComponent(FVector::ZeroVector, NewQuat, false, Hit);
+
+					DirectRotationInputGoalRotation = NewQuat.Rotator();
+				}
 			}
-
-			if (!RotDelta.IsNearlyZero())
+			else
 			{
-				FRotator const NewRot = UpdatedComponent->GetComponentRotation() + RotDelta;
+				// enforce pitch limits
+				float const CurrentPitch = UpdatedComponent->GetComponentRotation().Pitch;
+				float const MinDeltaPitch = MinPitch - CurrentPitch;
+				float const MaxDeltaPitch = MaxPitch - CurrentPitch;
+				float const OldPitch = RotDelta.Pitch;
+				RotDelta.Pitch = FMath::Clamp(RotDelta.Pitch, MinDeltaPitch, MaxDeltaPitch);
+				if (!FMath::IsNearlyEqual(OldPitch, RotDelta.Pitch, KINDA_SMALL_NUMBER))
+				{
+					// if we got clamped, zero the pitch velocity
+					RotVelocity.Pitch = 0.f;
+				}
 
-				FHitResult Hit(1.f);
-				SafeMoveUpdatedComponent(FVector::ZeroVector, NewRot, false, Hit);
+				if (!RotDelta.IsNearlyZero())
+				{
+					FRotator const NewRot = UpdatedComponent->GetComponentRotation() + RotDelta;
 
-				DirectRotationInputGoalRotation = DirectRotationInputGoalRotation + RotDelta;
+					FHitResult Hit(1.f);
+					SafeMoveUpdatedComponent(FVector::ZeroVector, NewRot, false, Hit);
+
+					DirectRotationInputGoalRotation = DirectRotationInputGoalRotation + RotDelta;
+				}
 			}
 		}
 

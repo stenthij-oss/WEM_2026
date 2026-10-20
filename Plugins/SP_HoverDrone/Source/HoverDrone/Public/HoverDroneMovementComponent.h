@@ -222,6 +222,10 @@ private:
 	UPROPERTY(EditAnywhere, Category = HoverDroneMovement)
 	float MaxPitch;
 
+	/** When true, pitch has no limit: the view turns about its own right axis, so it can go over the top and fly full loops. MinPitch and MaxPitch only apply when this is false. */
+	UPROPERTY(EditAnywhere, Category = HoverDroneMovement)
+	bool bAllowLooping = true;
+
 	/** Current distance to the ground. */
 	float CurrentAltitude;
 

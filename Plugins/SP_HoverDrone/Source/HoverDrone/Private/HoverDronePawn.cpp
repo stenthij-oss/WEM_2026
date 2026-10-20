@@ -225,10 +225,8 @@ void AHoverDronePawn::LookUpAccel(float Val)
 
 FRotator AHoverDronePawn::GetViewRotation() const
 {
-	// pawn rotation dictates camera rotation
-	float const Pitch = GetActorRotation().Pitch;
-	float const Yaw = GetActorRotation().Yaw;
-	return FRotator(Pitch, Yaw, 0.f);
+	// pawn rotation dictates camera rotation, roll included: it is 180 while upside down in a loop
+	return GetActorRotation();
 }
 
 void AHoverDronePawn::BeginLookat()
@@ -378,33 +376,14 @@ FRotator AHoverDronePawn::GetTiltedDroneRotation(float DeltaTime)
 
 	// now apply a tilt to simulate motion
 	{
-		FMatrix const OldCamToWorld = FRotationMatrix(GetActorRotation());
-		FMatrix const UntiltedDroneToWorld = FRotationMatrix::MakeFromZX(FVector::UpVector, OldCamToWorld.GetUnitAxis(EAxis::X));
-
-		FMatrix const OldCamToDrone = OldCamToWorld * UntiltedDroneToWorld.Inverse();
-
 		// more velocity => more tilt
 		// greater up vector magnitude => less tilt per unit velocity
 		FVector const TiltedUpVector = (MeasuredVelocity + TiltUpVector);
-		FMatrix TiltedDroneToWorld = FRotationMatrix::MakeFromZX(TiltedUpVector, UntiltedDroneToWorld.GetUnitAxis(EAxis::X));
 
-		// interpolate drone tilt to smooth it out
-		// only interpolating pitch and roll though!
-		FRotator GoalTiltedDroneRot = TiltedDroneToWorld.Rotator();
-		if (bEnableTiltLimits)
-		{
-			GoalTiltedDroneRot.Pitch = FMath::Clamp<>(GoalTiltedDroneRot.Pitch, -TiltLimits.Pitch, TiltLimits.Pitch);
-			GoalTiltedDroneRot.Roll = FMath::Clamp<>(GoalTiltedDroneRot.Roll, -TiltLimits.Roll, TiltLimits.Roll);
-		}
+		// The tilt is the shortest turn from world up to the tilted up vector, applied in world space. Unlike a frame
+		// built around the view's forward axis, it stays well defined when the view points straight up mid-loop.
+		FQuat const TiltQuat = FQuat::FindBetweenVectors(FVector::UpVector, TiltedUpVector);
 
-		GoalTiltedDroneRot.Yaw = 0.f;
-		FRotator InterpedTiltedDroneRot = DroneTiltInterpolator.Eval(GoalTiltedDroneRot, DeltaTime);
-
-		LastTiltedDroneRot = InterpedTiltedDroneRot;
-		InterpedTiltedDroneRot.Yaw = GetActorRotation().Yaw; // keep original Yaw
-
-		FMatrix const NewCamToWorld = OldCamToDrone * TiltedDroneToWorld;
-
-		return NewCamToWorld.Rotator();
+		return (TiltQuat * GetActorQuat()).Rotator();
 	}
 }
