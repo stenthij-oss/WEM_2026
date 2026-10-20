@@ -1,0 +1,112 @@
+// The phone camera look of the portrait frame, after tonemapping (and after the sky glitch, so the phone films the
+// glitched sky too). Per pixel, in this order:
+//  1. The stabiliser's crop. The frame was rendered a little wider (CropScale) and is cut back to its middle here,
+//     which leaves the rolling shutter a margin to move into.
+//  2. The rolling shutter. A phone reads its sensor from the top row down, so when the camera turns while reading,
+//     each row was taken a moment after the one above. ShutterSkew.x leans uprights (turning sideways), .y stretches
+//     or squashes the picture (tilting), both per unit of height away from the middle row.
+//  3. Colour fringes: the small lens draws red a little larger than blue, so edges away from the centre get a red
+//     fringe on their outer side and a blue one on their inner side.
+//  4. Over-sharpening: an unsharp mask on brightness, wide enough to leave the bright and dark halos along edges
+//     that phone processing is known for.
+//  5. Vignette: a dark rim, round like the lens, so the far ends of a tall frame darken more than its sides.
+//  6. Sensor noise: blotchy specks of brightness and colour, strongest in the shadows, new every frame.
+// All of it is measured in the frame, from its own centre, edges and pixels, whatever shape the frame has. The
+// fringes and the vignette are done here rather than with the engine's settings because those are drawn before the
+// sky glitch, which would paint them into its trails.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+float2 SceneColorInvExtent;
+// Where the frame sits in the scene colour texture, and in the render target.
+float2 SceneColorMin;
+float2 SceneColorSize;
+int2 OutputMin;
+float2 OutputSize;
+
+// The output frame's width and height over the larger of the two, to keep the vignette round.
+float2 FrameShape;
+
+float CropScale;
+float2 ShutterSkew;
+// How much larger red is drawn than blue, as a fraction of the distance from the centre.
+float FringeAmount;
+float SharpenAmount;
+// How dark the corners get, from 0 to 1.
+float VignetteAmount;
+float NoiseAmount;
+uint FrameIndex;
+
+// How far, in output pixels, the sharpening reaches for the blur it takes away. Further gives wider halos.
+static const float SharpenRadius = 1.6f;
+
+float4 SampleFrame(float2 FrameUV)
+{
+	// Stay inside the frame: the black bars beside it are not part of the picture.
+	const float2 HalfTexel = 0.5f / SceneColorSize;
+	FrameUV = clamp(FrameUV, HalfTexel, 1.0f - HalfTexel);
+	return SceneColorTexture.SampleLevel(SceneColorSampler, (SceneColorMin + FrameUV * SceneColorSize) * SceneColorInvExtent, 0);
+}
+
+float Luma(float4 Color)
+{
+	return dot(Color.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Three random numbers between 0 and 1 for a cell of pixels and a frame (pcg3d).
+float3 Random(uint2 Cell, uint Frame)
+{
+	uint3 V = uint3(Cell, Frame) * 1664525u + 1013904223u;
+	V.x += V.y * V.z; V.y += V.z * V.x; V.z += V.x * V.y;
+	V ^= V >> 16u;
+	V.x += V.y * V.z; V.y += V.z * V.x; V.z += V.x * V.y;
+	return float3(V) * (1.0f / 4294967296.0f);
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const uint2 Pixel = uint2(int2(SvPosition.xy) - OutputMin);
+	const float2 OutputUV = (float2(Pixel) + 0.5f) / OutputSize;
+
+	// 1 and 2: where in the rendered frame this pixel's light was taken from.
+	float2 UV = 0.5f + (OutputUV - 0.5f) * CropScale;
+	const float Row = UV.y - 0.5f;
+	UV.x += ShutterSkew.x * Row;
+	UV.y -= ShutterSkew.y * Row;
+
+	// 3: red from a little nearer the centre (so it is drawn larger), blue from a little further out.
+	const float4 Center = SampleFrame(UV);
+	const float2 FromCenter = UV - 0.5f;
+	float3 Color = float3(SampleFrame(0.5f + FromCenter * (1.0f - FringeAmount)).r, Center.g,
+		SampleFrame(0.5f + FromCenter * (1.0f + FringeAmount)).b);
+
+	// 4: a tent-weighted blur of this sample and the eight around it, on brightness only so the halos stay neutral;
+	// how much this pixel stands out from it is added back, strengthened.
+	const float2 Step = SharpenRadius * CropScale / SceneColorSize;
+	const float Sides = Luma(SampleFrame(UV + float2(Step.x, 0.0f))) + Luma(SampleFrame(UV - float2(Step.x, 0.0f)))
+		+ Luma(SampleFrame(UV + float2(0.0f, Step.y))) + Luma(SampleFrame(UV - float2(0.0f, Step.y)));
+	const float Corners = Luma(SampleFrame(UV + Step)) + Luma(SampleFrame(UV - Step))
+		+ Luma(SampleFrame(UV + float2(Step.x, -Step.y))) + Luma(SampleFrame(UV + float2(-Step.x, Step.y)));
+	const float CenterLuma = Luma(Center);
+	const float Blurred = (4.0f * CenterLuma + 2.0f * Sides + Corners) / 16.0f;
+	Color += SharpenAmount * (CenterLuma - Blurred);
+
+	// 5: 0 at the centre and 1 in the corners, measured in pixels so it stays round in any frame shape.
+	const float2 Shaped = (OutputUV - 0.5f) * FrameShape;
+	const float Rim = dot(Shaped, Shaped) / dot(0.5f * FrameShape, 0.5f * FrameShape);
+	Color *= 1.0f - VignetteAmount * Rim * Rim;
+
+	// 6: specks two pixels across with a finer grain on top; colour noise pushes red and blue against green. The
+	// darkened corners get more of it, as a phone brightening them back up would.
+	const float Shadow = saturate(1.0f - 1.6f * saturate(dot(Color, float3(0.2126f, 0.7152f, 0.0722f))));
+	const float Amount = NoiseAmount * (0.012f + 0.09f * Shadow * Shadow);
+	const float3 Coarse = Random(Pixel / 2u, FrameIndex) - 0.5f;
+	const float3 Fine = Random(Pixel, FrameIndex ^ 0x9E3779B9u) - 0.5f;
+	const float LumaNoise = 0.7f * Coarse.x + 0.3f * Fine.x;
+	const float3 ChromaNoise = float3(Coarse.y, -0.5f * (Coarse.y + Coarse.z), Coarse.z) * 0.9f;
+	Color += Amount * (LumaNoise + ChromaNoise);
+
+	OutColor = float4(saturate(Color), Center.a);
+}

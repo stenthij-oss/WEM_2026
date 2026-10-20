@@ -1,0 +1,123 @@
+// The sky glitch: the sky is never wiped, the way Windows XP stopped repainting the desktop behind
+// a hung program, so everything a platform covered stays painted there after it moves on.
+//
+// STAMP = 1 paints the trail texture: platform pixels take the platform as it is drawn now, and
+// sky pixels keep whatever was painted there before (alpha 1 = painted, 0 = never).
+// STAMP = 0 lays the trails over the frame: platform pixels show the live frame, sky pixels show
+// the trail where one was painted and the live sky (or black, with bBlackSky) everywhere else.
+// Visibility fades the trails, not the black: with bBlackSky the sky stays black throughout.
+//
+// A title (SkyGlitchTitle.h) covers sky pixels only: laid over them in the composite while it is shown,
+// and painted over the trail in the stamp that burns it in.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D SceneColorTexture;
+Texture2D SceneDepthTexture;
+Texture2D TrailTexture;
+
+// Where the pass draws in its render target; the trail texture is the same size, from (0, 0).
+int2 OutputMin;
+float2 OutputSize;
+// Where the view sits in the scene colour and the depth texture. Depth is at render resolution,
+// which is smaller than the output when the screen percentage is below 100.
+int2 SceneColorMin;
+float2 SceneColorSize;
+int2 DepthMin;
+int2 DepthMax;
+float2 DepthSize;
+
+float4 InvDeviceZToWorldZTransform;
+// Anything farther than this, in cm, is sky.
+float BackgroundDistance;
+uint bHasTrail;
+// Unpainted sky shows black instead of the live sky.
+uint bBlackSky;
+// How much of the trails shows, 0..1: below 1 they fade into the sky behind them.
+float Visibility;
+
+// The title: its red channel is how much of a pixel it covers. It lies from TitleMin, TitleSize pixels of the trail
+// across, and covers what it covers with TitleColour, at TitleOpacity. An opacity of 0 leaves it out.
+Texture2D TitleTexture;
+SamplerState TitleSampler;
+float2 TitleMin;
+float2 TitleSize;
+float3 TitleColour;
+float TitleOpacity;
+
+float ToSceneDepth(float DeviceZ)
+{
+	// As ConvertFromDeviceZ in Common.ush.
+	return DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+}
+
+bool IsNear(int2 DepthPixel)
+{
+	const float DeviceZ = SceneDepthTexture.Load(int3(clamp(DepthPixel, DepthMin, DepthMax - 1), 0)).r;
+	// Reversed Z: 0 is the far plane.
+	return DeviceZ > 0.0f && ToSceneDepth(DeviceZ) < BackgroundDistance;
+}
+
+// A pixel counts as platform when it or any of its four neighbours is near, so the platforms'
+// antialiased edges stay live instead of flickering between the frame and the trail.
+bool IsPlatform(int2 DepthPixel)
+{
+	return IsNear(DepthPixel)
+		|| IsNear(DepthPixel + int2(1, 0)) || IsNear(DepthPixel - int2(1, 0))
+		|| IsNear(DepthPixel + int2(0, 1)) || IsNear(DepthPixel - int2(0, 1));
+}
+
+// How much of the trail pixel the title covers, opacity included.
+float GetTitleCover(int2 TrailPixel)
+{
+	if (TitleOpacity <= 0.0f)
+	{
+		return 0.0f;
+	}
+
+	// Sampled with its mips, since the picture is drawn smaller than it is, and so before anything branches on the pixel.
+	const float2 TitleUV = (float2(TrailPixel) + 0.5f - TitleMin) / TitleSize;
+	const float Cover = saturate(TitleTexture.Sample(TitleSampler, TitleUV).r);
+	const bool bInside = all(TitleUV >= 0.0f) && all(TitleUV <= 1.0f);
+
+	return bInside ? Cover * TitleOpacity : 0.0f;
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const int2 TrailPixel = int2(SvPosition.xy) - OutputMin;
+	const float2 UV = (float2(TrailPixel) + 0.5f) / OutputSize;
+	const float4 Live = SceneColorTexture.Load(int3(SceneColorMin + int2(UV * SceneColorSize), 0));
+	const bool bPlatform = IsPlatform(DepthMin + int2(UV * DepthSize));
+	const float Cover = GetTitleCover(TrailPixel);
+
+#if STAMP
+	if (bPlatform)
+	{
+		OutColor = float4(Live.rgb, 1.0f);
+	}
+	else
+	{
+		const float4 Before = bHasTrail != 0 ? TrailTexture.Load(int3(TrailPixel, 0)) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+		// The title over what was painted before, so the composite's lerp from the sky shows the one over the other.
+		const float Painted = lerp(Before.a, 1.0f, Cover);
+		const float3 Colour = (Before.rgb * Before.a * (1.0f - Cover) + TitleColour * Cover) / max(Painted, 1e-4f);
+		OutColor = float4(Colour, Painted);
+	}
+#else
+	if (bPlatform)
+	{
+		OutColor = Live;
+	}
+	else
+	{
+		const float4 Trail = bHasTrail != 0 ? TrailTexture.Load(int3(TrailPixel, 0)) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+		const float3 Sky = bBlackSky != 0 ? float3(0.0f, 0.0f, 0.0f) : Live.rgb;
+		// The title shown is the glitch's, so it fades with the trails.
+		const float3 Glitch = lerp(Sky, Trail.rgb, Trail.a * Visibility);
+		OutColor = float4(lerp(Glitch, TitleColour, Cover * Visibility), Live.a);
+	}
+#endif
+}
