@@ -5,6 +5,7 @@
 #include "GridMath.h"
 #include "PlatformStructureData.h"
 #include "PlatformTileData.h"
+#include "StartScreen.h"
 #include "StructureCategory.h"
 #include "StructurePlacement.h"
 #include "Algo/BinarySearch.h"
@@ -915,8 +916,66 @@ void ARoomManager::BeginPlay()
 		});
 	}
 
+	// A start screen holds growth back until its title is lit, and starts it then. It asks before play begins, but this
+	// may begin play after it - loaded later, with its part of the world - so this asks it as well.
+	for (TActorIterator<AStartScreen> It(GetWorld()); It; ++It)
+	{
+		if (It->HoldsGrowth(this))
+		{
+			bGrowthHeld = true;
+		}
+	}
+
+	if (!bGrowthHeld)
+	{
+		StartGrowth();
+	}
+	else
+	{
+		HeldSince = GetClock();
+	}
+}
+
+void ARoomManager::HoldGrowth()
+{
+	if (HasActorBegunPlay() || IsActorBeginningPlay())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RoomManager: '%s' was asked to hold growth after play began; it is already growing."), *GetName());
+		return;
+	}
+
+	bGrowthHeld = true;
+}
+
+void ARoomManager::StartGrowth()
+{
+	if (bGrowthStarted || !(HasActorBegunPlay() || IsActorBeginningPlay()))
+	{
+		return;
+	}
+
+	bGrowthStarted = true;
+
 	// Paths, pockets, strikes and reshuffles all fall due by one clock, starting from now.
 	const double Now = GetClock();
+
+	// The pockets and paths drawn when the cube was cleared took their first lives from then: the time held is added
+	// on, so none is overdue the moment growth starts.
+	if (bGrowthHeld)
+	{
+		const double Held = FMath::Max(Now - HeldSince, 0.0);
+
+		for (FAirPocket& Pocket : AirPockets)
+		{
+			Pocket.MoveAt += Held;
+		}
+
+		for (FAirPath& Path : AirPaths)
+		{
+			Path.RedrawAt += Held;
+		}
+	}
+
 	NextStrikeAt = Now + DamageStream.FRandRange(MinStrikeInterval, FMath::Max(MaxStrikeInterval, MinStrikeInterval));
 	NextReshuffleAt = Now + ReshuffleInterval;
 	StartClock();

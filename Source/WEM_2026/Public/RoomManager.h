@@ -1696,6 +1696,24 @@ public:
 	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Grid|Air Pockets")
 	void MoveAirPockets();
 
+	/**
+	 * Keeps BeginPlay from starting growth: the cube is cleared and drawn as ever, but no beat, strike, reshuffle or
+	 * moving pocket runs until StartGrowth. A start screen (AStartScreen) calls it before play begins; once play has
+	 * begun it is too late.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Grid|Start")
+	void HoldGrowth();
+
+	/**
+	 * Starts what BeginPlay starts unless held: the beats and the clock the strikes, reshuffles and pockets keep, from
+	 * now, so the first beat lands a full interval in. Once only, and only once play has begun.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Grid|Start")
+	void StartGrowth();
+
+	UFUNCTION(BlueprintPure, Category = "Grid|Start")
+	bool HasGrowthStarted() const { return bGrowthStarted; }
+
 	//~ Begin AActor Interface
 	virtual void OnConstruction(const FTransform& Transform) override;
 	//~ End AActor Interface
@@ -3607,6 +3625,13 @@ private:
 	TArray<FFenceEnd> WallRunQueue;
 
 	FTimerHandle PlacementTimerHandle;
+
+	/** HoldGrowth was called before play began, and StartGrowth has run. */
+	bool bGrowthHeld = false;
+	bool bGrowthStarted = false;
+
+	/** When BeginPlay finished holding growth, by GetClock. */
+	double HeldSince = 0.0;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Grid", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<USceneComponent> SceneRoot;
