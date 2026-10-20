@@ -10,6 +10,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "MeshDescription.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -317,6 +318,28 @@ bool FStructureImportMaskTranslucencyTest::RunTest(const FString& Parameters)
 	UMaterial* Opaque = NewObject<UMaterial>(GetTransientPackage());
 	TestFalse(TEXT("An opaque material is left alone"), WEMStructureImport::MaskTranslucency(*Opaque));
 	TestTrue(TEXT("and stays opaque"), Opaque->BlendMode == BLEND_Opaque);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FStructureImportComplexCollisionTest, "WEM.Structures.Import.ComplexCollision", StructureImportTestsPrivate::TestFlags)
+
+bool FStructureImportComplexCollisionTest::RunTest(const FString& Parameters)
+{
+	// As a structure comes in: one hull around it, which the default lets stand in for its triangles.
+	UBodySetup* BodySetup = NewObject<UBodySetup>(GetTransientPackage());
+	BodySetup->AggGeom.ConvexElems.AddDefaulted();
+
+	TestTrue(TEXT("A structure colliding with its hull is changed"), WEMStructureImport::UseComplexCollision(*BodySetup));
+	TestTrue(TEXT("It collides with its triangles"), BodySetup->CollisionTraceFlag == CTF_UseComplexAsSimple);
+	TestTrue(TEXT("from either side"), BodySetup->bDoubleSidedGeometry);
+	TestEqual(TEXT("Its hull is kept"), BodySetup->AggGeom.ConvexElems.Num(), 1);
+	TestFalse(TEXT("Once it does, it is left alone"), WEMStructureImport::UseComplexCollision(*BodySetup));
+
+	// Its triangles from one side only is not enough: a single-sheet panel would let through what comes at its back.
+	BodySetup->bDoubleSidedGeometry = false;
+	TestTrue(TEXT("One-sided triangles are changed"), WEMStructureImport::UseComplexCollision(*BodySetup));
+	TestTrue(TEXT("to both sides"), BodySetup->bDoubleSidedGeometry);
 
 	return true;
 }

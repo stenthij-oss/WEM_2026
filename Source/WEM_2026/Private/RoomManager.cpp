@@ -726,9 +726,14 @@ ARoomManager::ARoomManager()
 	for (UInstancedStaticMeshComponent* Pieces : { EdgePieces.Get(), NodePieces.Get() })
 	{
 		// Every platform stands rather than marks, so it is lit and casts: without shadows falling
-		// off it the structure reads as flat as the notation laid over it. Still no collision,
-		// since there is nothing yet to walk into it.
-		Pieces->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		// off it the structure reads as flat as the notation laid over it. And it is solid: the drone
+		// flies among the pieces, and meets every one of them. A structure collides with its own
+		// triangles (the importer sees to that), so whatever openings it has stay open.
+		Pieces->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+		// Nothing walks the tower, so no navigation is built over it; without this, every chunk that
+		// fills would have the navigation system look at it again.
+		Pieces->SetCanEverAffectNavigation(false);
 		Pieces->SetCastShadow(true);
 		Pieces->SetMobility(EComponentMobility::Movable);
 	}
@@ -9558,8 +9563,8 @@ FStructureLayer& ARoomManager::FindOrAddStructureLayer(UPlatformStructureData* S
 		// A stamp of zero means "not drawn yet", so the layer's own has to start above it.
 		Layer->Pieces.SyncStamp = FMath::Max<uint32>(Layer->Pieces.SyncStamp, 1);
 
-		// Set up like the beams it stands among: lit, casting shadows, with no collision. The
-		// structure's mesh, with its own materials, goes on when the layer is first filled.
+		// Set up like the beams it stands among: lit, casting shadows, solid. The structure's mesh,
+		// with its own materials, goes on when the layer is first filled.
 		AddInstancedChunk(Layer->Pieces.Chunks, EdgePieces, FName(*FString::Printf(TEXT("%s_Pieces"), *Structure->GetName())));
 	}
 
@@ -9770,12 +9775,13 @@ bool ARoomManager::RemovePieceFromLayer(FRoomPieceLayer& Layer, const uint64 Key
 	const int32 Last = Keys.Num() - 1;
 
 	// As the overlay's squares are taken out: the chunk's last piece is moved into the hole first, so no other piece
-	// changes index and the record needs one fix-up at most.
+	// changes index and the record needs one fix-up at most. Its collision jumps there with it, rather than sweeping
+	// across the tower over the next physics step.
 	if (Instance != Last)
 	{
 		FTransform LastTransform;
 		Component->GetInstanceTransform(Last, LastTransform, /*bWorldSpace=*/true);
-		Component->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true);
+		Component->UpdateInstanceTransform(Instance, LastTransform, /*bWorldSpace=*/true, /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
 
 		Keys[Instance] = Keys[Last];
 		Layer.PieceSlots.FindChecked(Keys[Instance]).Y = Instance;
@@ -9829,6 +9835,7 @@ UInstancedStaticMeshComponent* ARoomManager::AddInstancedChunk(
 	// constructor stays the one place each kind is set up.
 	Chunk->SetMobility(FirstChunk->Mobility);
 	Chunk->SetCollisionEnabled(FirstChunk->GetCollisionEnabled());
+	Chunk->SetCanEverAffectNavigation(FirstChunk->CanEverAffectNavigation());
 	Chunk->SetCastShadow(FirstChunk->CastShadow);
 	Chunk->bAffectDistanceFieldLighting = FirstChunk->bAffectDistanceFieldLighting;
 	Chunk->bAffectDynamicIndirectLighting = FirstChunk->bAffectDynamicIndirectLighting;

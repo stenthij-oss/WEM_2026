@@ -7,6 +7,7 @@
 #include "Materials/MaterialExpression.h"
 #include "Misc/FileHelper.h"
 #include "Misc/SecureHash.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "PlatformStructureData.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -348,6 +349,24 @@ bool WEMStructureImport::MaskTranslucency(UMaterial& Material)
 
 	// Dithered, a pixel is drawn with the chance Mask - Clip + 0.5, so at 0.5 that chance is the alpha itself.
 	Material.OpacityMaskClipValue = 0.5f;
+
+	return true;
+}
+
+bool WEMStructureImport::UseComplexCollision(UBodySetup& BodySetup)
+{
+	if (BodySetup.CollisionTraceFlag == CTF_UseComplexAsSimple && BodySetup.bDoubleSidedGeometry)
+	{
+		return false;
+	}
+
+	BodySetup.Modify();
+
+	// The hull is kept, but nothing collides with it any more.
+	BodySetup.CollisionTraceFlag = CTF_UseComplexAsSimple;
+
+	// A structure modelled as a single sheet - a fence panel, a tile - has to stop what comes at its back too.
+	BodySetup.bDoubleSidedGeometry = true;
 
 	return true;
 }

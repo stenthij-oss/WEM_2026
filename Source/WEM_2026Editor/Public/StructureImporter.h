@@ -101,6 +101,9 @@ private:
 		TArray<FString> Errors;
 		UPlatformStructureData* Structure = nullptr;
 		bool bCreated = false;
+
+		/** Its mesh, when this import changed how the mesh collides. */
+		UStaticMesh* CollisionChanged = nullptr;
 	};
 
 	/** Imports one structure from its settings file, unless its files have not changed. */
@@ -119,6 +122,12 @@ private:
 	 * a rule was added takes it without coming in again.
 	 */
 	void PrepareMaterials(UStaticMesh& Mesh, FImportResult& Result) const;
+
+	/**
+	 * Readies the mesh's collision: it collides with its own triangles, so its openings stay open to
+	 * whatever moves through the structures. Run on every import, as PrepareMaterials is.
+	 */
+	void PrepareCollision(UStaticMesh& Mesh, FImportResult& Result) const;
 
 	/**
 	 * Adds structures to every room manager in the open level that does not list them yet, as one

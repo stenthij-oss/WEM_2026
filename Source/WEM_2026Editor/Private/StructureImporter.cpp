@@ -7,6 +7,7 @@
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetToolsModule.h"
 #include "Editor.h"
+#include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -22,6 +23,7 @@
 #include "Materials/MaterialInterface.h"
 #include "MeshDescription.h"
 #include "ObjectTools.h"
+#include "PhysicsEngine/BodySetup.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
@@ -32,6 +34,7 @@
 #include "ScopedTransaction.h"
 #include "StructureCategory.h"
 #include "StructureImport.h"
+#include "UObject/UObjectIterator.h"
 
 #define LOCTEXT_NAMESPACE "StructureImporter"
 
@@ -187,6 +190,7 @@ void UStructureImporter::Import()
 	}
 
 	TArray<UPlatformStructureData*> NewStructures;
+	TSet<UStaticMesh*> CollisionChanged;
 	int32 Failed = 0;
 	int32 Unchanged = 0;
 
@@ -199,6 +203,25 @@ void UStructureImporter::Import()
 		{
 			NewStructures.Add(Result.Structure);
 		}
+
+		if (Result.CollisionChanged)
+		{
+			CollisionChanged.Add(Result.CollisionChanged);
+		}
+	}
+
+	// Whatever already draws one of those meshes collides with its triangles at once, not on its next rebuild.
+	if (!CollisionChanged.IsEmpty())
+	{
+		for (UStaticMeshComponent* Component : TObjectRange<UStaticMeshComponent>())
+		{
+			if (Component->IsPhysicsStateCreated() && CollisionChanged.Contains(Component->GetStaticMesh()))
+			{
+				Component->RecreatePhysicsState();
+			}
+		}
+
+		Lines.Add(FString::Printf(TEXT("%d structure(s) now collide with their own triangles, so their openings are open."), CollisionChanged.Num()));
 	}
 
 	// Any structure brought in again has a new mesh, which the room managers draw only once they rebuild.
@@ -357,6 +380,7 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 	if (Previous && Previous->Mesh && !Hash.IsEmpty() && Previous->ImportHash == Hash && !bReimportAll)
 	{
 		PrepareMaterials(*Previous->Mesh, Result);
+		PrepareCollision(*Previous->Mesh, Result);
 		Result.Structure = Previous;
 		Result.Outcome = TEXT("unchanged");
 		return;
@@ -413,6 +437,7 @@ void UStructureImporter::ImportStructure(const FString& SettingsPath, FImportRes
 
 	MapMaterials(*Mesh, Result);
 	PrepareMaterials(*Mesh, Result);
+	PrepareCollision(*Mesh, Result);
 
 	// Dense relief is drawn with Nanite; a plain slab is cheaper without it.
 	const int32 Triangles = Description.Triangles().Num();
@@ -589,6 +614,27 @@ void UStructureImporter::PrepareMaterials(UStaticMesh& Mesh, FImportResult& Resu
 			}
 		}
 	}
+}
+
+void UStructureImporter::PrepareCollision(UStaticMesh& Mesh, FImportResult& Result) const
+{
+	if (!Mesh.GetBodySetup())
+	{
+		Mesh.CreateBodySetup();
+	}
+
+	UBodySetup* BodySetup = Mesh.GetBodySetup();
+
+	if (!BodySetup || !WEMStructureImport::UseComplexCollision(*BodySetup))
+	{
+		return;
+	}
+
+	// Built again from the triangles the next time anything collides with the mesh.
+	BodySetup->InvalidatePhysicsData();
+	Mesh.MarkPackageDirty();
+
+	Result.CollisionChanged = &Mesh;
 }
 
 UPlatformStructureData* UStructureImporter::FindOrCreateStructure(const FString& Folder, const FString& AssetName, bool& bOutCreated) const

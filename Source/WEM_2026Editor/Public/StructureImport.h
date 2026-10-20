@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "PlatformStructureData.h"
 
+class UBodySetup;
 class UMaterial;
 
 /**
@@ -127,4 +128,12 @@ namespace WEMStructureImport
 	 * is not translucent. The caller rebuilds the material.
 	 */
 	WEM_2026EDITOR_API bool MaskTranslucency(UMaterial& Material);
+
+	/**
+	 * Has a structure collide with its own triangles, from either side, rather than with the hull the
+	 * import wraps it in. A hull is solid across every opening the structure has - a window, a door,
+	 * the gaps in a railing - so whatever moves among the structures would meet a wall there. False,
+	 * and the body untouched, when it already does. The caller rebuilds the body's physics data.
+	 */
+	WEM_2026EDITOR_API bool UseComplexCollision(UBodySetup& BodySetup);
 }
