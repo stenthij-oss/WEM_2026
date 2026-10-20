@@ -1611,6 +1611,33 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Grid|Platforms")
 	int32 GetPlatformCount() const;
 
+	/** Every platform standing, in the order the structure keeps them. Changes whenever a platform is laid or taken away. */
+	TConstArrayView<FGridPlatform> GetStandingPlatforms() const
+	{
+		return BuiltPlatforms;
+	}
+
+	/** Whether this platform - at its min node, facing along its axis - is standing. */
+	bool IsPlatformStanding(const FGridPlatform& Platform) const;
+
+	/** How many zones the cube is split into. */
+	static constexpr int32 GetZoneCount()
+	{
+		return ZoneCount;
+	}
+
+	/** The zone a platform's middle lies in, from 0 to GetZoneCount() - 1: along X, then along Y, then a layer up. */
+	int32 GetPlatformZone(const FGridPlatform& Platform) const;
+
+	/** The cells a platform covers, rim included, inclusive at both corners. */
+	void GetPlatformCells(const FGridPlatform& Platform, FIntVector& OutMin, FIntVector& OutMax) const;
+
+	/**
+	 * Gives a standing platform Amount more health. One with none left, waiting to be taken away, is spared if that
+	 * lifts it above none. Returns its health now, or zero when it is not standing.
+	 */
+	float AddPlatformHealth(const FGridPlatform& Platform, float Amount);
+
 	/**
 	 * Whether a platform could be placed: at its min node, facing along its axis, laid from its
 	 * tile the way round it says.

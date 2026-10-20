@@ -13,6 +13,8 @@ public class WEM_2026 : ModuleRules
 		// The drone trail draws its own mesh (DroneTrailMeshComponent.cpp).
 		PrivateDependencyModuleNames.AddRange(new string[] { "RenderCore", "RHI" });
 
+		// The orb counter and snippets are drawn over the game view (OrbHud.cpp).
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 
 		// The Players page in Project Settings (WEMPlayers.h).
 		PublicDependencyModuleNames.Add("DeveloperSettings");

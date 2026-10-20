@@ -10837,6 +10837,53 @@ void ARoomManager::GiveHealth(const FGridPlatform& Platform)
 	PlatformHealth.Add(MakePlatformKey(Platform), DamageStream.FRandRange(MinHealth, FMath::Max(MaxHealth, MinHealth)));
 }
 
+bool ARoomManager::IsPlatformStanding(const FGridPlatform& Platform) const
+{
+	const uint64 Key = MakePlatformKey(Platform);
+	const int32* Index = ModuleFaceOwners.Find(Key);
+
+	return Index && MakePlatformKey(BuiltPlatforms[*Index]) == Key;
+}
+
+int32 ARoomManager::GetPlatformZone(const FGridPlatform& Platform) const
+{
+	return GetZoneOf(Platform);
+}
+
+void ARoomManager::GetPlatformCells(const FGridPlatform& Platform, FIntVector& OutMin, FIntVector& OutMax) const
+{
+	const FAirBox Box = GetPlatformBox(Platform);
+	OutMin = Box.Min;
+	OutMax = Box.Max;
+}
+
+float ARoomManager::AddPlatformHealth(const FGridPlatform& Platform, const float Amount)
+{
+	if (!IsPlatformStanding(Platform))
+	{
+		return 0.0f;
+	}
+
+	const uint64 Key = MakePlatformKey(Platform);
+	float* Health = PlatformHealth.Find(Key);
+
+	if (!Health)
+	{
+		GiveHealth(Platform);
+		Health = PlatformHealth.Find(Key);
+	}
+
+	*Health += Amount;
+
+	// Spared: out of the queue to be taken away, which would otherwise take it whatever its health is by then.
+	if (*Health > 0.0f && DyingKeys.Remove(Key) > 0)
+	{
+		DyingQueue.Remove(Key);
+	}
+
+	return *Health;
+}
+
 bool ARoomManager::IsVulnerable(const FGridPlatform& Platform) const
 {
 	return !IsClearOfHeldAir(Platform);

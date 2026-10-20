@@ -4,13 +4,29 @@
 
 #include "Components/LineBatchComponent.h"
 #include "Components/SceneComponent.h"
+#include "EnhancedInputComponent.h"
 #include "Engine/DataTable.h"
+#include "Engine/Font.h"
+#include "Fonts/CompositeFont.h"
+#include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/LocalPlayer.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "InputAction.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "Misc/Paths.h"
+#include "Orb.h"
+#include "OrbHud.h"
 #include "PlacedObjectVisuals.h"
 #include "PlacementArchetype.h"
 #include "RoomManager.h"
+#include "Styling/CoreStyle.h"
 #include "TimerManager.h"
+#include "UObject/ConstructorHelpers.h"
+#include "WEMPlayers.h"
 
 namespace ObjectPlacerPrivate
 {
@@ -134,7 +150,16 @@ namespace ObjectPlacerPrivate
 
 AObjectPlacer::AObjectPlacer()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	// The furniture keeps a beat of its own; the tick is the orbs', after the room manager's clock has taken away what
+	// it takes in the frame, so an orb whose segment went stands again in the same frame.
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.TickGroup = TG_PostUpdateWork;
+
+	OrbClass = AOrb::StaticClass();
+	CatchAction = TSoftObjectPtr<UInputAction>(FSoftObjectPath(TEXT("/Game/Input/Drone/IA_Drone_Interact.IA_Drone_Interact")));
+
+	static ConstructorHelpers::FObjectFinder<UTexture2D> IconFinder(TEXT("/Game/Orbs/T_Orb.T_Orb"));
+	CounterIcon = IconFinder.Object;
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
@@ -152,6 +177,15 @@ void AObjectPlacer::BeginPlay()
 
 	// Objects are never saved, so a run always starts from none, on a freshly seeded stream.
 	ClearObjects();
+
+	// The orbs, the count and the round of snippets start afresh too.
+	ResetOrbs();
+
+	// No catalog, no furniture: the placer is there for the orbs alone.
+	if (!Catalogs.ContainsByPredicate([](const UDataTable* Table) { return Table != nullptr; }))
+	{
+		return;
+	}
 
 	if (!EnsureReady())
 	{
@@ -184,7 +218,26 @@ void AObjectPlacer::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		Visuals->Reset();
 	}
 
+	DropOrbs();
+	HideOrbHud();
+	UnbindCatch();
+
 	Super::EndPlay(EndPlayReason);
+}
+
+void AObjectPlacer::Tick(const float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	if (bPlaceOrbs && !bOrbsFinished)
+	{
+		AdvanceOrbs();
+	}
+	else if (!bPlaceOrbs)
+	{
+		DropOrbs();
+		HideOrbHud();
+	}
 }
 
 #if WITH_EDITOR
@@ -234,19 +287,7 @@ bool AObjectPlacer::EnsureReady()
 		return false;
 	};
 
-	if (!RoomManager)
-	{
-		if (UWorld* World = GetWorld())
-		{
-			for (TActorIterator<ARoomManager> It(World); It; ++It)
-			{
-				RoomManager = *It;
-				break;
-			}
-		}
-	}
-
-	if (!RoomManager)
+	if (!FindRoomManager())
 	{
 		return Report(TEXT("there is no room manager in the level to place objects on."));
 	}
@@ -290,6 +331,23 @@ bool AObjectPlacer::EnsureReady()
 	}
 
 	return true;
+}
+
+bool AObjectPlacer::FindRoomManager()
+{
+	if (!RoomManager)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			for (TActorIterator<ARoomManager> It(World); It; ++It)
+			{
+				RoomManager = *It;
+				break;
+			}
+		}
+	}
+
+	return RoomManager != nullptr;
 }
 
 void AObjectPlacer::AdvancePlacement()
@@ -584,4 +642,525 @@ void AObjectPlacer::AppendDebugLines(const FPlacedObject& Object, TArray<FBatche
 			AddBox(OutLines, Piece, ObstacleColour, Thickness);
 		}
 	}
+}
+
+void AObjectPlacer::ResetOrbs()
+{
+	DropOrbs();
+
+	ZoneOrbs.Reset();
+	ZoneOrbs.SetNum(ARoomManager::GetZoneCount());
+	OrbsCaught = 0;
+	OrbsCaughtByPlayer.Reset();
+	OrbsMoved = 0;
+	bOrbsFinished = false;
+	OrbRebuildGeneration = INDEX_NONE;
+	OrbStream.Initialize(RandomSeed != 0 ? RandomSeed : FMath::Rand());
+
+	// Read now, so whatever was written since the last run is in.
+	TArray<FString> Written;
+	WEMOrbSnippets::LoadFolder(FPaths::Combine(FPaths::ProjectContentDir(), SnippetFolder), Written);
+
+	if (bPlaceOrbs && Written.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ObjectPlacer: no snippets in %s; caught orbs will show no text."), *FPaths::Combine(FPaths::ProjectContentDir(), SnippetFolder));
+	}
+
+	Snippets.Reset(MoveTemp(Written), OrbStream.RandHelper(MAX_int32));
+}
+
+AOrb* AObjectPlacer::GetZoneOrb(const int32 Zone) const
+{
+	return ZoneOrbs.IsValidIndex(Zone) ? ZoneOrbs[Zone].Orb.Get() : nullptr;
+}
+
+void AObjectPlacer::AdvanceOrbs()
+{
+	if (!FindRoomManager() || ZoneOrbs.IsEmpty())
+	{
+		return;
+	}
+
+	// The room manager started over: the orbs go with the old structure, as the objects do.
+	if (RoomManager->GetRebuildGeneration() != OrbRebuildGeneration)
+	{
+		DropOrbs();
+		OrbRebuildGeneration = RoomManager->GetRebuildGeneration();
+	}
+
+	BindCatch();
+	ShowOrbHud();
+	UpdateOrbHudStyle();
+
+	const FRoomManagerPlacementWorld Grid(RoomManager);
+	const int32 ZoneCount = ZoneOrbs.Num();
+	bool bMoved = false;
+
+	// A segment taken away is seen every frame. Whether anything was built into an orb's air is a few hundred lookups an
+	// orb, so that is looked at for a few zones a frame, every zone within a handful of frames.
+	constexpr int32 AirChecksPerFrame = 3;
+
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		FZoneOrb& Slot = ZoneOrbs[Zone];
+		AOrb* Orb = Slot.Orb.Get();
+
+		if (!Orb || Orb->IsCaught())
+		{
+			continue;
+		}
+
+		const bool bAirDue = (Zone - NextOrbAirCheck + ZoneCount) % ZoneCount < AirChecksPerFrame;
+
+		if (!RoomManager->IsPlatformStanding(Slot.Platform) || (bAirDue && !WEMOrbSpot::IsFree(Grid, Slot.Spot)))
+		{
+			Orb->Destroy();
+			Slot.Orb.Reset();
+			++OrbsMoved;
+			bMoved = true;
+		}
+	}
+
+	NextOrbAirCheck = (NextOrbAirCheck + AirChecksPerFrame) % ZoneCount;
+
+	// An orb that had to move stands again in this same frame. Zones still waiting for room look again a few times a second.
+	const double Now = GetWorld()->GetTimeSeconds();
+
+	if (bMoved || Now >= NextOrbSearchAt)
+	{
+		StandOrbs();
+		NextOrbSearchAt = Now + 0.25;
+	}
+
+	UpdateOrbSummary();
+}
+
+void AObjectPlacer::StandOrbs()
+{
+	UWorld* World = GetWorld();
+
+	if (!World || !RoomManager || !OrbClass)
+	{
+		return;
+	}
+
+	const double Now = World->GetTimeSeconds();
+	const int32 ZoneCount = ZoneOrbs.Num();
+
+	TArray<bool> Waiting;
+	Waiting.Init(false, ZoneCount);
+	bool bAnyWaiting = false;
+
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		if (!ZoneOrbs[Zone].Orb.IsValid() && Now >= ZoneOrbs[Zone].RestUntil)
+		{
+			Waiting[Zone] = true;
+			bAnyWaiting = true;
+		}
+	}
+
+	if (!bAnyWaiting)
+	{
+		return;
+	}
+
+	// The room an orb needs, from its class's own size: the square of surface under it and the air up past the top of its bob.
+	const AOrb* Defaults = OrbClass->GetDefaultObject<AOrb>();
+	const double CellSize = FMath::Max(static_cast<double>(RoomManager->CellSize), 1.0);
+	const int32 FootCells = FMath::Max(1, FMath::CeilToInt32(Defaults->Diameter / CellSize));
+	const int32 AirCells = FMath::Max(1, FMath::CeilToInt32((OrbHoverHeight + 0.5 * Defaults->Diameter + Defaults->HoverAmplitude) / CellSize));
+
+	// The horizontal segments of every zone waiting, in one pass over the structure.
+	const TConstArrayView<FGridPlatform> Standing = RoomManager->GetStandingPlatforms();
+	TArray<TArray<int32>> Candidates;
+	Candidates.SetNum(ZoneCount);
+
+	for (int32 Index = 0; Index < Standing.Num(); ++Index)
+	{
+		if (Standing[Index].Normal != EGridAxis::Z)
+		{
+			continue;
+		}
+
+		const int32 Zone = RoomManager->GetPlatformZone(Standing[Index]);
+
+		if (Waiting.IsValidIndex(Zone) && Waiting[Zone])
+		{
+			Candidates[Zone].Add(Index);
+		}
+	}
+
+	const FRoomManagerPlacementWorld Grid(RoomManager);
+
+	// A zone tries this many segments drawn at random a look, and the rest on the next.
+	constexpr int32 MostTriesPerZone = 24;
+
+	for (int32 Zone = 0; Zone < ZoneCount; ++Zone)
+	{
+		TArray<int32>& Pool = Candidates[Zone];
+
+		for (int32 Try = 0; Try < MostTriesPerZone && !Pool.IsEmpty(); ++Try)
+		{
+			const int32 Pick = OrbStream.RandRange(0, Pool.Num() - 1);
+			const FGridPlatform& Platform = Standing[Pool[Pick]];
+			Pool.RemoveAtSwap(Pick);
+
+			FIntVector PlatformMin, PlatformMax;
+			RoomManager->GetPlatformCells(Platform, PlatformMin, PlatformMax);
+
+			FOrbSpot Spot;
+
+			if (!WEMOrbSpot::Find(Grid, PlatformMin, PlatformMax, FootCells, AirCells, OrbMaxShift, Spot))
+			{
+				continue;
+			}
+
+			FActorSpawnParameters Parameters;
+			Parameters.Owner = this;
+			Parameters.ObjectFlags |= RF_Transient;
+			Parameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+			const FVector Centre = WEMOrbSpot::GetFootCentre(Grid, Spot) + FVector(0.0, 0.0, OrbHoverHeight);
+
+			if (AOrb* Orb = World->SpawnActor<AOrb>(OrbClass, Centre, FRotator::ZeroRotator, Parameters))
+			{
+				Orb->SetHoverCentre(Centre);
+
+				FZoneOrb& Slot = ZoneOrbs[Zone];
+				Slot.Orb = Orb;
+				Slot.Platform = Platform;
+				Slot.Spot = Spot;
+			}
+
+			break;
+		}
+	}
+}
+
+void AObjectPlacer::DropOrbs()
+{
+	for (FZoneOrb& Slot : ZoneOrbs)
+	{
+		if (AOrb* Orb = Slot.Orb.Get())
+		{
+			Orb->Destroy();
+		}
+
+		Slot = FZoneOrb();
+	}
+}
+
+bool AObjectPlacer::CatchNearestOrb(const int32 Player)
+{
+	if (bOrbsFinished || Player < 0)
+	{
+		return false;
+	}
+
+	// Near enough to where this player looks from.
+	FWEMViewer Viewer;
+
+	if (!WEMPlayers::GetViewer(GetWorld(), Player, Viewer))
+	{
+		return false;
+	}
+
+	int32 Nearest = INDEX_NONE;
+	double NearestDistance = TNumericLimits<double>::Max();
+
+	for (int32 Zone = 0; Zone < ZoneOrbs.Num(); ++Zone)
+	{
+		const AOrb* Orb = ZoneOrbs[Zone].Orb.Get();
+		const double Distance = Orb ? FVector::Distance(Viewer.Location, Orb->GetActorLocation()) : 0.0;
+
+		if (Orb && Orb->CanBeCaughtFrom(Viewer.Location) && Distance < NearestDistance)
+		{
+			Nearest = Zone;
+			NearestDistance = Distance;
+		}
+	}
+
+	if (Nearest == INDEX_NONE)
+	{
+		return false;
+	}
+
+	// Caught, it fades for everyone: nobody else can catch it now.
+	FZoneOrb& Slot = ZoneOrbs[Nearest];
+	Slot.Orb->Catch();
+	Slot.RestUntil = GetWorld()->GetTimeSeconds() + ZoneCooldownSeconds;
+
+	const float Health = RoomManager ? RoomManager->AddPlatformHealth(Slot.Platform, CatchHealthBoost) : 0.0f;
+	++OrbsCaught;
+
+	if (OrbsCaughtByPlayer.Num() <= Player)
+	{
+		OrbsCaughtByPlayer.SetNumZeroed(Player + 1);
+	}
+
+	const int32 Theirs = ++OrbsCaughtByPlayer[Player];
+
+	// Drawn whether or not there is a view to write it on, so the round of snippets is the same either way.
+	const FString Snippet = Snippets.Draw();
+
+	// Written out on the catcher's screen only.
+	const UGameInstance* GameInstance = GetGameInstance();
+	const int32 Hud = OrbHudPlayers.IndexOfByPredicate([GameInstance, Player](const TWeakObjectPtr<ULocalPlayer>& Local)
+	{
+		return GameInstance && Local.IsValid() && GameInstance->GetLocalPlayers().IndexOfByKey(Local.Get()) == Player;
+	});
+
+	if (OrbHuds.IsValidIndex(Hud) && OrbHuds[Hud])
+	{
+		OrbHuds[Hud]->SetCount(Theirs, OrbsToCatch);
+
+		if (!Snippet.IsEmpty())
+		{
+			OrbHuds[Hud]->ShowSnippet(Snippet);
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("ObjectPlacer: player %d caught their orb %d of %d (%d caught in all) in zone %d; its segment's health is now %.0f."),
+		Player + 1, Theirs, OrbsToCatch, OrbsCaught, Nearest, Health);
+
+	UpdateOrbSummary();
+
+	// One player has caught every orb there is to catch: the game stops.
+	if (Theirs >= OrbsToCatch)
+	{
+		bOrbsFinished = true;
+		UKismetSystemLibrary::QuitGame(this, GetWorld()->GetFirstPlayerController(), EQuitPreference::Quit, /*bIgnorePlatformRestrictions=*/false);
+	}
+
+	return true;
+}
+
+void AObjectPlacer::BindCatch()
+{
+	const UGameInstance* GameInstance = GetGameInstance();
+
+	if (!GameInstance || bCatchActionMissing)
+	{
+		return;
+	}
+
+	// Each local player as they join, on their own controller, so each catches with their own pad.
+	const TArray<ULocalPlayer*>& Locals = GameInstance->GetLocalPlayers();
+
+	for (int32 Player = 0; Player < Locals.Num(); ++Player)
+	{
+		APlayerController* Controller = Locals[Player] ? Locals[Player]->GetPlayerController(GetWorld()) : nullptr;
+
+		if (!Controller || !Controller->IsLocalController() || CatchInputPlayers.Contains(Controller))
+		{
+			continue;
+		}
+
+		UInputAction* Action = CatchAction.LoadSynchronous();
+
+		if (!Action)
+		{
+			bCatchActionMissing = true;
+			UE_LOG(LogTemp, Warning, TEXT("ObjectPlacer: no catch action set, so orbs cannot be caught."));
+			return;
+		}
+
+		UEnhancedInputComponent* Input = NewObject<UEnhancedInputComponent>(this, NAME_None, RF_Transient);
+		Input->RegisterComponent();
+		Input->bBlockInput = bBlockInput;
+		Input->Priority = InputPriority;
+		Input->BindAction(Action, ETriggerEvent::Started, this, &AObjectPlacer::HandleCatch, Player);
+		Controller->PushInputComponent(Input);
+
+		CatchInputs.Add(Input);
+		CatchInputPlayers.Add(Controller);
+	}
+}
+
+void AObjectPlacer::UnbindCatch()
+{
+	for (int32 Index = 0; Index < CatchInputs.Num(); ++Index)
+	{
+		UEnhancedInputComponent* Input = CatchInputs[Index];
+
+		if (APlayerController* Controller = CatchInputPlayers.IsValidIndex(Index) ? CatchInputPlayers[Index].Get() : nullptr)
+		{
+			Controller->PopInputComponent(Input);
+		}
+
+		if (Input)
+		{
+			Input->DestroyComponent();
+		}
+	}
+
+	CatchInputs.Reset();
+	CatchInputPlayers.Reset();
+	bCatchActionMissing = false;
+}
+
+void AObjectPlacer::HandleCatch(const int32 Player)
+{
+	CatchNearestOrb(Player);
+}
+
+void AObjectPlacer::ShowOrbHud()
+{
+	// Only a game view with players in it: Simulate has neither.
+	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
+	const UGameInstance* GameInstance = GetGameInstance();
+
+	if (!Viewport || !GameInstance)
+	{
+		return;
+	}
+
+	// Over each player's own frame, as they join.
+	bool bAdded = false;
+
+	for (ULocalPlayer* Local : GameInstance->GetLocalPlayers())
+	{
+		if (!Local || !Local->GetPlayerController(World) || OrbHudPlayers.Contains(Local))
+		{
+			continue;
+		}
+
+		TSharedRef<SOrbHud> Hud = SNew(SOrbHud);
+		Viewport->AddViewportWidgetForPlayer(Local, Hud, 10);
+		OrbHuds.Add(Hud);
+		OrbHudPlayers.Add(Local);
+		bAdded = true;
+	}
+
+	if (bAdded)
+	{
+		UpdateOrbHudStyle();
+	}
+}
+
+void AObjectPlacer::HideOrbHud()
+{
+	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
+
+	for (int32 Index = 0; Index < OrbHuds.Num(); ++Index)
+	{
+		if (Viewport && OrbHuds[Index] && OrbHudPlayers[Index].IsValid())
+		{
+			Viewport->RemoveViewportWidgetForPlayer(OrbHudPlayers[Index].Get(), OrbHuds[Index].ToSharedRef());
+		}
+	}
+
+	OrbHuds.Reset();
+	OrbHudPlayers.Reset();
+}
+
+void AObjectPlacer::UpdateOrbHudStyle()
+{
+	if (OrbHuds.IsEmpty())
+	{
+		return;
+	}
+
+	// The typeface is only made again when it changes. A font file is read as it is needed, not on every frame.
+	if (!bHudFontMade || HudFontSource.Get() != TextFont)
+	{
+		bHudFontMade = true;
+		HudFontSource = TextFont;
+
+		const FString Garamond = FPaths::Combine(FPlatformMisc::GetEnvironmentVariable(TEXT("WINDIR")), TEXT("Fonts"), TEXT("GARA.TTF"));
+
+		if (TextFont)
+		{
+			HudFont = FSlateFontInfo(TextFont, 24.0f);
+		}
+		else if (FPaths::FileExists(Garamond))
+		{
+			HudFont = FSlateFontInfo(MakeShared<FStandaloneCompositeFont>(TEXT("Garamond"), Garamond, EFontHinting::Default, EFontLoadingPolicy::LazyLoad), 24.0f);
+		}
+		else
+		{
+			HudFont = FCoreStyle::GetDefaultFontStyle("Regular", 24);
+		}
+	}
+
+	FOrbHudStyle Style;
+	Style.Font = HudFont;
+	Style.TextColor = TextColor;
+	Style.TextHeight = TextHeight;
+	Style.CounterHeight = CounterHeight;
+	Style.LetterSpacing = LetterSpacing;
+	Style.LettersPerSecond = LettersPerSecond;
+	Style.LetterFadeSeconds = LetterFadeSeconds;
+	Style.HoldSeconds = HoldSeconds;
+	Style.HoldSecondsPerLetter = HoldSecondsPerLetter;
+	Style.FadeOutSeconds = TextFadeOutSeconds;
+	Style.LongestWriteSeconds = LongestWriteSeconds;
+	Style.TextTop = TextTop;
+	Style.TextBottom = TextBottom;
+	Style.SmallestTextScale = SmallestTextScale;
+	Style.TiltDegrees = TextTilt;
+	Style.TextPosition = TextPosition;
+	Style.TextWidth = TextWidth;
+	Style.PortraitTextPosition = PortraitTextPosition;
+	Style.PortraitTextWidth = PortraitTextWidth;
+	Style.CounterIcon.SetResourceObject(CounterIcon);
+
+	// Each player's own count.
+	const UGameInstance* GameInstance = GetGameInstance();
+
+	for (int32 Index = 0; Index < OrbHuds.Num(); ++Index)
+	{
+		const int32 Player = GameInstance && OrbHudPlayers[Index].IsValid() ? GameInstance->GetLocalPlayers().IndexOfByKey(OrbHudPlayers[Index].Get()) : INDEX_NONE;
+
+		if (OrbHuds[Index])
+		{
+			OrbHuds[Index]->SetStyle(Style);
+			OrbHuds[Index]->SetCount(OrbsCaughtByPlayer.IsValidIndex(Player) ? OrbsCaughtByPlayer[Player] : 0, OrbsToCatch);
+		}
+	}
+}
+
+void AObjectPlacer::UpdateOrbSummary()
+{
+	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	int32 Standing = 0;
+	int32 Resting = 0;
+	int32 WaitingForRoom = 0;
+
+	for (const FZoneOrb& Slot : ZoneOrbs)
+	{
+		const AOrb* Orb = Slot.Orb.Get();
+
+		if (Orb && !Orb->IsCaught())
+		{
+			++Standing;
+		}
+		else if (Now < Slot.RestUntil)
+		{
+			++Resting;
+		}
+		else
+		{
+			++WaitingForRoom;
+		}
+	}
+
+	// With more than one player, each one's count too.
+	FString ByPlayer;
+
+	if (OrbsCaughtByPlayer.Num() > 1)
+	{
+		for (int32 Player = 0; Player < OrbsCaughtByPlayer.Num(); ++Player)
+		{
+			ByPlayer += FString::Printf(TEXT("%splayer %d %d"), Player == 0 ? TEXT(" (") : TEXT(", "), Player + 1, OrbsCaughtByPlayer[Player]);
+		}
+
+		ByPlayer += TEXT(")");
+	}
+
+	OrbSummary = FString::Printf(TEXT("%d standing, %d waiting for room, %d resting; %d of %d caught%s, %d moved; %d snippets, %d shown this round"),
+		Standing, WaitingForRoom, Resting, OrbsCaught, OrbsToCatch, *ByPlayer, OrbsMoved, Snippets.Num(), Snippets.GetDrawnThisRound());
 }
