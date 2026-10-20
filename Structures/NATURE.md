@@ -26,9 +26,9 @@ So all of a landscape's nature faces look into the same air, and their backs fac
 
 **Air.** Every piece of ground and water keeps the air above it open. This is a box of cells out along its Up, as high as it drew between `MinAirStoreys` and `MaxAirStoreys`. It covers the piece's opening and every seam it shares with a field laid before it in its plane, but never its outline, so cliffs can still rise and drop there. The air holds growth back the way a placed object's obstacle does, without changing any surface, so objects still stand on the ground. A piece is only laid where its lowest storeys of air are already clear of every platform.
 
-**Air pockets.** Whenever the cube is cleared (the start of play, or the Clear Platforms button), `AirPocketCount` pockets are drawn at random across it. The shapes are spheres, cubes, rectangular boxes, ziggurats and cylinders. Each pocket holds back every lattice piece it reaches into, so nothing is ever built there.
+**Air pockets.** Whenever the cube is cleared (the start of play, or the Clear Platforms button), `AirPocketCount` pockets are drawn at random across it. The shapes are spheres, cubes, rectangular boxes, ziggurats and cylinders. Each pocket holds back every lattice piece it reaches into, so nothing is ever built there. Since 2026-10-17 no pocket keeps its clean shape: noise makes its outline swell and dent (see Noisy pockets and molds).
 
-**Molds** (asked for on 2026-10-15). A mold is a box of air with a shape left open inside it, for the city to grow into. The shape is a ziggurat, a cylinder, a dome, a square tower, or a combination of two or three of them stacked, each no wider than the one below, with a dome only ever on top. The box holds back everything except the shape and an **open floor**: a layer across the bottom of the box (`MoldOpenFloor`, one module by default). The city spreads in under the shape from any side through that floor, and walls standing on it rise into the shape. Inside the shape the city grows as it does anywhere else. (The first version, without the open floor, almost never got filled. See Known limits.)
+**Molds** (asked for on 2026-10-15). A mold is a box of air with a shape left open inside it, for the city to grow into. The shape is a ziggurat, a cylinder, a dome, a square tower, or a combination of two or three of them stacked, each no wider than the one below, with a dome only ever on top. The box holds back everything except the shape and an **open floor**: a layer across the bottom of the box (`MoldOpenFloor`, one module by default). The city spreads in under the shape from any side through that floor, and walls standing on it rise into the shape. Inside the shape the city grows as it does anywhere else. (The first version, without the open floor, almost never got filled. See Known limits.) Since 2026-10-17 the box and the shape wander with noise, and some molds' shapes run out through the top of the box (see Noisy pockets and molds).
 
 Molds are drawn before the pockets, from a stream of their own. Molds stay clear of each other, and pockets stay clear of molds, but pockets may overlap each other. Molds are drawn near the cube's centre, where growth starts (`MoldSpread`).
 
@@ -79,6 +79,8 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Air Pockets: Sphere / Box / Rectangular / Ziggurat / Cylinder Weight | | 1 each | How often each shape is drawn. Zero never. |
 | Grid \| Air Pockets: Ziggurat Tiers | `ZigguratTiers` | 4 | Steps, each narrower than the one below by an even step. |
 | Grid \| Air Pockets: Air Pockets Along Any Axis | `bAirPocketsAlongAnyAxis` | on | Ziggurats and cylinders stand along any axis, either way. Off, they stand upright in the world. |
+| Grid \| Air Pockets: Air Pocket Noise | `AirPocketNoise` | 0.35 | How far a pocket's outline wanders in and out, as a part of its half size. Zero keeps the clean shapes. |
+| Grid \| Air Pockets: Air Pocket Noise Scale | `AirPocketNoiseScale` | 0.75 | How broad the lumps are, as a part of the pocket's size across. Small makes many little lumps, large a few broad swells. |
 | Grid \| Air Pockets: Show Air Pockets | `bShowAirPockets` | on | Each pocket's outline, in its shape's colour. |
 | Grid \| Air Pockets: Show Air Pocket Pieces | `bShowAirPocketPieces` | off | A point at every lattice piece a pocket holds back. This is what growth can no longer use, which is coarser than the outline. Many points in a large cube. |
 | Grid \| Air Pockets: Sphere / Box / Rectangular / Ziggurat / Cylinder Color | | cyan, magenta, orange, lime, violet | Debug colours. |
@@ -87,6 +89,10 @@ Where things could start is sampled, not walked in full: 48 of the city's open p
 | Grid \| Molds: Min / Max Mold Size | `MinMoldSize`, `MaxMoldSize` | 64, 128 | Cells along each side of the box. Each side is drawn separately. |
 | Grid \| Molds: Min / Max Mold Fill | `MinMoldFill`, `MaxMoldFill` | 0.5, 0.9 | How much of its box (above the open floor) the open shape fills. Width and height are each drawn between the two. A shape narrower than a tile (17 cells for a 16x16) can never hold a platform. |
 | Grid \| Molds: Mold Open Floor | `MoldOpenFloor` | 4 | Cells at the bottom of the box left open all the way across, for growth to come in under the shape. Zero means only the shape's own foot is open. |
+| Grid \| Molds: Mold Open Top Chance | `MoldOpenTopChance` | 0.3 | How often a mold's shape runs the whole height of the box and out through its top, so growth can also reach it from above. Never a dome; a stack then has no dome on top. |
+| Grid \| Molds: Mold Noise | `MoldNoise` | 0.25 | How far the box wanders in and out, as a part of its half width. The floor stays level; the wander grows toward the top. Zero keeps the box square. |
+| Grid \| Molds: Mold Shape Noise | `MoldShapeNoise` | 0.2 | How far the open shape wanders on top of the box, as a part of its foot's half width. |
+| Grid \| Molds: Mold Noise Scale | `MoldNoiseScale` | 0.75 | How broad the lumps of the box and of the shape are, as a part of the box across. |
 | Grid \| Molds: Mold Ziggurat / Cylinder / Dome / Tower / Combination Weight | | 1 each | How often each shape is drawn. A ziggurat steps in `ZigguratTiers` tiers. |
 | Grid \| Molds: Mold Spread | `MoldSpread` | 0.35 | How far from the cube's centre a mold may be drawn, as a part of the cube. 1 means anywhere. |
 | Grid \| Molds: Molds Along Any Axis | `bMoldsAlongAnyAxis` | off | Off, molds stand upright with their floor at the bottom. |
@@ -328,6 +334,58 @@ So at the default of 0.25 the runs don't show in one 20 s run; at 1 they clearly
 Raise the two chances for more, or ask for runs to start when a floor is laid beside walls already standing.
 
 In NewMap the walls standing on a ground's edge were mostly exteriors over exterior grounds (341 of 654). Interiors over interior grounds were 65, and walls of both sides over the ground 76.
+
+## Noisy pockets and molds
+
+Asked on 2026-10-17: "Airpockets and molds have more noise to them, not completely rectangular or evenly shaped, more variation in form. Same for the inside of a mold." Then: "Also some molds have the top open too, meaning the mold extends from bottom to top."
+
+**How it works.** Every pocket and mold draws a field of smooth 3D noise over its reach (`FAirPocket::FWarp`). Each cell is moved by the field before it is tested against the clean shape. This is a domain warp: the outline swells and dents, but the shape still reads as a sphere, a box or a cylinder.
+- The noise is two layers of Perlin noise: broad lumps, with finer lumps half as strong on top of them. It is doubled and clipped, so a typical cell moves about a third of the amount and a few move all of it.
+- A pocket's lumps are `AirPocketNoiseScale` of its size across, and they move cells by up to `AirPocketNoise` of its half size.
+- The field is held on a grid of nodes a quarter of the finer lumps apart, never closer than a module, and blended in between. Testing a cell costs eight lookups, not fresh noise, which matters because a moving pocket is cut a slab per tick.
+- The field is kept as offsets from the pocket's centre, so a pocket keeps its lumps wherever it moves.
+- The noise comes from a stream of its own per draw. With the noise at 0, every pocket and mold is exactly what it was before.
+- A pocket's bounds grow by the furthest its noise can move a cell, so slabs, the mold-clear checks and the mold pull all cover the moved outline.
+- Lines draw the moved outline: each edge in short steps, each point moved back through the field (`GetUnwarpedPoint`).
+
+**Molds** get two fields:
+- The **box's** field (`MoldNoise`) moves the box and everything in it.
+- The **shape's** own field (`MoldShapeNoise`) moves the shape again inside the box. Its lumps are as broad as the box's. With lumps sized to the shape, a ziggurat's narrow top tiers drifted apart from each other in the prototype.
+- Neither field moves anything along the mold's axis at its floor, and both move more the higher up. So the open floor stays a level layer that growth can slide in along, and the shape stands on it.
+- Whatever the noise does, a module of the box stays held round the shape, and over it unless it opens at the top. So a mold is still reached only from its floor (or from above), never through a side.
+
+**Cost.** Measured by `WEM.Nature.PocketNoisePerf` (stress filter): NewMap's 509 cube, seed 4242, six pockets and two molds, 1500 platforms grown, run clean and then noisy.
+
+| | Clean | Noisy |
+|---|---|---|
+| Clearing | 67-75 ms | 127-144 ms |
+| Cutting every pocket afresh | 29-31 ms | 88-107 ms |
+| Moving every pocket, a slab per step: mean | 1.6-1.8 ms | 3.6-4.1 ms |
+| Moving every pocket, a slab per step: longest | 26-29 ms | 39-50 ms |
+
+The first noisy version took 205 ms to cut and 6.1 ms / 63 ms per step. Three changes brought it down:
+- The noise is sampled once per lattice module, not once per cell. Every cell of a module moves alike (each still damped for its own height in a mold, so the floor stays exactly level), and a piece, whose cells all lie in one module, costs one sample.
+- A move step judges placements again only inside the box its slab's pieces actually reach (`GetPocketPiecesBox`), not across the whole slab of the bounds. This helps clean pockets too.
+- Pieces whose moved cells cannot reach the clean shape's box are skipped untested.
+
+The longest step is the re-judging of placements after one slab of a big mold. It was already a long frame without noise.
+
+**Open at the top** (`MoldOpenTopChance`, 0.3): the shape runs the whole height of the box, and its top part reaches on out through the box's top however the top has wandered. Domes never open: a single dome stays closed, and a stack that opens has no dome on top. The decision comes from a stream of its own, and the shape's height is still drawn, so the other molds come out as they would have.
+
+**My calls:**
+- I read "the mold extends from bottom to top" as the open shape running through the top of its box, so growth can come in from above as well as from the floor.
+- "Same for the inside" is the second field. The box's own noise already moves the shape with the box.
+- The guaranteed one-module wall and lid are mine. Without them the shape's noise punched holes in the sides of closed molds.
+- Defaults were picked by rendering slices in a Python copy of the warp (`noise_proto.py` in the session scratchpad).
+- A narrow stack that opens at the top can open only a few cells wide, too narrow for a tile to grow through.
+
+**Tests:** `WEM.Nature.PocketNoise` checks the following:
+- Every noisy pocket differs from its clean shape and still holds cells back.
+- Growth never builds into a pocket as drawn, and agrees with a full rebuild.
+- The same seed draws the same lumps, and noise 0 gives the clean shapes.
+- For towers, cylinders and stacks, open and closed: the open floor holds nothing back, nothing below it is held, and the shape is reached from the floor. It leaves the box through the top only when it opens there.
+
+`WEM.Nature.Molds` and `WEM.Nature.Mushroom` measure exact boxes, so they switch the noise off. `WEM.Nature.AirPockets` now tests platforms against the pockets as drawn, noise included. **117/117 WEM tests pass**, together with the ground-tile session's uncommitted work in the same checkout.
 
 ## Built
 

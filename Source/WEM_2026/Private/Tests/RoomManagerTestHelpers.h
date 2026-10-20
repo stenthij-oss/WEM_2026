@@ -274,9 +274,13 @@ struct FRoomManagerTestAccess
 		int32 Parts = 0;
 		double OpenFloor = 0.0;
 
-		/** Its reach, in cells. */
+		/** Its reach, in cells, as far as its warp moves it. */
 		FVector Min = FVector::ZeroVector;
 		FVector Max = FVector::ZeroVector;
+
+		/** Whether its noise moves its outline - a mold's box or its shape - and whether a mold's shape runs out through its top. */
+		bool bWarped = false;
+		bool bOpenTop = false;
 	};
 
 	static TArray<FPocket> GetAirPockets(const ARoomManager& Manager)
@@ -287,6 +291,8 @@ struct FRoomManagerTestAccess
 			FPocket& Read = Pockets.Add_GetRef(FPocket{ Pocket.Shape, Pocket.Centre, Pocket.HalfSize, Pocket.Axis, Pocket.AxisSign,
 				Pocket.FaceKeys.Num() + Pocket.EdgeKeys.Num() + Pocket.NodeKeys.Num(), Pocket.bMold, Pocket.MoldShape, Pocket.Parts.Num(), Pocket.OpenFloor });
 			Manager.GetPocketBounds(Pocket, Read.Min, Read.Max);
+			Read.bWarped = !Pocket.Warp.IsEmpty() || !Pocket.ShapeWarp.IsEmpty();
+			Read.bOpenTop = Pocket.bOpenTop;
 		}
 
 		return Pockets;
@@ -326,6 +332,18 @@ struct FRoomManagerTestAccess
 	static bool IsCellInMoldShape(const ARoomManager& Manager, const int32 Index, const FIntVector& Cell)
 	{
 		return Manager.IsCellInMoldShape(Manager.AirPockets[Index], Cell);
+	}
+
+	/** Whether a cell's centre lies in the box of the mold drawn at Index as its warp moves it, held back or open. */
+	static bool IsCellInMoldBox(const ARoomManager& Manager, const int32 Index, const FIntVector& Cell)
+	{
+		const ARoomManager::FAirPocket& Mold = Manager.AirPockets[Index];
+		FVector Offset = FVector(Cell) + FVector(0.5) - Mold.Centre;
+		Offset += ARoomManager::DampWarp(Mold, Manager.SamplePocketShift(Mold, Cell).Box, Offset);
+
+		return FMath::Abs(Offset[(Mold.Axis + 1) % 3]) <= Mold.HalfSize.X
+			&& FMath::Abs(Offset[(Mold.Axis + 2) % 3]) <= Mold.HalfSize.Y
+			&& FMath::Abs(Offset[Mold.Axis]) <= Mold.HalfSize.Z;
 	}
 
 	/** How many lattice pieces the obstacles hold back - the objects'. */
@@ -374,6 +392,12 @@ struct FRoomManagerTestAccess
 	static void StepPocketMove(ARoomManager& Manager)
 	{
 		Manager.StepPocketMove();
+	}
+
+	/** Cuts the pieces of the pocket or mold drawn at Index afresh, every slab, as the lattice stands: what drawing one costs. */
+	static void CutPocketPieces(ARoomManager& Manager, const int32 Index)
+	{
+		Manager.CutPocketPieces(Manager.AirPockets[Index]);
 	}
 
 	static bool IsPocketMoving(const ARoomManager& Manager)

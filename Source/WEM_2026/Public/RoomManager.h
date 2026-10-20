@@ -920,6 +920,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0", EditCondition = "bMushroomAir"))
 	int32 MaxMushroomSpread = 48;
 
+	/**
+	 * How irregular a crown grows, from none - one block - to one. Each storey of it reaches out further or less far on
+	 * every side, by up to a quarter of the crown's width at one, and its top storey, once it has two, breaks into lumps.
+	 * Drawn from the run's seed and the landscape's first piece, so a crown keeps its shape as the landscape grows.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "bMushroomAir"))
+	float MushroomIrregularity = 0.5f;
+
 	/** The landscapes standing and the air over the largest. Readout only. */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Transient, Category = "Grid|Air")
 	FString AirSummary;
@@ -963,6 +971,18 @@ public:
 	/** Lets a ziggurat or a cylinder stand along any axis, either way, rather than upright in the world. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets")
 	bool bAirPocketsAlongAnyAxis = true;
+
+	/**
+	 * How far a pocket's outline wanders in and out, as a part of its half size: lumps and dents that leave no two
+	 * pockets alike and none quite its shape, though each still reads as one. Zero keeps the clean shapes. Drawn when
+	 * the cube is cleared, from a stream of its own, and kept by a pocket wherever it moves.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float AirPocketNoise = 0.35f;
+
+	/** How broad a pocket's lumps are, as a part of its size across: small makes many little ones, large a few broad swells. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Air Pockets", meta = (ClampMin = "0.1", ClampMax = "4.0"))
+	float AirPocketNoiseScale = 0.75f;
 
 	/**
 	 * Lets every pocket and mold break down during play and form again somewhere else, one at a time, the same shape.
@@ -1064,6 +1084,28 @@ public:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0"))
 	int32 MoldOpenFloor = 4;
+
+	/**
+	 * How often a mold's open shape runs the whole height of its box and out through its top, so growth can reach it
+	 * from above as well as from the floor. Never a dome, which closes over; a stack has no dome on top.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MoldOpenTopChance = 0.3f;
+
+	/**
+	 * How far a mold's box wanders in and out, as a part of its half width. Its floor stays level, so growth still slides
+	 * in under the shape, and the wander grows toward its top. Zero keeps the box square.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MoldNoise = 0.25f;
+
+	/** How far the shape open inside a mold wanders on top of its box, as a part of the shape's half width at its foot. Zero keeps it clean. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float MoldShapeNoise = 0.2f;
+
+	/** How broad the lumps of a mold and of its shape are, as a part of its box across. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "0.1", ClampMax = "4.0"))
+	float MoldNoiseScale = 0.75f;
 
 	/** How much likelier a beat draws a placement whose middle lies in a mold's box than one anywhere else. One draws them alike. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Grid|Molds", meta = (ClampMin = "1.0"))
@@ -2091,6 +2133,14 @@ private:
 	 * as they were drawn until the cube is cleared again, however the settings change in between, since
 	 * the platforms standing grew round them.
 	 *
+	 * No pocket keeps its clean shape. Each draws a field of smooth noise over its reach (FAirPocket::FWarp), and
+	 * every cell is moved by it before it is tested against the shape: the outline swells and dents by up to
+	 * AirPocketNoise of the pocket's half size, in lumps AirPocketNoiseScale of its size across, broad ones with
+	 * finer ones on them. The noise is held on a grid of nodes, a quarter of the finer lumps apart, and blended in
+	 * between, and sampled once for each module of the lattice: every cell of a module moves alike, so a lattice
+	 * piece - whose cells all lie in one module - costs one sample. A pocket is cut a slab a tick while it moves.
+	 * Lines draw the outline as the noise has moved it, sampled smoothly.
+	 *
 	 * Molds
 	 * -----
 	 * Before the pockets, MoldCount molds are drawn the same way, from a stream of their own: rectangular boxes,
@@ -2100,7 +2150,13 @@ private:
 	 * height above an open layer, MoldOpenFloor cells deep, across the bottom of the box: growth spreads in under
 	 * the shape from any side, and rises from there into the shape, inside which it grows as anywhere: whatever
 	 * forms above the layer, forms in the shape. Molds are kept clear of
-	 * each other, and pockets clear of molds - pockets may still overlap pockets.
+	 * each other, and pockets clear of molds - pockets may still overlap pockets. With MoldOpenTopChance a
+	 * mold's shape - never a dome - runs the whole height of the box and out through its top instead.
+	 *
+	 * A mold's box wanders like a pocket, by MoldNoise, and its shape wanders inside it again, by
+	 * MoldShapeNoise, its lumps as broad as the box's so a ziggurat's tiers move together. Neither moves
+	 * anything along the mold's axis at its floor, and both more the higher up: the open floor stays a level
+	 * layer growth can slide in along, and the shape stands on it.
 	 *
 	 * Paths
 	 * -----
@@ -2339,6 +2395,13 @@ private:
 	int32 GetMushroomSpread(int32 Pieces) const;
 
 	/**
+	 * The boxes a landscape's crown is made of, from Block, the one block it would be: by MushroomIrregularity a slab per
+	 * storey out from the trunk along NormalAxis, each side of it moved in or out by whole modules, and the top storey,
+	 * once there are two, two lumps. Drawn from the run's seed and LandscapeHash, so the crown keeps its shape as it grows.
+	 */
+	void GatherCrownBoxes(const FAirBox& Block, int32 NormalAxis, bool bOutPositive, uint32 LandscapeHash, TArray<FAirBox>& OutBoxes) const;
+
+	/**
 	 * Brings the air the fields keep open in line with the fields standing: works it out afresh, swaps in only the boxes
 	 * that changed, and - with bRefreshLists - judges again the placements those reach into or have let go of.
 	 */
@@ -2401,6 +2464,36 @@ private:
 		/** How many cells at the bottom of a mold's box are open all the way across; its shapes start above them. */
 		double OpenFloor = 0.0;
 
+		/** Whether a mold's shape runs out through the top of its box, its top part reaching on past its End. */
+		bool bOpenTop = false;
+
+		/**
+		 * A field of offsets over a pocket's reach, which moves every cell before it is tested against the shape: what makes
+		 * the outline wander. Held as offsets from the pocket's centre, so it moves with the pocket. Empty moves nothing.
+		 */
+		struct FWarp
+		{
+			/** Its first node, from the pocket's centre, how many cells apart the nodes lie, and how many along each axis. */
+			FVector Origin = FVector::ZeroVector;
+			double Step = 1.0;
+			FIntVector Count = FIntVector::ZeroValue;
+
+			/** The offset at each node, X fastest. */
+			TArray<FVector3f> Offsets;
+
+			/** The furthest it moves a cell along any one axis. */
+			double Reach = 0.0;
+
+			bool IsEmpty() const { return Offsets.IsEmpty(); }
+
+			/** The offset at a place given from the pocket's centre, blended from the nodes round it. */
+			FVector Sample(const FVector& Offset) const;
+		};
+
+		/** What moves a pocket's cells - a mold's box, and all in it - and, for a mold, its open shapes on top of that. */
+		FWarp Warp;
+		FWarp ShapeWarp;
+
 		/** How many times it has formed again since the cube was cleared. With the run's seed and its index, where it goes. */
 		int32 Draw = 0;
 
@@ -2452,6 +2545,12 @@ private:
 	/** Cuts the pieces of a pocket's next slab, the first not yet cut, onto its lists. */
 	void CutPocketSlab(FAirPocket& Pocket) const;
 
+	/**
+	 * The box of cells a run of a pocket's pieces reaches - from From to To in its three lists, as SlabEnds counts them -
+	 * each taken a module on from its min corner. False when the run is empty. What a slab's move has to judge again.
+	 */
+	bool GetPocketPiecesBox(const FAirPocket& Pocket, const FIntVector& From, const FIntVector& To, FAirBox& OutBox) const;
+
 	/** Counts a pocket's pieces into the pocket keys, or out of them: one slab's, or every slab's. */
 	void CountPocketSlabKeys(const FAirPocket& Pocket, int32 Slab, int32 Delta);
 	void AddPocketKeys(const FAirPocket& Pocket);
@@ -2476,17 +2575,66 @@ private:
 	/** Draws the shapes one mold leaves open inside its box, from Stream. */
 	void DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const;
 
-	/** The box of cells a pocket or mold can reach, in cells, its corners included. */
+	/** How far a pocket's clean shape reaches from its centre along each world axis, in cells. */
+	static FVector GetPocketReach(const FAirPocket& Pocket);
+
+	/** The box of cells a pocket or mold can reach, in cells, its corners included, as far as its warp moves it. */
 	void GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const;
+
+	/**
+	 * Fills a warp over Reach - half measures along each world axis, from the pocket's centre - that moves cells by up to
+	 * Amount along each axis, in lumps Wavelength across with finer ones on them, its place in the noise drawn from Stream.
+	 * Empty when Amount or Wavelength is none.
+	 */
+	void BuildPocketWarp(FAirPocket::FWarp& Warp, const FVector& Reach, double Amount, double Wavelength, FRandomStream& Stream) const;
+
+	/** Draws the warps of a pocket or mold by the noise settings, from the stream for its draw Index. */
+	void DrawPocketWarps(FAirPocket& Pocket, int32 Index) const;
+
+	/**
+	 * How far one of a pocket's warps moves a place given from its centre, sampled right there - for drawing. In a mold none
+	 * of it runs along the mold's axis at the top of its open floor or below, and all of it at the top of its box, so the
+	 * floor stays level: DampWarp, which takes a shift sampled anywhere and damps it for the place it moves.
+	 */
+	static FVector GetWarpShift(const FAirPocket& Pocket, const FAirPocket::FWarp& Warp, const FVector& Offset);
+	static FVector DampWarp(const FAirPocket& Pocket, const FVector& Shift, const FVector& Offset);
+
+	/** A pocket's two warps sampled for one module of the lattice, before damping. */
+	struct FPocketShift
+	{
+		FVector Box = FVector::ZeroVector;
+		FVector Shape = FVector::ZeroVector;
+	};
+
+	/**
+	 * The warps for the module a cell lies in, sampled at its middle. Every cell of a module moves alike - each damped for
+	 * its own height in a mold - so a lattice piece, whose cells all lie in one module, costs one sample however many
+	 * cells it tests, and growth, which sees only pieces, sees no difference.
+	 */
+	FPocketShift SamplePocketShift(const FAirPocket& Pocket, const FIntVector& Cell) const;
+
+	/** Where a point given in a pocket's clean shape, from its centre, lies in cells: undoes its warp, and with bInShape a mold's shape warp first. */
+	FVector GetUnwarpedPoint(const FAirPocket& Pocket, const FVector& ShapeOffset, bool bInShape) const;
 
 	/** Whether a cell's centre lies inside one of a mold's open shapes, or its open floor. */
 	bool IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& Cell) const;
 
+	/** The same for a place from the mold's centre that its box's warp has already moved, its shape warp's ShapeShift still to come. */
+	bool IsOffsetInMoldShape(const FAirPocket& Mold, const FVector& BoxOffset, const FVector& ShapeShift) const;
+
+	/**
+	 * A line of a pocket's clean shape, From and To given from its centre, as its warp has moved it - with bInShape a mold's
+	 * shape warp too - in short steps when it wanders. A box's twelve edges the same way, Min and Max its corners.
+	 */
+	void AppendWarpedLine(const FAirPocket& Pocket, const FVector& From, const FVector& To, bool bInShape, const FLinearColor& Color, TArray<FBatchedLine>& Lines) const;
+	void AppendWarpedBox(const FAirPocket& Pocket, const FVector& Min, const FVector& Max, bool bInShape, const FLinearColor& Color, TArray<FBatchedLine>& Lines) const;
+
 	/** One mold's box and the shapes open inside it, as lines. */
 	void AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>& Lines) const;
 
-	/** Whether a cell's centre lies inside a pocket. */
+	/** Whether a cell's centre lies inside a pocket, and the same with the warps for its module already sampled. */
 	bool IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const;
+	bool IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell, const FPocketShift& Shift) const;
 
 	/** Works out the lattice pieces a pocket reaches into: every one with a cell inside it. */
 	void CutPocketPieces(FAirPocket& Pocket) const;
@@ -2644,7 +2792,8 @@ private:
 	 * across their seams in one plane make a landscape. Every piece keeps MinAirStoreys to MaxAirStoreys of air - one
 	 * storey by default - its trunk; with bMushroomAir a crown grows over the landscape like a tree's, from above its
 	 * first storey up, MushroomStoreysPerPiece taller and MushroomSpreadPerPiece cells further past the landscape's edges
-	 * for every piece beyond the first. It is kept as boxes, bucketed by
+	 * for every piece beyond the first. With MushroomIrregularity the crown is no one block but a slab a storey, each
+	 * reaching out further or less far on every side, and a top of two lumps. It is kept as boxes, bucketed by
 	 * where they are, rather than as lattice pieces, since it changes whenever a landscape does.
 	 */
 

@@ -4542,6 +4542,89 @@ int32 ARoomManager::GetMushroomSpread(const int32 Pieces) const
 	return (Cells / Module) * Module;
 }
 
+void ARoomManager::GatherCrownBoxes(const FAirBox& Block, const int32 NormalAxis, const bool bOutPositive, const uint32 LandscapeHash, TArray<FAirBox>& OutBoxes) const
+{
+	const float Irregularity = FMath::Clamp(MushroomIrregularity, 0.0f, 1.0f);
+
+	if (Irregularity <= 0.0f)
+	{
+		OutBoxes.Add(Block);
+		return;
+	}
+
+	const int32 Module = GetModule();
+	const int32 Storey = FMath::Max(StoreyCells, 1);
+	const int32 LastCell = ResolveGridSize() - 1;
+	const int32 Height = Block.Max[NormalAxis] - Block.Min[NormalAxis] + 1;
+	const int32 Storeys = FMath::DivideAndRoundUp(Height, Storey);
+
+	int32 U, V;
+	GetInPlaneAxes(NormalAxis, U, V);
+
+	// In whole modules, so every side lies on lattice lines like the block's.
+	auto Snap = [Module](const double Cells)
+	{
+		return FMath::RoundToInt32(Cells / Module) * Module;
+	};
+
+	for (int32 Level = 0; Level < Storeys; ++Level)
+	{
+		// This storey of it, counted out from the trunk.
+		FAirBox Slab = Block;
+		const int32 Near = Level * Storey;
+		const int32 Far = FMath::Min(Near + Storey, Height) - 1;
+
+		if (bOutPositive)
+		{
+			Slab.Min[NormalAxis] = Block.Min[NormalAxis] + Near;
+			Slab.Max[NormalAxis] = Block.Min[NormalAxis] + Far;
+		}
+		else
+		{
+			Slab.Max[NormalAxis] = Block.Max[NormalAxis] - Near;
+			Slab.Min[NormalAxis] = Block.Max[NormalAxis] - Far;
+		}
+
+		// From the landscape and the storey alone, so a storey keeps its shape while the crown grows round it.
+		FRandomStream Stream(static_cast<int32>(HashCombineFast(
+			HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("Crowns")))),
+			HashCombineFast(LandscapeHash, GetTypeHash(Level)))));
+
+		// Each side in or out by up to a quarter of the block's width, at full irregularity. Two quarters in at most, so
+		// the sides never cross.
+		for (const int32 Axis : { U, V })
+		{
+			const double Wander = 0.25 * Irregularity * (Block.Max[Axis] - Block.Min[Axis]);
+			Slab.Min[Axis] = FMath::Clamp(Slab.Min[Axis] - Snap(Wander * Stream.FRandRange(-1.0f, 1.0f)), 0, LastCell);
+			Slab.Max[Axis] = FMath::Clamp(Slab.Max[Axis] + Snap(Wander * Stream.FRandRange(-1.0f, 1.0f)), Slab.Min[Axis], LastCell);
+		}
+
+		if (Storeys < 2 || Level < Storeys - 1)
+		{
+			OutBoxes.Add(Slab);
+			continue;
+		}
+
+		// The top storey as two lumps, each over a part of it: the less irregular, the more of it.
+		for (int32 Lump = 0; Lump < 2; ++Lump)
+		{
+			FAirBox Part = Slab;
+
+			for (const int32 Axis : { U, V })
+			{
+				const int32 Width = Slab.Max[Axis] - Slab.Min[Axis];
+				const int32 PartWidth = FMath::Clamp(Snap(Width * Stream.FRandRange(1.0f - 0.6f * Irregularity, 1.0f - 0.2f * Irregularity)), FMath::Min(Module, Width), Width);
+				const int32 Room = Width - PartWidth;
+
+				Part.Min[Axis] = Slab.Min[Axis] + FMath::FloorToInt32(Room * Stream.FRand() / Module) * Module;
+				Part.Max[Axis] = Part.Min[Axis] + PartWidth;
+			}
+
+			OutBoxes.Add(Part);
+		}
+	}
+}
+
 void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscapes, int32* OutLargest) const
 {
 	OutBoxes.Reset();
@@ -4710,7 +4793,7 @@ void ARoomManager::GatherFieldAir(TArray<FAirBox>& OutBoxes, int32* OutLandscape
 
 		Box.Min[NormalAxis] = bOutPositive ? Plane + TrunkTop + 1 : Plane - Top;
 		Box.Max[NormalAxis] = bOutPositive ? Plane + Top : Plane - TrunkTop - 1;
-		OutBoxes.Add(Box);
+		GatherCrownBoxes(Box, NormalAxis, bOutPositive, GetTypeHash(MakePlatformKey(First)), OutBoxes);
 	}
 
 	if (OutLandscapes)
@@ -5223,8 +5306,11 @@ void ARoomManager::StepPocketMove()
 		if (!Pocket.SlabEnds.IsEmpty())
 		{
 			const int32 Slab = Pocket.SlabEnds.Num() - 1;
-			const FAirBox Region = GetPocketSlabBox(Pocket, Slab);
 			const FIntVector Start = Slab > 0 ? Pocket.SlabEnds[Slab - 1] : FIntVector::ZeroValue;
+
+			// Only where the slab's pieces lie, which is often far less than the slab across its bounds.
+			FAirBox Region;
+			const bool bHeldAny = GetPocketPiecesBox(Pocket, Start, Pocket.SlabEnds[Slab], Region);
 
 			CountPocketSlabKeys(Pocket, Slab, -1);
 			Pocket.FaceKeys.SetNum(Start.X);
@@ -5232,7 +5318,11 @@ void ARoomManager::StepPocketMove()
 			Pocket.NodeKeys.SetNum(Start.Z);
 			Pocket.SlabEnds.Pop();
 
-			FreeCandidatesIn(MakeArrayView(&Region, 1));
+			if (bHeldAny)
+			{
+				FreeCandidatesIn(MakeArrayView(&Region, 1));
+			}
+
 			return;
 		}
 
@@ -5264,11 +5354,17 @@ void ARoomManager::StepPocketMove()
 	// Forming, from the bottom: one slab cut and held, and what is listed there drops out.
 	if (Pocket.SlabEnds.Num() < GetPocketSlabCount(Pocket))
 	{
-		const FAirBox Region = GetPocketSlabBox(Pocket, Pocket.SlabEnds.Num());
+		const FIntVector Start = Pocket.SlabEnds.IsEmpty() ? FIntVector::ZeroValue : Pocket.SlabEnds.Last();
 
 		CutPocketSlab(Pocket);
 		CountPocketSlabKeys(Pocket, Pocket.SlabEnds.Num() - 1, 1);
-		DropCandidatesIn(MakeArrayView(&Region, 1));
+
+		FAirBox Region;
+
+		if (GetPocketPiecesBox(Pocket, Start, Pocket.SlabEnds.Last(), Region))
+		{
+			DropCandidatesIn(MakeArrayView(&Region, 1));
+		}
 	}
 
 	if (Pocket.SlabEnds.Num() >= GetPocketSlabCount(Pocket))
@@ -5276,6 +5372,29 @@ void ARoomManager::StepPocketMove()
 		MovingPocket = INDEX_NONE;
 		bPocketForming = false;
 	}
+}
+
+bool ARoomManager::GetPocketPiecesBox(const FAirPocket& Pocket, const FIntVector& From, const FIntVector& To, FAirBox& OutBox) const
+{
+	const int32 Module = GetModule();
+	bool bAny = false;
+
+	// Each piece within a module on from its min corner, whatever it is: a face, an edge or a node.
+	auto Take = [&](const TArray<uint64>& Keys, const int32 First, const int32 End)
+	{
+		for (int32 Index = First; Index < End; ++Index)
+		{
+			const FIntVector Corner = CellFromKey(Keys[Index]);
+			OutBox.Min = bAny ? ComponentMin(OutBox.Min, Corner) : Corner;
+			OutBox.Max = bAny ? ComponentMax(OutBox.Max, Corner + FIntVector(Module)) : Corner + FIntVector(Module);
+			bAny = true;
+		}
+	};
+
+	Take(Pocket.FaceKeys, From.X, To.X);
+	Take(Pocket.EdgeKeys, From.Y, To.Y);
+	Take(Pocket.NodeKeys, From.Z, To.Z);
+	return bAny;
 }
 
 void ARoomManager::MovePocket(const int32 Index)
@@ -5405,9 +5524,13 @@ void ARoomManager::SpawnAirPockets()
 	const float MoldWeights[] = { MoldZigguratWeight, MoldCylinderWeight, MoldDomeWeight, MoldTowerWeight, MoldCombinationWeight };
 	int32 MoldCounts[UE_ARRAY_COUNT(MoldWeights)] = {};
 	int32 MoldsLeftOut = 0;
+	int32 OpenTops = 0;
 
 	{
 		FRandomStream Stream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("Molds"))))));
+
+		// Which open at the top, from a stream of their own, so the molds' shapes and places are drawn as they were.
+		FRandomStream TopStream(static_cast<int32>(HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(TEXT("MoldTops"))))));
 		const int32 Smallest = FMath::Max(MinMoldSize, 4);
 		const int32 Largest = FMath::Max(MaxMoldSize, Smallest);
 
@@ -5439,7 +5562,11 @@ void ARoomManager::SpawnAirPockets()
 			Mold.OpenFloor = FMath::Max(MoldOpenFloor, 0);
 			Mold.HalfSize.Z = FMath::Max(Mold.HalfSize.Z, 0.5 * (Mold.OpenFloor + 2.0 * GetModule()));
 
+			// A dome closes over, so it never opens at the top.
+			Mold.bOpenTop = TopStream.FRand() < MoldOpenTopChance && Mold.MoldShape != EMoldShape::Dome;
+
 			DrawMoldParts(Mold, Stream);
+			DrawPocketWarps(Mold, Index);
 
 			if (!Place(Mold, Stream, FMath::Clamp(MoldSpread, 0.0f, 1.0f)))
 			{
@@ -5449,6 +5576,7 @@ void ARoomManager::SpawnAirPockets()
 
 			CutPocketPieces(Mold);
 			++MoldCounts[ShapeIndex];
+			OpenTops += Mold.bOpenTop ? 1 : 0;
 			AirPockets.Add(MoveTemp(Mold));
 		}
 	}
@@ -5510,6 +5638,8 @@ void ARoomManager::SpawnAirPockets()
 				Pocket.AxisSign = Stream.FRand() < 0.5f ? 1 : -1;
 			}
 
+			DrawPocketWarps(Pocket, Index);
+
 			if (!Place(Pocket, Stream, 1.0))
 			{
 				++LeftOut;
@@ -5541,9 +5671,9 @@ void ARoomManager::SpawnAirPockets()
 	AirPocketSummary =FString::Printf(TEXT("%d pockets: %d sphere, %d box, %d rectangular, %d ziggurat, %d cylinder; %d left out"),
 		Counts[0] + Counts[1] + Counts[2] + Counts[3] + Counts[4], Counts[0], Counts[1], Counts[2], Counts[3], Counts[4], LeftOut);
 
-	MoldSummary = FString::Printf(TEXT("%d molds: %d ziggurat, %d cylinder, %d dome, %d tower, %d combination; %d left out"),
+	MoldSummary = FString::Printf(TEXT("%d molds: %d ziggurat, %d cylinder, %d dome, %d tower, %d combination; %d open at the top; %d left out"),
 		MoldCounts[0] + MoldCounts[1] + MoldCounts[2] + MoldCounts[3] + MoldCounts[4],
-		MoldCounts[0], MoldCounts[1], MoldCounts[2], MoldCounts[3], MoldCounts[4], MoldsLeftOut);
+		MoldCounts[0], MoldCounts[1], MoldCounts[2], MoldCounts[3], MoldCounts[4], OpenTops, MoldsLeftOut);
 }
 
 void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
@@ -5553,10 +5683,14 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 	const float LeastFill = FMath::Clamp(MinMoldFill, 0.05f, 1.0f);
 	const float MostFill = FMath::Clamp(FMath::Max(MaxMoldFill, LeastFill), 0.05f, 1.0f);
 
-	// How wide and how tall the open shape is, as parts of its box: never narrower than a module, so growth fits in.
+	// How wide and how tall the open shape is, as parts of its box: never narrower than a module, so growth fits in. Open
+	// at the top, it runs the whole height of the box above its floor - its height drawn all the same, so the draws after
+	// it stay as they were.
 	const double Across = FMath::Min(Mold.HalfSize.X, Mold.HalfSize.Y);
 	const double Half = FMath::Max(Across * Stream.FRandRange(LeastFill, MostFill), 0.5 * GetModule());
-	const double Tall = FMath::Max((2.0 * Mold.HalfSize.Z - Mold.OpenFloor) * Stream.FRandRange(LeastFill, MostFill), static_cast<double>(GetModule()));
+	const double Room = 2.0 * Mold.HalfSize.Z - Mold.OpenFloor;
+	const double DrawnTall = FMath::Max(Room * Stream.FRandRange(LeastFill, MostFill), static_cast<double>(GetModule()));
+	const double Tall = Mold.bOpenTop ? Room : DrawnTall;
 	const double Floor = Mold.OpenFloor;
 
 	using FMoldPart = FAirPocket::FMoldPart;
@@ -5571,7 +5705,8 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 		return;
 	}
 
-	// Two or three shapes stacked from the floor up, each no wider than the one below it, a dome only ever on top.
+	// Two or three shapes stacked from the floor up, each no wider than the one below it, a dome only ever on top - and
+	// none there either when it opens at the top.
 	const EMoldShape Stackable[] = { EMoldShape::Ziggurat, EMoldShape::Cylinder, EMoldShape::Tower };
 	const int32 PartCount = Stream.RandRange(2, 3);
 
@@ -5581,7 +5716,9 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 	for (int32 Part = 0; Part < PartCount; ++Part)
 	{
 		const bool bTop = Part == PartCount - 1;
-		const EMoldShape Shape = bTop && Stream.FRand() < 0.5f ? EMoldShape::Dome : Stackable[Stream.RandRange(0, static_cast<int32>(UE_ARRAY_COUNT(Stackable)) - 1)];
+		const EMoldShape Shape = bTop && Stream.FRand() < 0.5f && !Mold.bOpenTop
+			? EMoldShape::Dome
+			: Stackable[Stream.RandRange(0, static_cast<int32>(UE_ARRAY_COUNT(Stackable)) - 1)];
 
 		const double Remaining = Floor + Tall - Start;
 		double PartTall = bTop ? Remaining : Remaining * Stream.FRandRange(0.3f, 0.6f);
@@ -5599,41 +5736,250 @@ void ARoomManager::DrawMoldParts(FAirPocket& Mold, FRandomStream& Stream) const
 	}
 }
 
-void ARoomManager::GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const
+FVector ARoomManager::GetPocketReach(const FAirPocket& Pocket)
 {
-	// Its reach along each world axis: its half measures across and along its axis, or a sphere's radius.
+	// Its half measures across and along its axis, along each world axis, or a sphere's radius.
+	if (Pocket.Shape == EAirPocketShape::Sphere && !Pocket.bMold)
+	{
+		return FVector(Pocket.HalfSize.X);
+	}
+
 	FVector Reach;
 	Reach[Pocket.Axis] = Pocket.HalfSize.Z;
 	Reach[(Pocket.Axis + 1) % 3] = Pocket.HalfSize.X;
 	Reach[(Pocket.Axis + 2) % 3] = Pocket.HalfSize.Y;
+	return Reach;
+}
 
-	if (Pocket.Shape == EAirPocketShape::Sphere && !Pocket.bMold)
-	{
-		Reach = FVector(Pocket.HalfSize.X);
-	}
+void ARoomManager::GetPocketBounds(const FAirPocket& Pocket, FVector& OutMin, FVector& OutMax) const
+{
+	// Its reach, and as much again as its warp can move a cell into it. A mold's shape warp moves only what is in its box.
+	const FVector Reach = GetPocketReach(Pocket) + FVector(Pocket.Warp.Reach);
 
 	OutMin = Pocket.Centre - Reach;
 	OutMax = Pocket.Centre + Reach;
 }
 
+FVector ARoomManager::FAirPocket::FWarp::Sample(const FVector& Offset) const
+{
+	if (Offsets.IsEmpty())
+	{
+		return FVector::ZeroVector;
+	}
+
+	// The node below the place along each axis, kept inside the grid, and how far on toward the next it lies.
+	int32 Below[3];
+	double Along[3];
+
+	for (int32 Dimension = 0; Dimension < 3; ++Dimension)
+	{
+		const double Index = FMath::Clamp((Offset[Dimension] - Origin[Dimension]) / Step, 0.0, static_cast<double>(Count[Dimension] - 1));
+		Below[Dimension] = FMath::Min(FMath::FloorToInt32(Index), Count[Dimension] - 2);
+		Along[Dimension] = Index - Below[Dimension];
+	}
+
+	auto At = [this](const int32 X, const int32 Y, const int32 Z)
+	{
+		return FVector(Offsets[(Z * Count.Y + Y) * Count.X + X]);
+	};
+
+	auto Layer = [&](const int32 Z)
+	{
+		return FMath::Lerp(
+			FMath::Lerp(At(Below[0], Below[1], Z), At(Below[0] + 1, Below[1], Z), Along[0]),
+			FMath::Lerp(At(Below[0], Below[1] + 1, Z), At(Below[0] + 1, Below[1] + 1, Z), Along[0]),
+			Along[1]);
+	};
+
+	return FMath::Lerp(Layer(Below[2]), Layer(Below[2] + 1), Along[2]);
+}
+
+void ARoomManager::BuildPocketWarp(FAirPocket::FWarp& Warp, const FVector& Reach, const double Amount, const double Wavelength, FRandomStream& Stream) const
+{
+	Warp = FAirPocket::FWarp();
+
+	if (Amount <= 0.0 || Wavelength <= 0.0)
+	{
+		return;
+	}
+
+	// Nodes a quarter of the finer lumps apart - those are half as broad as the broad ones - but no closer than a module,
+	// since growth sees nothing finer.
+	Warp.Step = FMath::Max(Wavelength / 8.0, static_cast<double>(GetModule()));
+	Warp.Reach = Amount;
+
+	// Over every place a cell could be moved into the shape from, and a node beyond.
+	const FVector Extent = Reach + FVector(Amount + Warp.Step);
+	Warp.Origin = -Extent;
+
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		Warp.Count[Axis] = FMath::Max(FMath::CeilToInt32(2.0 * Extent[Axis] / Warp.Step) + 1, 2);
+	}
+
+	// A place of its own in the noise for each axis - Perlin noise repeats every 256.
+	FVector Seeds[3];
+
+	for (FVector& Seed : Seeds)
+	{
+		Seed = FVector(Stream.FRandRange(0.0f, 256.0f), Stream.FRandRange(0.0f, 256.0f), Stream.FRandRange(0.0f, 256.0f));
+	}
+
+	Warp.Offsets.SetNumUninitialized(Warp.Count.X * Warp.Count.Y * Warp.Count.Z);
+	int32 Node = 0;
+
+	for (int32 Z = 0; Z < Warp.Count.Z; ++Z)
+	{
+		for (int32 Y = 0; Y < Warp.Count.Y; ++Y)
+		{
+			for (int32 X = 0; X < Warp.Count.X; ++X)
+			{
+				const FVector Place = (Warp.Origin + FVector(FIntVector(X, Y, Z)) * Warp.Step) / Wavelength;
+				FVector3f Offset;
+
+				for (int32 Axis = 0; Axis < 3; ++Axis)
+				{
+					// Broad lumps with finer ones half as strong on them, doubled and clipped, since Perlin noise mostly
+					// keeps near nought: a typical cell moves about a third of Amount, and a few all of it.
+					const FVector Broad = Place + Seeds[Axis];
+					const double Noise = FMath::PerlinNoise3D(Broad) + 0.5 * FMath::PerlinNoise3D(2.13 * Broad + FVector(17.1, 5.3, 11.7));
+					Offset[Axis] = static_cast<float>(Amount * FMath::Clamp(Noise * (2.0 / 1.5), -1.0, 1.0));
+				}
+
+				Warp.Offsets[Node++] = Offset;
+			}
+		}
+	}
+}
+
+void ARoomManager::DrawPocketWarps(FAirPocket& Pocket, const int32 Index) const
+{
+	// From a stream of its own per draw, so the noise takes nothing from the streams shapes and places are drawn from.
+	FRandomStream Stream(static_cast<int32>(HashCombineFast(
+		HashCombineFast(GetTypeHash(RunSeed), GetTypeHash(FStringView(Pocket.bMold ? TEXT("MoldNoise") : TEXT("PocketNoise")))),
+		GetTypeHash(Index))));
+
+	const FVector Reach = GetPocketReach(Pocket);
+	Pocket.ShapeWarp = FAirPocket::FWarp();
+
+	if (!Pocket.bMold)
+	{
+		const double Half = Reach.GetMax();
+		BuildPocketWarp(Pocket.Warp, Reach, FMath::Max(AirPocketNoise, 0.0f) * Half, FMath::Max(AirPocketNoiseScale, 0.1f) * 2.0 * Half, Stream);
+		return;
+	}
+
+	// The box by its half width; the shape by its foot's, in lumps as broad as the box's, so a ziggurat's tiers move together.
+	const double Across = FMath::Max(Pocket.HalfSize.X, Pocket.HalfSize.Y);
+	const double Wavelength = FMath::Max(MoldNoiseScale, 0.1f) * 2.0 * Across;
+	const double Foot = Pocket.Parts.IsEmpty() ? 0.0 : Pocket.Parts[0].Half;
+
+	BuildPocketWarp(Pocket.Warp, Reach, FMath::Max(MoldNoise, 0.0f) * Across, Wavelength, Stream);
+	BuildPocketWarp(Pocket.ShapeWarp, Reach, FMath::Max(MoldShapeNoise, 0.0f) * Foot, Wavelength, Stream);
+}
+
+FVector ARoomManager::GetWarpShift(const FAirPocket& Pocket, const FAirPocket::FWarp& Warp, const FVector& Offset)
+{
+	return Warp.IsEmpty() ? FVector::ZeroVector : DampWarp(Pocket, Warp.Sample(Offset), Offset);
+}
+
+FVector ARoomManager::DampWarp(const FAirPocket& Pocket, const FVector& Shift, const FVector& Offset)
+{
+	if (!Pocket.bMold)
+	{
+		return Shift;
+	}
+
+	// Along its axis none at the top of the open floor and below, and all of it at the top of the box.
+	FVector Damped = Shift;
+	const double Height = 2.0 * Pocket.HalfSize.Z - Pocket.OpenFloor;
+	const double Rise = Offset[Pocket.Axis] * Pocket.AxisSign + Pocket.HalfSize.Z - Pocket.OpenFloor;
+	Damped[Pocket.Axis] *= Height > 0.0 ? FMath::Clamp(Rise / Height, 0.0, 1.0) : 0.0;
+	return Damped;
+}
+
+ARoomManager::FPocketShift ARoomManager::SamplePocketShift(const FAirPocket& Pocket, const FIntVector& Cell) const
+{
+	if (Pocket.Warp.IsEmpty() && Pocket.ShapeWarp.IsEmpty())
+	{
+		return FPocketShift();
+	}
+
+	// The middle of the module the cell lies in.
+	const int32 Module = GetModule();
+
+	auto NodeBelow = [Module](const int32 Coordinate)
+	{
+		return (Coordinate >= 0 ? Coordinate : Coordinate - Module + 1) / Module * Module;
+	};
+
+	const FVector Middle = FVector(FIntVector(NodeBelow(Cell.X), NodeBelow(Cell.Y), NodeBelow(Cell.Z))) + FVector(0.5 * Module) - Pocket.Centre;
+	return FPocketShift{ Pocket.Warp.Sample(Middle), Pocket.ShapeWarp.Sample(Middle) };
+}
+
+FVector ARoomManager::GetUnwarpedPoint(const FAirPocket& Pocket, const FVector& ShapeOffset, const bool bInShape) const
+{
+	// The place a warp moves onto Target, stepped toward a few times: each step goes back by what the warp does where it
+	// stands, which settles while the lumps are broader than they are tall.
+	auto Undo = [&Pocket](const FAirPocket::FWarp& Warp, const FVector& Target)
+	{
+		FVector Point = Target;
+
+		for (int32 Round = 0; Round < 8 && !Warp.IsEmpty(); ++Round)
+		{
+			Point = Target - GetWarpShift(Pocket, Warp, Point);
+		}
+
+		return Point;
+	};
+
+	const FVector InBox = bInShape ? Undo(Pocket.ShapeWarp, ShapeOffset) : ShapeOffset;
+	return Pocket.Centre + Undo(Pocket.Warp, InBox);
+}
+
 bool ARoomManager::IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& Cell) const
 {
+	const FPocketShift Shift = SamplePocketShift(Mold, Cell);
 	const FVector Offset = FVector(Cell) + FVector(0.5) - Mold.Centre;
+	return IsOffsetInMoldShape(Mold, Offset + DampWarp(Mold, Shift.Box, Offset), Shift.Shape);
+}
 
-	// Its height above the mold's floor, and how far it lies off the mold's axis either way across it.
-	const double Rise = Offset[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
-	const double First = Offset[(Mold.Axis + 1) % 3];
-	const double Second = Offset[(Mold.Axis + 2) % 3];
+bool ARoomManager::IsOffsetInMoldShape(const FAirPocket& Mold, const FVector& BoxOffset, const FVector& ShapeShift) const
+{
+	// The open layer across the bottom of the box, level, as the box's warp leaves it.
+	const double FloorRise = BoxOffset[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
 
-	// The open layer across the bottom of the box.
-	if (Rise >= 0.0 && Rise <= Mold.OpenFloor)
+	if (FloorRise >= 0.0 && FloorRise <= Mold.OpenFloor)
 	{
 		return true;
 	}
 
-	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
+	// However far the shapes wander, a module of the box stays held round them, and over them unless they open at the
+	// top: growth reaches them only from the floor, or from above.
+	const double Wall = static_cast<double>(GetModule());
+
+	if (FMath::Abs(BoxOffset[(Mold.Axis + 1) % 3]) > Mold.HalfSize.X - Wall
+		|| FMath::Abs(BoxOffset[(Mold.Axis + 2) % 3]) > Mold.HalfSize.Y - Wall
+		|| (!Mold.bOpenTop && FloorRise > 2.0 * Mold.HalfSize.Z - Wall))
 	{
-		if (Rise < Part.Start || Rise > Part.End)
+		return false;
+	}
+
+	// The shapes, once their own warp has moved the place too: its height above the mold's floor, and how far it lies
+	// off the mold's axis either way across it.
+	const FVector Offset = BoxOffset + DampWarp(Mold, ShapeShift, BoxOffset);
+	const double Rise = Offset[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
+	const double First = Offset[(Mold.Axis + 1) % 3];
+	const double Second = Offset[(Mold.Axis + 2) % 3];
+
+	for (int32 Index = 0; Index < Mold.Parts.Num(); ++Index)
+	{
+		const FAirPocket::FMoldPart& Part = Mold.Parts[Index];
+
+		// Open at the top, the top part reaches on out of the box, however far its top has wandered.
+		const bool bReachesOut = Mold.bOpenTop && Index == Mold.Parts.Num() - 1;
+
+		if (Rise < Part.Start || (Rise > Part.End && !bReachesOut))
 		{
 			continue;
 		}
@@ -5684,31 +6030,83 @@ bool ARoomManager::IsCellInMoldShape(const FAirPocket& Mold, const FIntVector& C
 	return false;
 }
 
+void ARoomManager::AppendWarpedLine(const FAirPocket& Pocket, const FVector& From, const FVector& To, const bool bInShape, const FLinearColor& Color, TArray<FBatchedLine>& Lines) const
+{
+	// Clean, one line; wandering, steps half a node of the warp long, so the lumps show.
+	double Step = UE_DOUBLE_BIG_NUMBER;
+
+	if (!Pocket.Warp.IsEmpty())
+	{
+		Step = FMath::Min(Step, Pocket.Warp.Step);
+	}
+
+	if (bInShape && !Pocket.ShapeWarp.IsEmpty())
+	{
+		Step = FMath::Min(Step, Pocket.ShapeWarp.Step);
+	}
+
+	const int32 Steps = Step < UE_DOUBLE_BIG_NUMBER ? FMath::Max(FMath::CeilToInt32(FVector::Dist(From, To) / (0.5 * Step)), 1) : 1;
+	FVector Previous = CellPointToWorld(GetUnwarpedPoint(Pocket, From, bInShape));
+
+	for (int32 Index = 1; Index <= Steps; ++Index)
+	{
+		const FVector Next = CellPointToWorld(GetUnwarpedPoint(Pocket, FMath::Lerp(From, To, static_cast<double>(Index) / Steps), bInShape));
+		Lines.Emplace(Previous, Next, Color, /*LifeTime=*/0.0f, BoundaryLineThickness, SDPG_World);
+		Previous = Next;
+	}
+}
+
+void ARoomManager::AppendWarpedBox(const FAirPocket& Pocket, const FVector& Min, const FVector& Max, const bool bInShape, const FLinearColor& Color, TArray<FBatchedLine>& Lines) const
+{
+	// Its twelve edges, four along each axis.
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		const int32 First = (Axis + 1) % 3;
+		const int32 Second = (Axis + 2) % 3;
+
+		for (int32 Corner = 0; Corner < 4; ++Corner)
+		{
+			FVector From = Min;
+			From[First] = (Corner & 1) ? Max[First] : Min[First];
+			From[Second] = (Corner & 2) ? Max[Second] : Min[Second];
+
+			FVector To = From;
+			To[Axis] = Max[Axis];
+
+			AppendWarpedLine(Pocket, From, To, bInShape, Color, Lines);
+		}
+	}
+}
+
 void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>& Lines) const
 {
-	const float Thickness = BoundaryLineThickness;
+	const FLinearColor FrameColor(MoldColor);
 	const FLinearColor ShapeColor(MoldShapeColor);
 
-	// Its box.
-	FVector Min, Max;
-	GetPocketBounds(Mold, Min, Max);
-	AppendBoxLines(Lines, CellPointToWorld(Min), CellPointToWorld(Max), FLinearColor(MoldColor), Thickness, SDPG_World, /*bWithDiagonals=*/false);
-
-	// A point in the mold's own frame - off its axis across it, and its height above its floor - in the world.
+	// A point in the mold's own frame - off its axis across it, and its height above its floor - from its centre. Its box
+	// and floor are drawn as the box's warp moves them, its shapes as their own warp moves them too.
 	auto Local = [&Mold](const double First, const double Second, const double Rise)
 	{
-		FVector Point = Mold.Centre;
-		Point[(Mold.Axis + 1) % 3] += First;
-		Point[(Mold.Axis + 2) % 3] += Second;
-		Point[Mold.Axis] += (Rise - Mold.HalfSize.Z) * Mold.AxisSign;
+		FVector Point = FVector::ZeroVector;
+		Point[(Mold.Axis + 1) % 3] = First;
+		Point[(Mold.Axis + 2) % 3] = Second;
+		Point[Mold.Axis] = (Rise - Mold.HalfSize.Z) * Mold.AxisSign;
 		return Point;
+	};
+
+	auto AddBox = [&](const FVector& A, const FVector& B, const bool bInShape, const FLinearColor& Color)
+	{
+		AppendWarpedBox(Mold, A.ComponentMin(B), A.ComponentMax(B), bInShape, Color, Lines);
 	};
 
 	auto AddSquare = [&](const double Half, const double Start, const double End)
 	{
-		const FVector A = Local(-Half, -Half, Start);
-		const FVector B = Local(Half, Half, End);
-		AppendBoxLines(Lines, CellPointToWorld(A.ComponentMin(B)), CellPointToWorld(A.ComponentMax(B)), ShapeColor, Thickness, SDPG_World, /*bWithDiagonals=*/false);
+		AddBox(Local(-Half, -Half, Start), Local(Half, Half, End), /*bInShape=*/true, ShapeColor);
+	};
+
+	auto AddLine = [&](const FVector& From, const FVector& To)
+	{
+		AppendWarpedLine(Mold, From, To, /*bInShape=*/true, ShapeColor, Lines);
 	};
 
 	auto AddCircle = [&](const double Radius, const double Rise)
@@ -5718,19 +6116,17 @@ void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>&
 			const double From = 2.0 * UE_DOUBLE_PI * Segment / AirPocketCircleSegments;
 			const double To = 2.0 * UE_DOUBLE_PI * (Segment + 1) / AirPocketCircleSegments;
 
-			Lines.Emplace(
-				CellPointToWorld(Local(Radius * FMath::Cos(From), Radius * FMath::Sin(From), Rise)),
-				CellPointToWorld(Local(Radius * FMath::Cos(To), Radius * FMath::Sin(To), Rise)),
-				ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+			AddLine(Local(Radius * FMath::Cos(From), Radius * FMath::Sin(From), Rise), Local(Radius * FMath::Cos(To), Radius * FMath::Sin(To), Rise));
 		}
 	};
+
+	// Its box.
+	AddBox(Local(-Mold.HalfSize.X, -Mold.HalfSize.Y, 0.0), Local(Mold.HalfSize.X, Mold.HalfSize.Y, 2.0 * Mold.HalfSize.Z), /*bInShape=*/false, FrameColor);
 
 	// The top of its open floor, across the whole box.
 	if (Mold.OpenFloor > 0.0)
 	{
-		const FVector A = Local(-Mold.HalfSize.X, -Mold.HalfSize.Y, 0.0);
-		const FVector B = Local(Mold.HalfSize.X, Mold.HalfSize.Y, Mold.OpenFloor);
-		AppendBoxLines(Lines, CellPointToWorld(A.ComponentMin(B)), CellPointToWorld(A.ComponentMax(B)), FLinearColor(MoldColor), Thickness, SDPG_World, /*bWithDiagonals=*/false);
+		AddBox(Local(-Mold.HalfSize.X, -Mold.HalfSize.Y, 0.0), Local(Mold.HalfSize.X, Mold.HalfSize.Y, Mold.OpenFloor), /*bInShape=*/false, FrameColor);
 	}
 
 	for (const FAirPocket::FMoldPart& Part : Mold.Parts)
@@ -5746,8 +6142,7 @@ void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>&
 				const double Angle = 0.5 * UE_DOUBLE_PI * Quarter;
 				const double First = Part.Half * FMath::Cos(Angle);
 				const double Second = Part.Half * FMath::Sin(Angle);
-				Lines.Emplace(CellPointToWorld(Local(First, Second, Part.Start)), CellPointToWorld(Local(First, Second, Part.End)),
-					ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+				AddLine(Local(First, Second, Part.Start), Local(First, Second, Part.End));
 			}
 			break;
 
@@ -5768,10 +6163,10 @@ void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>&
 						const double Angle = UE_DOUBLE_PI * Step / (AirPocketCircleSegments / 2);
 						const double Across = Part.Half * FMath::Cos(Angle);
 						const double Rise = Part.Start + Part.Half * FMath::Sin(Angle);
-						return CellPointToWorld(bAlongFirst ? Local(Across, 0.0, Rise) : Local(0.0, Across, Rise));
+						return bAlongFirst ? Local(Across, 0.0, Rise) : Local(0.0, Across, Rise);
 					};
 
-					Lines.Emplace(ArcPoint(Segment), ArcPoint(Segment + 1), ShapeColor, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+					AddLine(ArcPoint(Segment), ArcPoint(Segment + 1));
 				}
 			}
 			break;
@@ -5797,7 +6192,15 @@ void ARoomManager::AppendMoldLines(const FAirPocket& Mold, TArray<FBatchedLine>&
 
 bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell) const
 {
-	const FVector Offset = FVector(Cell) + FVector(0.5) - Pocket.Centre;
+	return IsCellInPocket(Pocket, Cell, SamplePocketShift(Pocket, Cell));
+}
+
+bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Cell, const FPocketShift& Shift) const
+{
+	// The cell's centre as the pocket's warp moves it, tested against the clean shape.
+	FVector Offset = FVector(Cell) + FVector(0.5) - Pocket.Centre;
+	Offset += DampWarp(Pocket, Shift.Box, Offset);
+
 	const double Along = Offset[Pocket.Axis];
 	const double First = Offset[(Pocket.Axis + 1) % 3];
 	const double Second = Offset[(Pocket.Axis + 2) % 3];
@@ -5806,7 +6209,7 @@ bool ARoomManager::IsCellInPocket(const FAirPocket& Pocket, const FIntVector& Ce
 	// A mold holds back its whole box but the shapes it leaves open.
 	if (Pocket.bMold)
 	{
-		return FMath::Abs(First) <= Half.X && FMath::Abs(Second) <= Half.Y && FMath::Abs(Along) <= Half.Z && !IsCellInMoldShape(Pocket, Cell);
+		return FMath::Abs(First) <= Half.X && FMath::Abs(Second) <= Half.Y && FMath::Abs(Along) <= Half.Z && !IsOffsetInMoldShape(Pocket, Offset, Shift.Shape);
 	}
 
 	switch (Pocket.Shape)
@@ -5857,20 +6260,48 @@ void ARoomManager::CutPocketSlab(FAirPocket& Pocket) const
 	const FAirBox Slab = GetPocketSlabBox(Pocket, Pocket.SlabEnds.Num());
 
 	// A piece is cut when any one of its cells lies inside: the inside of a module face, the run of a module edge, or the
-	// node itself. An edge can be visited from both planes it lies in; it is kept once.
+	// node itself. An edge can be visited from both planes it lies in; it is kept once. A piece's cells all lie in the
+	// module from its min node, so its warps are sampled once.
 	TSet<uint64> Edges;
+
+	// Whether cells from MinCell to MaxCell, moved by a piece's shift, could reach the clean shape's reach at all - most of
+	// a noisy pocket's bounds are room for the noise, and their pieces are passed over without a cell tested. A mold
+	// moves cells along its axis by anywhere between none of the shift and all of it.
+	const FVector Reach = GetPocketReach(Pocket);
+
+	auto MayReach = [&](const FIntVector& MinCell, const FIntVector& MaxCell, const FPocketShift& Shift)
+	{
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			const double Least = Pocket.bMold && Axis == Pocket.Axis ? FMath::Min(Shift.Box[Axis], 0.0) : Shift.Box[Axis];
+			const double Most = Pocket.bMold && Axis == Pocket.Axis ? FMath::Max(Shift.Box[Axis], 0.0) : Shift.Box[Axis];
+
+			if (MaxCell[Axis] + 0.5 - Pocket.Centre[Axis] + Most < -Reach[Axis] || MinCell[Axis] + 0.5 - Pocket.Centre[Axis] + Least > Reach[Axis])
+			{
+				return false;
+			}
+		}
+
+		return true;
+	};
 
 	ForEachObstaclePiece(Slab.Min, Slab.Max, Module,
 		[&](const FIntVector& FaceMinNode, const int32 NormalAxis)
 		{
 			int32 U, V;
 			GetInPlaneAxes(NormalAxis, U, V);
+			const FPocketShift Shift = SamplePocketShift(Pocket, FaceMinNode);
+
+			if (!MayReach(FaceMinNode + AxisStep(U, 1) + AxisStep(V, 1), FaceMinNode + AxisStep(U, Module - 1) + AxisStep(V, Module - 1), Shift))
+			{
+				return;
+			}
 
 			for (int32 StepV = 1; StepV < Module; ++StepV)
 			{
 				for (int32 StepU = 1; StepU < Module; ++StepU)
 				{
-					if (IsCellInPocket(Pocket, FaceMinNode + AxisStep(U, StepU) + AxisStep(V, StepV)))
+					if (IsCellInPocket(Pocket, FaceMinNode + AxisStep(U, StepU) + AxisStep(V, StepV), Shift))
 					{
 						Pocket.FaceKeys.Add(MakeModuleFaceKey(FaceMinNode, NormalAxis));
 						return;
@@ -5880,9 +6311,16 @@ void ARoomManager::CutPocketSlab(FAirPocket& Pocket) const
 		},
 		[&](const FLatticeEdge& Edge)
 		{
+			const FPocketShift Shift = SamplePocketShift(Pocket, Edge.Node);
+
+			if (!MayReach(Edge.Node + AxisStep(Edge.Axis, 1), Edge.Node + AxisStep(Edge.Axis, Module - 1), Shift))
+			{
+				return;
+			}
+
 			for (int32 Step = 1; Step < Module; ++Step)
 			{
-				if (IsCellInPocket(Pocket, Edge.Node + AxisStep(Edge.Axis, Step)))
+				if (IsCellInPocket(Pocket, Edge.Node + AxisStep(Edge.Axis, Step), Shift))
 				{
 					Edges.Add(MakeEdgeKey(Edge));
 					return;
@@ -6459,25 +6897,26 @@ FLinearColor ARoomManager::GetAirPocketColor(const EAirPocketShape Shape) const
 void ARoomManager::AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatchedLine>& Lines) const
 {
 	const FLinearColor Color = GetAirPocketColor(Pocket.Shape);
-	const float Thickness = BoundaryLineThickness;
 
 	const int32 AlongAxis = Pocket.Axis;
 	const int32 FirstAxis = (Pocket.Axis + 1) % 3;
 	const int32 SecondAxis = (Pocket.Axis + 2) % 3;
 
+	// Every point from the pocket's centre, in its clean shape, drawn where its warp has moved it.
+
 	// A box in the pocket's own axes - half across its first and second axes, from Start to End along its axis.
 	auto AddBox = [&](const double HalfFirst, const double HalfSecond, const double Start, const double End)
 	{
-		FVector Min = Pocket.Centre;
-		FVector Max = Pocket.Centre;
-		Min[FirstAxis] -= HalfFirst;
-		Max[FirstAxis] += HalfFirst;
-		Min[SecondAxis] -= HalfSecond;
-		Max[SecondAxis] += HalfSecond;
-		Min[AlongAxis] += FMath::Min(Start, End);
-		Max[AlongAxis] += FMath::Max(Start, End);
+		FVector Min = FVector::ZeroVector;
+		FVector Max = FVector::ZeroVector;
+		Min[FirstAxis] = -HalfFirst;
+		Max[FirstAxis] = HalfFirst;
+		Min[SecondAxis] = -HalfSecond;
+		Max[SecondAxis] = HalfSecond;
+		Min[AlongAxis] = FMath::Min(Start, End);
+		Max[AlongAxis] = FMath::Max(Start, End);
 
-		AppendBoxLines(Lines, CellPointToWorld(Min), CellPointToWorld(Max), Color, Thickness, SDPG_World, /*bWithDiagonals=*/false);
+		AppendWarpedBox(Pocket, Min, Max, /*bInShape=*/false, Color, Lines);
 	};
 
 	// A circle round the pocket's centre, Offset along one axis, in the plane of the other two.
@@ -6489,16 +6928,16 @@ void ARoomManager::AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatche
 		auto PointAt = [&](const int32 Segment)
 		{
 			const double Angle = 2.0 * UE_DOUBLE_PI * static_cast<double>(Segment) / AirPocketCircleSegments;
-			FVector Point = Pocket.Centre;
-			Point[NormalAxis] += Offset;
-			Point[U] += Radius * FMath::Cos(Angle);
-			Point[V] += Radius * FMath::Sin(Angle);
-			return CellPointToWorld(Point);
+			FVector Point = FVector::ZeroVector;
+			Point[NormalAxis] = Offset;
+			Point[U] = Radius * FMath::Cos(Angle);
+			Point[V] = Radius * FMath::Sin(Angle);
+			return Point;
 		};
 
 		for (int32 Segment = 0; Segment < AirPocketCircleSegments; ++Segment)
 		{
-			Lines.Emplace(PointAt(Segment), PointAt(Segment + 1), Color, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+			AppendWarpedLine(Pocket, PointAt(Segment), PointAt(Segment + 1), /*bInShape=*/false, Color, Lines);
 		}
 	};
 
@@ -6522,15 +6961,15 @@ void ARoomManager::AppendAirPocketLines(const FAirPocket& Pocket, TArray<FBatche
 		for (int32 Quarter = 0; Quarter < 4; ++Quarter)
 		{
 			const double Angle = 0.5 * UE_DOUBLE_PI * Quarter;
-			FVector Start = Pocket.Centre;
-			Start[FirstAxis] += Half.X * FMath::Cos(Angle);
-			Start[SecondAxis] += Half.X * FMath::Sin(Angle);
+			FVector Start = FVector::ZeroVector;
+			Start[FirstAxis] = Half.X * FMath::Cos(Angle);
+			Start[SecondAxis] = Half.X * FMath::Sin(Angle);
 
 			FVector End = Start;
-			Start[AlongAxis] -= Half.Z;
-			End[AlongAxis] += Half.Z;
+			Start[AlongAxis] = -Half.Z;
+			End[AlongAxis] = Half.Z;
 
-			Lines.Emplace(CellPointToWorld(Start), CellPointToWorld(End), Color, /*LifeTime=*/0.0f, Thickness, SDPG_World);
+			AppendWarpedLine(Pocket, Start, End, /*bInShape=*/false, Color, Lines);
 		}
 		break;
 	}

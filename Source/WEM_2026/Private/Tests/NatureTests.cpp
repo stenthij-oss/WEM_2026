@@ -1394,9 +1394,10 @@ bool FNatureAirPocketsTest::RunTest(const FString& Parameters)
 			{
 				const FIntVector Cell = Platform.MinNode + WEMGrid::AxisStep(U, StepU) + WEMGrid::AxisStep(V, StepV);
 
-				for (const FPocket& Pocket : Pockets)
+				// Each pocket as drawn, its noise and all.
+				for (int32 Index = 0; Index < Pockets.Num(); ++Index)
 				{
-					CellsInPockets += FRoomManagerTestAccess::IsCellInPocket(*Manager, Pocket, Cell) ? 1 : 0;
+					CellsInPockets += FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Cell) ? 1 : 0;
 				}
 			}
 		}
@@ -1735,6 +1736,11 @@ bool FNatureMoldsTest::RunTest(const FString& Parameters)
 	Manager->AirPocketCount = 10;
 	Manager->MinAirPocketSize = 16;
 	Manager->MaxAirPocketSize = 40;
+
+	// Clean, closed molds, so their boxes and floors can be measured exactly. WEM.Nature.PocketNoise has the noisy ones.
+	Manager->MoldNoise = 0.0f;
+	Manager->MoldShapeNoise = 0.0f;
+	Manager->MoldOpenTopChance = 0.0f;
 	Manager->ClearPlatforms();
 
 	AddInfo(Manager->MoldSummary);
@@ -1972,6 +1978,9 @@ bool FNatureMushroomTest::RunTest(const FString& Parameters)
 
 	ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted, Kit.GetAll());
 	Manager->GridSize = 129;
+
+	// The crown as one block, to measure; its irregular shape is checked at the end.
+	Manager->MushroomIrregularity = 0.0f;
 	Manager->ClearPlatforms();
 	UPlatformTileData* Square = Manager->Tiles[0];
 
@@ -2062,6 +2071,385 @@ bool FNatureMushroomTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Split in two"), Manager->AirSummary.StartsWith(TEXT("2 landscapes")));
 	TestTrue(TEXT("Only trunks"), !FRoomManagerTestAccess::GetAirBoxes(*Manager).ContainsByPredicate([](const TPair<FIntVector, FIntVector>& Box) { return Box.Key.Z > 32 + 16; }));
 	TestEqual(TEXT("Split, it agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// Irregular, the nine pieces' crown is a slab for its first storey and two lumps for its second: none of it below the
+	// second storey or past its top, its sides on lattice lines, not all of it the block it was, and the same each time.
+	Manager->MushroomIrregularity = 1.0f;
+
+	auto ReadCrown = [&]()
+	{
+		TArray<TPair<FIntVector, FIntVector>> Boxes = FRoomManagerTestAccess::GetAirBoxes(*Manager);
+		Boxes.RemoveAll([](const TPair<FIntVector, FIntVector>& Box) { return Box.Key.Z <= 32 + 16; });
+		return Boxes;
+	};
+
+	FRoomManagerTestAccess::Rebuild(*Manager, Landscape);
+	const TArray<TPair<FIntVector, FIntVector>> Irregular = ReadCrown();
+
+	for (const TPair<FIntVector, FIntVector>& Box : Irregular)
+	{
+		AddInfo(FString::Printf(TEXT("Crown box (%d,%d,%d)-(%d,%d,%d)"), Box.Key.X, Box.Key.Y, Box.Key.Z, Box.Value.X, Box.Value.Y, Box.Value.Z));
+	}
+
+	TestEqual(TEXT("Irregular: a slab and two lumps"), Irregular.Num(), 3);
+	TestTrue(TEXT("All of it from the second storey to the crown's top"), !Irregular.ContainsByPredicate([](const TPair<FIntVector, FIntVector>& Box)
+	{
+		return Box.Key.Z < 32 + 17 || Box.Value.Z > 32 + 48;
+	}));
+	TestTrue(TEXT("Its sides on lattice lines"), !Irregular.ContainsByPredicate([](const TPair<FIntVector, FIntVector>& Box)
+	{
+		return Box.Key.X % 4 != 0 || Box.Key.Y % 4 != 0 || Box.Value.X % 4 != 0 || Box.Value.Y % 4 != 0;
+	}));
+	TestTrue(TEXT("Not the block it was"), Irregular.ContainsByPredicate([](const TPair<FIntVector, FIntVector>& Box)
+	{
+		return Box.Key.X != 0 || Box.Key.Y != 0 || Box.Value.X != 80 || Box.Value.Y != 80;
+	}));
+
+	FRoomManagerTestAccess::Rebuild(*Manager, Landscape);
+	TestTrue(TEXT("The same crown each time"), ReadCrown() == Irregular);
+
+	// As a piece goes it keeps up, piece by piece, with a full rebuild.
+	FRoomManagerTestAccess::EnsureCandidates(*Manager);
+	FRoomManagerTestAccess::Remove(*Manager, { Landscape[8] });
+	TestEqual(TEXT("Irregular, it agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNaturePocketNoisePerfTest, "WEM.Nature.PocketNoisePerf", WEMRoomManagerTests::SlowTestFlags)
+
+bool FNaturePocketNoisePerfTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+
+	// NewMap's cube with six pockets and two molds, clean and then noisy: how long clearing takes, cutting every pocket's
+	// pieces afresh, and moving each one a slab a tick as play does, with 1500 platforms grown.
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	for (const bool bNoisy : { false, true })
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+		Manager->GridSize = 509;
+		Manager->PlatformRandomSeed = 4242;
+		Manager->AirPocketCount = 6;
+		Manager->MoldCount = 2;
+
+		if (!bNoisy)
+		{
+			Manager->AirPocketNoise = 0.0f;
+			Manager->MoldNoise = 0.0f;
+			Manager->MoldShapeNoise = 0.0f;
+		}
+
+		double Start = FPlatformTime::Seconds();
+		Manager->ClearPlatforms();
+		const double Clearing = 1000.0 * (FPlatformTime::Seconds() - Start);
+
+		while (Manager->GetPlatformCount() < 1500 && Manager->PlaceNextPlatform())
+		{
+		}
+
+		FRoomManagerTestAccess::EnsureCandidates(*Manager);
+		const int32 Pockets = FRoomManagerTestAccess::GetAirPockets(*Manager).Num();
+
+		Start = FPlatformTime::Seconds();
+
+		for (int32 Index = 0; Index < Pockets; ++Index)
+		{
+			FRoomManagerTestAccess::CutPocketPieces(*Manager, Index);
+		}
+
+		const double Cutting = 1000.0 * (FPlatformTime::Seconds() - Start);
+		FBeatTimes Steps;
+
+		for (int32 Index = 0; Index < Pockets; ++Index)
+		{
+			FRoomManagerTestAccess::StartPocketMove(*Manager, Index);
+
+			while (FRoomManagerTestAccess::IsPocketMoving(*Manager))
+			{
+				Start = FPlatformTime::Seconds();
+				FRoomManagerTestAccess::StepPocketMove(*Manager);
+				Steps.Add(FPlatformTime::Seconds() - Start);
+			}
+		}
+
+		AddInfo(FString::Printf(TEXT("%s: clearing %.1f ms, cutting every pocket afresh %.1f ms, move steps: %s. %s; %s"),
+			bNoisy ? TEXT("Noisy") : TEXT("Clean"), Clearing, Cutting, *Steps.Describe(), *Manager->AirPocketSummary, *Manager->MoldSummary));
+		TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+		Manager->Destroy();
+	}
+
+	ReleaseRooted(Rooted);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNaturePocketNoiseTest, "WEM.Nature.PocketNoise", WEMRoomManagerTests::TestFlags)
+
+bool FNaturePocketNoiseTest::RunTest(const FString& Parameters)
+{
+	using namespace NatureTestsPrivate;
+	using FPocket = FRoomManagerTestAccess::FPocket;
+
+	FScopedTestWorld TestWorld;
+	TArray<UObject*> Rooted;
+
+	static constexpr int32 LastCell = 128;
+
+	// The cells a pocket reaches, as far as the cube goes, and an index for each in that box.
+	struct FReach
+	{
+		FIntVector Min;
+		FIntVector Max;
+
+		explicit FReach(const FPocket& Pocket)
+		{
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				Min[Axis] = FMath::Clamp(FMath::FloorToInt32(Pocket.Min[Axis]), 0, LastCell);
+				Max[Axis] = FMath::Clamp(FMath::CeilToInt32(Pocket.Max[Axis]), 0, LastCell);
+			}
+		}
+
+		bool Contains(const FIntVector& Cell) const
+		{
+			return Cell.X >= Min.X && Cell.Y >= Min.Y && Cell.Z >= Min.Z && Cell.X <= Max.X && Cell.Y <= Max.Y && Cell.Z <= Max.Z;
+		}
+
+		int32 Num() const
+		{
+			return (Max.X - Min.X + 1) * (Max.Y - Min.Y + 1) * (Max.Z - Min.Z + 1);
+		}
+
+		int32 IndexOf(const FIntVector& Cell) const
+		{
+			return ((Cell.Z - Min.Z) * (Max.Y - Min.Y + 1) + (Cell.Y - Min.Y)) * (Max.X - Min.X + 1) + (Cell.X - Min.X);
+		}
+
+		void ForEach(TFunctionRef<void(const FIntVector&)> Visit) const
+		{
+			for (int32 Z = Min.Z; Z <= Max.Z; ++Z)
+			{
+				for (int32 Y = Min.Y; Y <= Max.Y; ++Y)
+				{
+					for (int32 X = Min.X; X <= Max.X; ++X)
+					{
+						Visit(FIntVector(X, Y, Z));
+					}
+				}
+			}
+		}
+	};
+
+	// A cell's height above a mold's floor, before any warp.
+	auto RiseOf = [](const FPocket& Mold, const FIntVector& Cell)
+	{
+		return (FVector(Cell) + FVector(0.5) - Mold.Centre)[Mold.Axis] * Mold.AxisSign + Mold.HalfSize.Z;
+	};
+
+	// How many cells of the platforms standing lie in what a pocket or mold holds back.
+	auto CountHeld = [](const ARoomManager& Manager, const int32 Pockets)
+	{
+		int32 Held = 0;
+
+		for (const FGridPlatform& Platform : FRoomManagerTestAccess::GetBuilt(Manager))
+		{
+			const int32 SpanU = Platform.bTurned ? Platform.Tile->Length : Platform.Tile->Width;
+			const int32 SpanV = Platform.bTurned ? Platform.Tile->Width : Platform.Tile->Length;
+
+			int32 U, V;
+			WEMGrid::GetInPlaneAxes(static_cast<int32>(Platform.Normal), U, V);
+
+			for (int32 StepV = 0; StepV <= SpanV; ++StepV)
+			{
+				for (int32 StepU = 0; StepU <= SpanU; ++StepU)
+				{
+					const FIntVector Cell = Platform.MinNode + WEMGrid::AxisStep(U, StepU) + WEMGrid::AxisStep(V, StepV);
+
+					for (int32 Index = 0; Index < Pockets; ++Index)
+					{
+						Held += FRoomManagerTestAccess::IsCellInAirPocket(Manager, Index, Cell) ? 1 : 0;
+					}
+				}
+			}
+		}
+
+		return Held;
+	};
+
+	auto SpawnWithPockets = [&](const float Noise) -> ARoomManager*
+	{
+		ARoomManager* Manager = SpawnRoomManager(TestWorld.World, Rooted);
+		Manager->GridSize = LastCell + 1;
+		Manager->AirPocketCount = 8;
+		Manager->MinAirPocketSize = 16;
+		Manager->MaxAirPocketSize = 40;
+		Manager->AirPocketNoise = Noise;
+		Manager->ClearPlatforms();
+		return Manager;
+	};
+
+	// Pockets: each wanders off its clean shape, and still holds cells back.
+	ARoomManager* Manager = SpawnWithPockets(0.35f);
+	const TArray<FPocket> Pockets = FRoomManagerTestAccess::GetAirPockets(*Manager);
+	AddInfo(Manager->AirPocketSummary);
+	TestTrue(TEXT("Pockets are drawn"), Pockets.Num() > 0);
+
+	for (int32 Index = 0; Index < Pockets.Num(); ++Index)
+	{
+		int32 Held = 0;
+		int32 Moved = 0;
+
+		FReach(Pockets[Index]).ForEach([&](const FIntVector& Cell)
+		{
+			const bool bHeld = FRoomManagerTestAccess::IsCellInAirPocket(*Manager, Index, Cell);
+			Held += bHeld ? 1 : 0;
+			Moved += bHeld != FRoomManagerTestAccess::IsCellInPocket(*Manager, Pockets[Index], Cell) ? 1 : 0;
+		});
+
+		TestTrue(TEXT("Each has its noise"), Pockets[Index].bWarped);
+		TestTrue(TEXT("Each still holds cells back"), Held > 0 && Pockets[Index].CutPieces > 0);
+		TestTrue(TEXT("And none keeps its clean shape"), Moved > 0);
+	}
+
+	// Growth never builds into one as drawn, and agrees with a full rebuild.
+	for (int32 Beat = 0; Beat < 400; ++Beat)
+	{
+		Manager->PlaceNextPlatform();
+	}
+
+	AddInfo(FString::Printf(TEXT("%d platforms grew round the noisy pockets."), Manager->GetPlatformCount()));
+	TestTrue(TEXT("Growth goes on"), Manager->GetPlatformCount() > 100);
+	TestEqual(TEXT("No platform reaches into a noisy pocket"), CountHeld(*Manager, Pockets.Num()), 0);
+	TestEqual(TEXT("The placements agree with a full rebuild"), FRoomManagerTestAccess::Verify(*Manager), 0);
+
+	// The same seed draws the same lumps; no noise keeps every pocket its clean shape.
+	const TArray<FPocket> Again = FRoomManagerTestAccess::GetAirPockets(*SpawnWithPockets(0.35f));
+	bool bSame = Again.Num() == Pockets.Num();
+
+	for (int32 Index = 0; bSame && Index < Pockets.Num(); ++Index)
+	{
+		bSame = Again[Index].CutPieces == Pockets[Index].CutPieces && Again[Index].Centre.Equals(Pockets[Index].Centre);
+	}
+
+	TestTrue(TEXT("The same seed draws the same lumps"), bSame);
+
+	ARoomManager* Clean = SpawnWithPockets(0.0f);
+	const TArray<FPocket> CleanPockets = FRoomManagerTestAccess::GetAirPockets(*Clean);
+	int32 CleanMoved = 0;
+
+	for (int32 Index = 0; Index < CleanPockets.Num(); ++Index)
+	{
+		FReach(CleanPockets[Index]).ForEach([&](const FIntVector& Cell)
+		{
+			CleanMoved += FRoomManagerTestAccess::IsCellInAirPocket(*Clean, Index, Cell) != FRoomManagerTestAccess::IsCellInPocket(*Clean, CleanPockets[Index], Cell) ? 1 : 0;
+		});
+	}
+
+	TestTrue(TEXT("No noise, no warp"), !CleanPockets.ContainsByPredicate([](const FPocket& Pocket) { return Pocket.bWarped; }));
+	TestEqual(TEXT("And every pocket its clean shape"), CleanMoved, 0);
+
+	// Molds, noisy, open at the top or closed: the open floor stays level and holds nothing back, nothing below it is
+	// held, and the shape is reached from the floor - and leaves the box through its top only when it opens there.
+	for (const bool bOpenTop : { true, false })
+	{
+		ARoomManager* Molds = SpawnRoomManager(TestWorld.World, Rooted);
+		Molds->GridSize = LastCell + 1;
+		Molds->MoldCount = 5;
+		Molds->MoldSpread = 0.5f; // Inside the cube, top and all, so what leaves through the top can be seen.
+		Molds->MinMoldSize = 24;
+		Molds->MaxMoldSize = 36;
+		Molds->MoldDomeWeight = 0.0f;
+		Molds->MoldOpenTopChance = bOpenTop ? 1.0f : 0.0f;
+		Molds->ClearPlatforms();
+		AddInfo(Molds->MoldSummary);
+
+		const TArray<FPocket> MoldPockets = FRoomManagerTestAccess::GetAirPockets(*Molds);
+		TestTrue(TEXT("Molds are drawn"), MoldPockets.Num() > 0);
+
+		for (int32 Index = 0; Index < MoldPockets.Num(); ++Index)
+		{
+			const FPocket& Mold = MoldPockets[Index];
+			const FReach Reach(Mold);
+
+			TestTrue(TEXT("Each has its noise"), Mold.bWarped);
+			TestTrue(TEXT("Open at the top as asked"), Mold.bOpenTop == bOpenTop);
+
+			int32 HeldInFloor = 0;
+			int32 HeldBelow = 0;
+
+			Reach.ForEach([&](const FIntVector& Cell)
+			{
+				const double Rise = RiseOf(Mold, Cell);
+				const bool bHeld = FRoomManagerTestAccess::IsCellInAirPocket(*Molds, Index, Cell);
+				HeldInFloor += Rise > 0.0 && Rise < Mold.OpenFloor && bHeld ? 1 : 0;
+				HeldBelow += Rise < 0.0 && bHeld ? 1 : 0;
+			});
+
+			TestEqual(TEXT("Its open floor stays level, and holds nothing back"), HeldInFloor, 0);
+			TestEqual(TEXT("Nothing below it is held"), HeldBelow, 0);
+
+			// Every open cell reached from the floor, through the open floor and shape.
+			TBitArray<> Reached(false, Reach.Num());
+			TArray<FIntVector> Open;
+
+			Reach.ForEach([&](const FIntVector& Cell)
+			{
+				const double Rise = RiseOf(Mold, Cell);
+
+				if (Rise > 0.0 && Rise < Mold.OpenFloor && FRoomManagerTestAccess::IsCellInMoldShape(*Molds, Index, Cell))
+				{
+					Reached[Reach.IndexOf(Cell)] = true;
+					Open.Add(Cell);
+				}
+			});
+
+			int32 InShape = 0;
+			int32 OutOfTop = 0;
+
+			for (int32 Next = 0; Next < Open.Num(); ++Next)
+			{
+				const FIntVector Cell = Open[Next];
+
+				if (RiseOf(Mold, Cell) > Mold.OpenFloor + 0.5)
+				{
+					++InShape;
+					OutOfTop += FRoomManagerTestAccess::IsCellInMoldBox(*Molds, Index, Cell) ? 0 : 1;
+				}
+
+				for (int32 Axis = 0; Axis < 3; ++Axis)
+				{
+					for (const int32 Side : { -1, 1 })
+					{
+						const FIntVector Neighbour = Cell + WEMGrid::AxisStep(Axis, Side);
+
+						if (Reach.Contains(Neighbour) && !Reached[Reach.IndexOf(Neighbour)] && FRoomManagerTestAccess::IsCellInMoldShape(*Molds, Index, Neighbour))
+						{
+							Reached[Reach.IndexOf(Neighbour)] = true;
+							Open.Add(Neighbour);
+						}
+					}
+				}
+			}
+
+			AddInfo(FString::Printf(TEXT("%s: %d cells of shape reached from the floor, %d of them out past the box's top."),
+				*StaticEnum<EMoldShape>()->GetNameStringByValue(static_cast<int64>(Mold.MoldShape)), InShape, OutOfTop));
+			TestTrue(TEXT("Its shape is reached from the floor"), InShape > 0);
+			TestTrue(TEXT("And leaves the box through its top only when open there"), (OutOfTop > 0) == bOpenTop);
+		}
+
+		// Growth never builds into what one holds back, and agrees with a full rebuild.
+		for (int32 Beat = 0; Beat < 400; ++Beat)
+		{
+			Molds->PlaceNextPlatform();
+		}
+
+		TestEqual(TEXT("No platform reaches into what a noisy mold holds back"), CountHeld(*Molds, MoldPockets.Num()), 0);
+		TestEqual(TEXT("Grown, it agrees with a full rebuild"), FRoomManagerTestAccess::Verify(*Molds), 0);
+	}
 
 	ReleaseRooted(Rooted);
 	return true;
